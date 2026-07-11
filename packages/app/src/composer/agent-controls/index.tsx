@@ -28,6 +28,7 @@ import { CombinedModelSelector } from "@/components/combined-model-selector";
 import {
   buildProviderSelectorProviders,
   buildSelectableProviderSelectorProviders,
+  applyDesktopModelSelection,
   filterCompatibleProviderEntries,
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
@@ -290,22 +291,6 @@ function pickSheetModel({
   onSelectModel?.(modelId);
 }
 
-function pickDesktopModel({
-  nextProviderId,
-  modelId,
-  currentProvider,
-  onSelectModel,
-}: {
-  nextProviderId: string;
-  modelId: string;
-  currentProvider: string;
-  onSelectModel?: (modelId: string) => void;
-}) {
-  if (nextProviderId === currentProvider) {
-    onSelectModel?.(modelId);
-  }
-}
-
 function resolveProviderIcon(provider: string) {
   if (provider.trim().length === 0) {
     return null;
@@ -515,9 +500,15 @@ function ControlledAgentControls({
 
   const handleDesktopModelSelect = useCallback(
     (nextProviderId: string, modelId: string) => {
-      pickDesktopModel({ nextProviderId, modelId, currentProvider: provider, onSelectModel });
+      applyDesktopModelSelection({
+        nextProviderId,
+        modelId,
+        currentProvider: provider,
+        onSelectProviderAndModel,
+        onSelectModel,
+      });
     },
-    [onSelectModel, provider],
+    [onSelectModel, onSelectProviderAndModel, provider],
   );
 
   const providerPressableStyle = useMemo(

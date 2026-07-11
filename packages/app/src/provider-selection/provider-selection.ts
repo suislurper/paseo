@@ -37,6 +37,20 @@ export interface ProviderSelectionReadiness {
   reason?: string;
 }
 
+export function applyDesktopModelSelection(input: {
+  nextProviderId: string;
+  modelId: string;
+  currentProvider: string;
+  onSelectProviderAndModel?: (provider: string, modelId: string) => void;
+  onSelectModel?: (modelId: string) => void;
+}): void {
+  if (input.nextProviderId !== input.currentProvider) {
+    input.onSelectProviderAndModel?.(input.nextProviderId, input.modelId);
+    return;
+  }
+  input.onSelectModel?.(input.modelId);
+}
+
 function buildModelRows(
   provider: string,
   providerLabel: string,

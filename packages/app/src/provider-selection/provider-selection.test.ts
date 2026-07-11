@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AgentModelDefinition, ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import type { AgentProviderDefinition } from "@getpaseo/protocol/provider-manifest";
 import { i18n } from "@/i18n/i18next";
@@ -6,6 +6,7 @@ import {
   buildProviderSelectorProviders,
   buildSelectableProviderSelectorProviders,
   buildSelectedTriggerLabel,
+  applyDesktopModelSelection,
   filterAndRankModelRows,
   filterCompatibleProviderEntries,
   matchesModelSearch,
@@ -46,6 +47,38 @@ describe("combined model selector data", () => {
       secondary,
     ]);
     expect(filterCompatibleProviderEntries([primary, secondary, codex], codex)).toEqual([codex]);
+  });
+
+  it("applies a desktop model selection through the provider switch handler", () => {
+    const onSelectProviderAndModel = vi.fn();
+    const onSelectModel = vi.fn();
+
+    applyDesktopModelSelection({
+      nextProviderId: "claude-secondary",
+      modelId: "claude-opus-4-6",
+      currentProvider: "claude",
+      onSelectProviderAndModel,
+      onSelectModel,
+    });
+
+    expect(onSelectProviderAndModel).toHaveBeenCalledWith("claude-secondary", "claude-opus-4-6");
+    expect(onSelectModel).not.toHaveBeenCalled();
+  });
+
+  it("keeps desktop model-only changes on the current provider", () => {
+    const onSelectProviderAndModel = vi.fn();
+    const onSelectModel = vi.fn();
+
+    applyDesktopModelSelection({
+      nextProviderId: "claude",
+      modelId: "claude-sonnet-4-6",
+      currentProvider: "claude",
+      onSelectProviderAndModel,
+      onSelectModel,
+    });
+
+    expect(onSelectModel).toHaveBeenCalledWith("claude-sonnet-4-6");
+    expect(onSelectProviderAndModel).not.toHaveBeenCalled();
   });
 
   it("builds selector providers from ready enabled snapshot entries", () => {

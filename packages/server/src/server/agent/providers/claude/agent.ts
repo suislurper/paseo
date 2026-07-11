@@ -2079,7 +2079,7 @@ class ClaudeAgentSession implements AgentSession {
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
 
     try {
-      await this.ensureQuery();
+      await this.ensureQuery({ allowRestart: true });
       if (!this.input) {
         throw new Error("Claude session input stream not initialized");
       }
@@ -2254,24 +2254,7 @@ class ClaudeAgentSession implements AgentSession {
 
     if (response.behavior === "allow") {
       if (pending.request.kind === "plan") {
-        const selectedActionId = response.selectedActionId;
-        const shouldResumePriorMode =
-          selectedActionId === "implement_resume" && this.planResumeMode === "bypassPermissions";
-        const targetMode: PermissionMode = shouldResumePriorMode
-          ? "bypassPermissions"
-          : "acceptEdits";
-        await this.setMode(targetMode);
-        this.pushToolCall(
-          mapClaudeCompletedToolCall({
-            name: "plan_approval",
-            callId: pending.request.id,
-            input: pending.request.input ?? null,
-            output: {
-              approved: true,
-              actionId: selectedActionId ?? "implement",
-            },
-          }),
-        );
+        await this.applyPlanApproval(pending.request, response.selectedActionId);
       }
       const updatedInput =
         pending.request.kind === "question"
@@ -2315,6 +2298,37 @@ class ClaudeAgentSession implements AgentSession {
       requestId,
       resolution: response,
     });
+  }
+
+  private async applyPlanApproval(
+    request: AgentPermissionRequest,
+    selectedActionId: string | undefined,
+  ): Promise<void> {
+    const shouldResumePriorMode =
+      selectedActionId === "implement_resume" && this.planResumeMode === "bypassPermissions";
+    const targetMode: PermissionMode = shouldResumePriorMode ? "bypassPermissions" : "acceptEdits";
+    try {
+      await this.setMode(targetMode);
+    } catch (error) {
+      // The pending entry is already removed from the map, so failing here
+      // would leave the CLI blocked on can_use_tool forever. Deliver the
+      // approval regardless; the mode switch can be retried by the user.
+      this.logger.warn(
+        { err: error, requestId: request.id, targetMode },
+        "Plan approval: setMode failed; resolving permission anyway",
+      );
+    }
+    this.pushToolCall(
+      mapClaudeCompletedToolCall({
+        name: "plan_approval",
+        callId: request.id,
+        input: request.input ?? null,
+        output: {
+          approved: true,
+          actionId: selectedActionId ?? "implement",
+        },
+      }),
+    );
   }
 
   describePersistence(): AgentPersistenceHandle | null {
@@ -2591,7 +2605,7 @@ class ClaudeAgentSession implements AgentSession {
     if (this.query) {
       this.queryRestartNeeded = true;
     }
-    return this.ensureQuery();
+    return this.ensureQuery({ allowRestart: true });
   }
 
   private getRewindCandidateUserMessageIds(): string[] {
@@ -2757,8 +2771,18 @@ class ClaudeAgentSession implements AgentSession {
     return { kind: "fork", messageId: previousTurn.assistantMessageId };
   }
 
-  private async ensureQuery(): Promise<Query> {
+  private async ensureQuery(opts?: { allowRestart?: boolean }): Promise<Query> {
     if (this.query && !this.queryRestartNeeded) {
+      return this.query;
+    }
+
+    // A deferred restart (queryRestartNeeded) may only be honored at a turn
+    // boundary (startTurn / explicit rewind). Control-plane callers such as
+    // listCommands/setMode/setModel must keep using the live query: restarting
+    // here tree-kills the CLI process mid-turn, which destroys any pending
+    // can_use_tool permission (e.g. an ExitPlanMode plan approval) with
+    // "Tool permission stream closed before response" and strands the agent.
+    if (this.queryRestartNeeded && this.query && !opts?.allowRestart) {
       return this.query;
     }
 

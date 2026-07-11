@@ -977,7 +977,37 @@ test("preserves bypass capability across query restarts triggered by thinking ch
         effort: options.effort,
       });
 
-      return createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+      let step = 0;
+      return createBaseQueryMock(
+        vi.fn(async () => {
+          if (step === 0) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "system",
+                subtype: "init",
+                session_id: "bypass-restart-session",
+                permissionMode: "default",
+                model: "opus",
+              },
+            };
+          }
+          if (step === 1) {
+            step += 1;
+            return {
+              done: false,
+              value: {
+                type: "result",
+                subtype: "success",
+                usage: buildUsage(),
+                total_cost_usd: 0,
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        }),
+      );
     },
   );
 
@@ -987,18 +1017,94 @@ test("preserves bypass capability across query restarts triggered by thinking ch
     await session.setMode("bypassPermissions");
     await session.setMode("acceptEdits");
     await session.setThinkingOption("high");
+    // Control-plane calls must NOT restart the query — a mid-turn restart
+    // tree-kills the CLI and destroys pending permissions. The pending
+    // restart is honored at the next turn boundary instead.
     await session.setMode("bypassPermissions");
-
-    expect(capturedOptions).toHaveLength(2);
+    expect(capturedOptions).toHaveLength(1);
     expect(capturedOptions[0]).toMatchObject({
       permissionMode: "default",
       allowDangerouslySkipPermissions: true,
     });
+
+    await session.run("next turn picks up the deferred restart");
+
+    expect(capturedOptions).toHaveLength(2);
     expect(capturedOptions[1]).toMatchObject({
-      permissionMode: "acceptEdits",
+      permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       effort: "high",
     });
+  } finally {
+    await session.close();
+  }
+});
+
+test("a pending plan approval survives a thinking change followed by control-plane calls", async () => {
+  // Regression: setThinkingOption marks the query for restart; a subsequent
+  // control-plane call (listCommands from the composer, setMode from plan
+  // approval) used to honor that restart immediately, tree-killing the CLI
+  // while ExitPlanMode's can_use_tool was pending → "Tool permission stream
+  // closed before response" and a permanently stranded plan-mode agent.
+  const spawnedQueries: QueryMock[] = [];
+  sdkQueryFactory.mockImplementation(() => {
+    const mock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+    spawnedQueries.push(mock);
+    return mock;
+  });
+
+  const session = await createSession();
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  try {
+    await session.setMode("plan");
+    expect(spawnedQueries).toHaveLength(1);
+
+    const internal: {
+      handlePermissionRequest: (
+        toolName: string,
+        input: Record<string, unknown>,
+        options: Record<string, unknown>,
+      ) => Promise<unknown>;
+    } = asInternals(session);
+
+    const pendingResolution = internal.handlePermissionRequest(
+      "ExitPlanMode",
+      { plan: "- Implement the approved plan" },
+      {},
+    );
+
+    const requestEvent = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "permission_requested" }> =>
+        event.type === "permission_requested" && event.request.kind === "plan",
+    );
+    if (!requestEvent) {
+      throw new Error("Expected plan permission request");
+    }
+
+    // User tweaks the thinking level while the approval card is open…
+    await session.setThinkingOption("high");
+    // …and the composer refreshes its slash-command catalog.
+    await session.listCommands();
+
+    // The live query (and its CLI process) must still be the original one.
+    expect(spawnedQueries).toHaveLength(1);
+    expect(spawnedQueries[0].close).not.toHaveBeenCalled();
+    expect(spawnedQueries[0].return).not.toHaveBeenCalled();
+
+    await session.respondToPermission(requestEvent.request.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+
+    await expect(pendingResolution).resolves.toMatchObject({
+      behavior: "allow",
+      updatedInput: { plan: "- Implement the approved plan" },
+    });
+    expect(spawnedQueries).toHaveLength(1);
+    expect(spawnedQueries[0].setPermissionMode).toHaveBeenLastCalledWith("acceptEdits");
+    expect(await session.getCurrentMode()).toBe("acceptEdits");
   } finally {
     await session.close();
   }

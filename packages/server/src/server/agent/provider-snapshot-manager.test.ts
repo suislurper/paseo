@@ -112,6 +112,36 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("loaded custom provider entries retain their base provider", async () => {
+    const provider = "claude-secondary";
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      providerOverrides: {
+        [provider]: { extends: "claude", label: "Claude Secondary", enabled: true },
+      },
+      extraClients: {
+        [provider]: createExtraClient(provider, {
+          isAvailable: vi.fn(async () => true),
+          fetchCatalog: vi.fn(async () => ({ models: [], modes: [] })),
+        }),
+      },
+    });
+    try {
+      const entry = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider,
+        wait: true,
+      });
+      expect(entry).toMatchObject({
+        provider,
+        baseProvider: "claude",
+        status: "ready",
+      });
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("getSnapshot returns loading entries for built-in providers before warmup", () => {
     const manager = new ProviderSnapshotManager({ logger: createTestLogger() });
     try {

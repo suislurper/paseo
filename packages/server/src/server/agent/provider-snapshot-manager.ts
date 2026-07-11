@@ -769,6 +769,7 @@ export class ProviderSnapshotManager {
     const base = {
       provider,
       source: this.getProviderSource(provider),
+      baseProvider: definition.derivedFromProviderId ?? provider,
       label: definition.label,
       description: definition.description,
       defaultModeId: definition.defaultModeId,

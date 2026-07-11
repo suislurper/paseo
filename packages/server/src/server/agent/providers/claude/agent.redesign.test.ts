@@ -1604,3 +1604,68 @@ test("does not use stream_event uuid as assistant message identity when message_
 
   await session.close();
 });
+
+test("history rehydration honors a per-profile CLAUDE_CONFIG_DIR from runtime settings", async () => {
+  // Regression: per-profile providers launch the CLI with their own
+  // CLAUDE_CONFIG_DIR, so transcripts land under that profile's projects dir.
+  // resolveHistoryPath used to read the daemon's env instead, so after a
+  // daemon restart every per-profile chat rehydrated empty.
+  const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { claudeProjectDirSync } = await import("./project-dir.js");
+
+  const configDir = await mkdtemp(join(tmpdir(), "paseo-profile-config-"));
+  const cwd = process.cwd();
+  const sessionId = "11111111-2222-3333-4444-555555555555";
+  try {
+    const projectDir = claudeProjectDirSync(cwd, { configDir });
+    await mkdir(projectDir, { recursive: true });
+    const lines = [
+      JSON.stringify({
+        type: "user",
+        uuid: "u-1",
+        timestamp: "2026-07-11T10:00:00.000Z",
+        message: { role: "user", content: "hello from the profile transcript" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "a-1",
+        timestamp: "2026-07-11T10:00:01.000Z",
+        message: {
+          id: "msg-1",
+          role: "assistant",
+          content: [{ type: "text", text: "hi back" }],
+        },
+      }),
+    ];
+    await writeFile(join(projectDir, `${sessionId}.jsonl`), lines.join("\n"), "utf8");
+
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory: sdkQueryFactory,
+      runtimeSettings: { env: { CLAUDE_CONFIG_DIR: configDir } },
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.resumeSession({
+      provider: "claude",
+      sessionId,
+      nativeHandle: sessionId,
+      metadata: { provider: "claude", cwd },
+    });
+
+    const items: AgentTimelineItem[] = [];
+    for await (const event of session.streamHistory()) {
+      if (event.type === "timeline") {
+        items.push(event.item);
+      }
+    }
+    await session.close();
+
+    expect(items.length).toBeGreaterThan(0);
+    const texts = items.map((item) => ("text" in item ? item.text : "")).join(" | ");
+    expect(texts).toContain("hello from the profile transcript");
+  } finally {
+    await rm(configDir, { recursive: true, force: true });
+  }
+});

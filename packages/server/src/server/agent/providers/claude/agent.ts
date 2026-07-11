@@ -1486,7 +1486,13 @@ export class ClaudeAgentClient implements AgentClient {
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    // Per-profile providers point the CLI at their own config dir; list
+    // sessions from there, not from the daemon's default.
+    const configDir =
+      this.configDir ??
+      this.runtimeSettings?.env?.CLAUDE_CONFIG_DIR ??
+      process.env.CLAUDE_CONFIG_DIR ??
+      path.join(os.homedir(), ".claude");
     const projectsRoot = path.join(configDir, "projects");
     if (!(await pathExists(projectsRoot))) {
       return [];
@@ -2916,6 +2922,14 @@ class ClaudeAgentSession implements AgentSession {
     );
   }
 
+  // The CLI may run with a per-profile CLAUDE_CONFIG_DIR (provider env overlay),
+  // so transcripts live under that profile's projects dir — not the daemon's.
+  // Any path derived from the config dir must use the CLI's effective env.
+  private resolveClaudeConfigDir(): string {
+    const sdkEnv = this.buildSdkEnv(this.config.extra?.claude);
+    return sdkEnv.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+  }
+
   private buildSdkEnv(extraClaudeOptions: Partial<ClaudeOptions> | undefined): NodeJS.ProcessEnv {
     return createProviderEnv({
       baseEnv: process.env,
@@ -4311,7 +4325,7 @@ class ClaudeAgentSession implements AgentSession {
   private resolveHistoryPath(sessionId: string): string | null {
     const cwd = this.config.cwd;
     if (!cwd) return null;
-    const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    const configDir = this.resolveClaudeConfigDir();
     const candidates = [cwd];
     try {
       const realCwd = fs.realpathSync(cwd);

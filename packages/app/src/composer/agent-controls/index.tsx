@@ -28,6 +28,7 @@ import { CombinedModelSelector } from "@/components/combined-model-selector";
 import {
   buildProviderSelectorProviders,
   buildSelectableProviderSelectorProviders,
+  filterCompatibleProviderEntries,
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
 import { useSessionStore } from "@/stores/session-store";
@@ -1398,14 +1399,16 @@ export const AgentControls = memo(function AgentControls({
     [agent?.provider, models],
   );
   const agentModelSelectorProviders = useMemo(() => {
-    if (snapshotSelectedEntry) {
-      return buildSelectableProviderSelectorProviders([snapshotSelectedEntry]);
+    if (snapshotSelectedEntry && snapshotEntries) {
+      return buildSelectableProviderSelectorProviders(
+        filterCompatibleProviderEntries(snapshotEntries, snapshotSelectedEntry),
+      );
     }
     return buildProviderSelectorProviders({
       providerDefinitions: agentProviderDefinitions,
       modelsByProvider: agentProviderModels,
     });
-  }, [agentProviderDefinitions, agentProviderModels, snapshotSelectedEntry]);
+  }, [agentProviderDefinitions, agentProviderModels, snapshotEntries, snapshotSelectedEntry]);
 
   const modelSelection = resolveAgentModelSelection({
     models,
@@ -1457,6 +1460,28 @@ export const AgentControls = memo(function AgentControls({
       });
     },
     [agentId, agentProvider, client, toast, updatePreferences],
+  );
+
+  const handleSelectProviderAndModel = useCallback(
+    (providerId: string, modelId: string) => {
+      if (!client) {
+        return;
+      }
+      void updatePreferences((current) =>
+        mergeProviderPreferences({
+          preferences: current,
+          provider: providerId,
+          updates: { model: modelId },
+        }),
+      ).catch((error) => {
+        console.warn("[AgentControls] persist provider preference failed", error);
+      });
+      void client.setAgentProvider(agentId, providerId, modelId || null).catch((error) => {
+        console.warn("[AgentControls] setAgentProvider failed", error);
+        toast.error(toErrorMessage(error));
+      });
+    },
+    [agentId, client, toast, updatePreferences],
   );
 
   const handleToggleFavoriteModel = useCallback(
@@ -1562,6 +1587,7 @@ export const AgentControls = memo(function AgentControls({
       modelOptions={modelOptions}
       selectedModelId={modelSelection.activeModelId ?? undefined}
       onSelectModel={handleSelectModel}
+      onSelectProviderAndModel={handleSelectProviderAndModel}
       favoriteKeys={favoriteKeys}
       onToggleFavoriteModel={handleToggleFavoriteModel}
       thinkingOptions={thinkingOptions.length > 1 ? thinkingOptions : undefined}

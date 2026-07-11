@@ -1388,6 +1388,82 @@ test("setAgentMode persists the selected mode across session reload", async () =
   expect(reloaded.currentModeId).toBe("full-access");
 });
 
+test("setAgentProvider reloads an active agent through a compatible provider profile", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-switch-"));
+  const resumeCalls: Array<{
+    provider: string;
+    handle: AgentPersistenceHandle;
+    config: Partial<AgentSessionConfig> | undefined;
+  }> = [];
+
+  class ProfileClient implements AgentClient {
+    readonly capabilities = TEST_CAPABILITIES;
+
+    constructor(readonly provider: string) {}
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumeCalls.push({ provider: this.provider, handle, config });
+      return new TestAgentSession({
+        provider: this.provider,
+        cwd: config?.cwd ?? workdir,
+        model: config?.model,
+      });
+    }
+
+    async fetchCatalog() {
+      return { models: [], modes: [] };
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: {
+      "claude-primary": new ProfileClient("claude-primary"),
+      "claude-secondary": new ProfileClient("claude-secondary"),
+      codex: new ProfileClient("codex"),
+    },
+    providerDefinitions: {
+      "claude-primary": { enabled: true, derivedFromProviderId: "claude" },
+      "claude-secondary": { enabled: true, derivedFromProviderId: "claude" },
+      codex: { enabled: true },
+    },
+    logger,
+  });
+  const created = await manager.createAgent(
+    { provider: "claude-primary", cwd: workdir, model: "sonnet" },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  const switched = await manager.setAgentProvider(created.id, "claude-secondary", "opus");
+
+  expect(switched).toBeUndefined();
+  expect(manager.getAgent(created.id)).toMatchObject({
+    provider: "claude-secondary",
+    config: { provider: "claude-secondary", model: "opus" },
+  });
+  expect(resumeCalls).toEqual([
+    {
+      provider: "claude-secondary",
+      handle: expect.objectContaining({ provider: "claude-secondary" }),
+      config: expect.objectContaining({ provider: "claude-secondary", model: "opus" }),
+    },
+  ]);
+  await expect(manager.setAgentProvider(created.id, "codex", "gpt-5.4")).rejects.toThrow(
+    "incompatible provider",
+  );
+});
+
 test("reloadAgentSession completes when the previous session close hangs", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-close-timeout-"));
   const storagePath = join(workdir, "agents");

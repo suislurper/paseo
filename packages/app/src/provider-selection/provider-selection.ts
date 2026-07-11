@@ -137,6 +137,20 @@ export function buildSelectableProviderSelectorProviders(
     });
 }
 
+export function filterCompatibleProviderEntries(
+  entries: ProviderSnapshotEntry[] | undefined,
+  selectedEntry: ProviderSnapshotEntry | undefined,
+): ProviderSnapshotEntry[] {
+  if (!entries || !selectedEntry) {
+    return selectedEntry ? [selectedEntry] : [];
+  }
+  const selectedBase = selectedEntry.baseProvider ?? selectedEntry.provider;
+  if (selectedBase !== "claude") {
+    return [selectedEntry];
+  }
+  return entries.filter((entry) => (entry.baseProvider ?? entry.provider) === selectedBase);
+}
+
 export function getProviderModelRows(
   provider: ProviderSelectorProvider,
 ): ProviderSelectionModelRow[] {

@@ -809,6 +809,8 @@ export class Session {
         setMode: async (agentId, modeId) =>
           (await setAgentModeCommand({ agentManager }, { agentId, modeId })).notice,
         setModel: (agentId, modelId) => agentManager.setAgentModel(agentId, modelId),
+        setProvider: (agentId, providerId, modelId) =>
+          agentManager.setAgentProvider(agentId, providerId, modelId),
         setFeature: (agentId, featureId, value) =>
           agentManager.setAgentFeature(agentId, featureId, value),
         setThinking: (agentId, thinkingOptionId) =>
@@ -1788,6 +1790,8 @@ export class Session {
         return this.agentConfigSession.handleSetAgentModeRequest(msg);
       case "set_agent_model_request":
         return this.agentConfigSession.handleSetAgentModelRequest(msg);
+      case "set_agent_provider_request":
+        return this.agentConfigSession.handleSetAgentProviderRequest(msg);
       case "set_agent_feature_request":
         return this.agentConfigSession.handleSetAgentFeatureRequest(msg);
       case "set_agent_thinking_request":

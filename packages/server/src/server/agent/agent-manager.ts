@@ -555,6 +555,7 @@ function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): str
 export class AgentManager {
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
+  private readonly providerBase = new Map<AgentProvider, AgentProvider>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
@@ -629,6 +630,7 @@ export class AgentManager {
     for (const [provider, definition] of Object.entries(input.providerDefinitions)) {
       if (definition) {
         this.providerEnabled.set(provider, definition.enabled);
+        this.providerBase.set(provider, definition.derivedFromProviderId ?? provider);
       }
     }
 
@@ -1173,7 +1175,7 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: { rehydrateFromDisk?: boolean; targetProvider?: AgentProvider },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
       this.reloadAgentSessionInternal(agentId, overrides, options),
@@ -1197,7 +1199,7 @@ export class AgentManager {
     const preservedLastError = existing.lastError;
     const preservedAttention = existing.attention;
     const handle = existing.persistence;
-    const provider = handle?.provider ?? existing.provider;
+    const provider = options?.targetProvider ?? handle?.provider ?? existing.provider;
     const client = this.requireClient(provider);
     const refreshConfig = {
       ...existing.config,
@@ -1209,7 +1211,7 @@ export class AgentManager {
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
 
     const session = handle
-      ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
+      ? await client.resumeSession({ ...handle, provider }, providerLaunchConfig, launchContext)
       : await client.createSession(providerLaunchConfig, launchContext);
 
     let handedToRegistration = false;
@@ -1494,6 +1496,36 @@ export class AgentManager {
     }
     this.touchUpdatedAt(agent);
     this.emitState(agent);
+  }
+
+  async setAgentProvider(
+    agentId: string,
+    providerId: string,
+    modelId: string | null,
+  ): Promise<void> {
+    const agent = this.requireSessionAgent(agentId);
+    if (providerId === agent.provider) {
+      await this.setAgentModel(agentId, modelId);
+      return;
+    }
+
+    this.requireEnabledProvider(providerId);
+    await this.requireAvailableClient({ provider: providerId });
+    const currentBase = this.providerBase.get(agent.provider) ?? agent.provider;
+    const targetBase = this.providerBase.get(providerId) ?? providerId;
+    if (currentBase !== targetBase || currentBase !== "claude") {
+      throw new Error(
+        `Cannot switch an active agent from '${agent.provider}' to incompatible provider '${providerId}'`,
+      );
+    }
+
+    agent.persistence = agent.session.describePersistence() ?? agent.persistence;
+
+    await this.reloadAgentSession(
+      agentId,
+      { model: modelId ?? undefined },
+      { targetProvider: providerId },
+    );
   }
 
   async setAgentThinkingOption(

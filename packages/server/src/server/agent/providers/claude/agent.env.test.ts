@@ -1,10 +1,14 @@
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import type { AgentLaunchContext } from "../../agent-sdk-types.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQueryInput } from "./query.js";
+import { claudeProjectDirSync } from "./project-dir.js";
 
 function createQueryMock(events: unknown[]): Query {
   let index = 0;
@@ -29,6 +33,38 @@ function createQueryMock(events: unknown[]): Query {
 }
 
 describe("Claude SDK env", () => {
+  test("copies a resumed session into a different Claude profile config dir", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paseo-claude-profile-switch-"));
+    const sourceConfigDir = join(root, "source");
+    const targetConfigDir = join(root, "target");
+    const cwd = join(root, "workspace");
+    const sessionId = "persisted-session";
+    await mkdir(cwd, { recursive: true });
+    const sourceProjectDir = claudeProjectDirSync(cwd, { configDir: sourceConfigDir });
+    await mkdir(join(sourceProjectDir, sessionId, "subagents"), { recursive: true });
+    await writeFile(join(sourceProjectDir, `${sessionId}.jsonl`), "conversation\n");
+    await writeFile(join(sourceProjectDir, sessionId, "subagents", "child.jsonl"), "child\n");
+
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      configDir: targetConfigDir,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    await client.resumeSession({
+      provider: "claude",
+      sessionId,
+      metadata: { cwd, paseoClaudeConfigDir: sourceConfigDir },
+    });
+
+    const targetProjectDir = claudeProjectDirSync(cwd, { configDir: targetConfigDir });
+    await expect(readFile(join(targetProjectDir, `${sessionId}.jsonl`), "utf8")).resolves.toBe(
+      "conversation\n",
+    );
+    await expect(
+      readFile(join(targetProjectDir, sessionId, "subagents", "child.jsonl"), "utf8"),
+    ).resolves.toBe("child\n");
+  });
+
   test("forwards launch-context env through Claude process env", async () => {
     let capturedEnv: Record<string, string | undefined> | undefined;
     const launchContext: AgentLaunchContext = {

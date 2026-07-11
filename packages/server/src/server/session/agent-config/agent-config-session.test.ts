@@ -11,6 +11,11 @@ import type { SessionOutboundMessage } from "../../messages.js";
 class FakeAgentConfigOperations implements AgentConfigOperations {
   readonly modeCalls: Array<{ agentId: string; modeId: string }> = [];
   readonly modelCalls: Array<{ agentId: string; modelId: string | null }> = [];
+  readonly providerCalls: Array<{
+    agentId: string;
+    providerId: string;
+    modelId: string | null;
+  }> = [];
   readonly featureCalls: Array<{ agentId: string; featureId: string; value: unknown }> = [];
   readonly thinkingCalls: Array<{ agentId: string; thinkingOptionId: string | null }> = [];
   modeNotice: AgentProviderNotice | null = null;
@@ -25,6 +30,11 @@ class FakeAgentConfigOperations implements AgentConfigOperations {
 
   async setModel(agentId: string, modelId: string | null): Promise<void> {
     this.modelCalls.push({ agentId, modelId });
+    if (this.failWith) throw this.failWith;
+  }
+
+  async setProvider(agentId: string, providerId: string, modelId: string | null): Promise<void> {
+    this.providerCalls.push({ agentId, providerId, modelId });
     if (this.failWith) throw this.failWith;
   }
 
@@ -153,6 +163,32 @@ describe("AgentConfigSession", () => {
       type: "set_agent_model_response",
       payload: { requestId: "req-1", agentId: "agent-1", accepted: false, error: "model boom" },
     });
+  });
+
+  test("set provider: forwards the profile and model and emits an accepted response", async () => {
+    const { subsystem, emitted, operations } = makeSubsystem();
+
+    await subsystem.handleSetAgentProviderRequest({
+      type: "set_agent_provider_request",
+      agentId: "agent-1",
+      providerId: "claude-secondary",
+      modelId: "claude-opus-4-8",
+      requestId: "req-1",
+    });
+
+    expect(operations.providerCalls).toEqual([
+      {
+        agentId: "agent-1",
+        providerId: "claude-secondary",
+        modelId: "claude-opus-4-8",
+      },
+    ]);
+    expect(emitted).toEqual([
+      {
+        type: "set_agent_provider_response",
+        payload: { requestId: "req-1", agentId: "agent-1", accepted: true, error: null },
+      },
+    ]);
   });
 
   test("set feature: forwards the feature value and emits an accepted response with no notice", async () => {

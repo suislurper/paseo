@@ -107,11 +107,44 @@ import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
 const fsPromises = promises;
+const PASEO_CLAUDE_CONFIG_DIR_METADATA_KEY = "paseoClaudeConfigDir";
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
   "user",
   "project",
   "local",
 ];
+
+async function copyClaudeSessionBetweenConfigDirs(input: {
+  sourceConfigDir: string;
+  targetConfigDir: string;
+  cwd: string | undefined;
+  sessionId: string;
+}): Promise<void> {
+  if (!input.cwd) {
+    throw new Error("Claude profile switch requires the original working directory");
+  }
+  const sourceProjectDir = claudeProjectDirSync(input.cwd, {
+    configDir: input.sourceConfigDir,
+  });
+  const targetProjectDir = claudeProjectDirSync(input.cwd, {
+    configDir: input.targetConfigDir,
+  });
+  const sourceTranscript = path.join(sourceProjectDir, `${input.sessionId}.jsonl`);
+  const targetTranscript = path.join(targetProjectDir, `${input.sessionId}.jsonl`);
+  if (!(await pathExists(sourceTranscript))) {
+    throw new Error(`Claude session transcript '${input.sessionId}' was not found`);
+  }
+
+  await fsPromises.mkdir(targetProjectDir, { recursive: true });
+  await fsPromises.copyFile(sourceTranscript, targetTranscript);
+  const sourceSessionDir = path.join(sourceProjectDir, input.sessionId);
+  if (await pathExists(sourceSessionDir)) {
+    await fsPromises.cp(sourceSessionDir, path.join(targetProjectDir, input.sessionId), {
+      recursive: true,
+      force: true,
+    });
+  }
+}
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -1447,6 +1480,16 @@ export class ClaudeAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
     const metadata = coerceSessionMetadata(handle.metadata);
+    const sourceConfigDir = handle.metadata?.[PASEO_CLAUDE_CONFIG_DIR_METADATA_KEY];
+    const targetConfigDir = this.resolveConfigDir();
+    if (typeof sourceConfigDir === "string" && sourceConfigDir !== targetConfigDir) {
+      await copyClaudeSessionBetweenConfigDirs({
+        sourceConfigDir,
+        targetConfigDir,
+        cwd: typeof metadata.cwd === "string" ? metadata.cwd : overrides?.cwd,
+        sessionId: handle.sessionId,
+      });
+    }
     const merged: Partial<AgentSessionConfig> = { ...metadata, ...overrides };
     if (!merged.cwd) {
       throw new Error("Claude resume requires the original working directory in metadata");
@@ -1467,6 +1510,15 @@ export class ClaudeAgentClient implements AgentClient {
       queryFactory: this.queryFactory,
       resolveBinary: this.resolveBinary,
     });
+  }
+
+  private resolveConfigDir(): string {
+    return (
+      this.configDir ??
+      this.runtimeSettings?.env?.CLAUDE_CONFIG_DIR ??
+      process.env.CLAUDE_CONFIG_DIR ??
+      path.join(os.homedir(), ".claude")
+    );
   }
 
   async fetchCatalog(_options: FetchCatalogOptions): Promise<ProviderCatalog> {
@@ -2339,6 +2391,13 @@ class ClaudeAgentSession implements AgentSession {
 
   describePersistence(): AgentPersistenceHandle | null {
     if (this.persistence) {
+      this.persistence = {
+        ...this.persistence,
+        metadata: {
+          ...this.persistence.metadata,
+          [PASEO_CLAUDE_CONFIG_DIR_METADATA_KEY]: this.resolveClaudeConfigDir(),
+        },
+      };
       return this.persistence;
     }
     if (!this.claudeSessionId) {
@@ -2348,7 +2407,10 @@ class ClaudeAgentSession implements AgentSession {
       provider: "claude",
       sessionId: this.claudeSessionId,
       nativeHandle: this.claudeSessionId,
-      metadata: { ...this.config },
+      metadata: {
+        ...this.config,
+        [PASEO_CLAUDE_CONFIG_DIR_METADATA_KEY]: this.resolveClaudeConfigDir(),
+      },
     };
     return this.persistence;
   }

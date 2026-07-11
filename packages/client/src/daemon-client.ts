@@ -2947,6 +2947,38 @@ export class DaemonClient {
     }
   }
 
+  async setAgentProvider(
+    agentId: string,
+    providerId: string,
+    modelId: string | null,
+  ): Promise<void> {
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      type: "set_agent_provider_request",
+      agentId,
+      providerId,
+      modelId,
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "set_agent_provider_response") {
+          return null;
+        }
+        if (msg.payload.requestId !== requestId) {
+          return null;
+        }
+        return msg.payload;
+      },
+    });
+    if (!payload.accepted) {
+      throw new Error(payload.error ?? "setAgentProvider rejected");
+    }
+  }
+
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({

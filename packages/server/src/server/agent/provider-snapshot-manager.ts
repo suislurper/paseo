@@ -533,6 +533,7 @@ export class ProviderSnapshotManager {
     } catch (error) {
       return {
         provider,
+        baseProvider: definition.derivedFromProviderId ?? provider,
         status: "error",
         enabled: definition.enabled,
         source: this.getProviderSource(provider),
@@ -580,6 +581,7 @@ export class ProviderSnapshotManager {
       const definition = this.providerRegistry[provider];
       entries.set(provider, {
         provider,
+        baseProvider: definition?.derivedFromProviderId ?? provider,
         status: "loading",
         enabled: definition?.enabled ?? true,
         source: this.getProviderSource(provider),
@@ -600,6 +602,7 @@ export class ProviderSnapshotManager {
       const current = existing?.get(provider);
       const metadata = {
         provider,
+        baseProvider: definition?.derivedFromProviderId ?? provider,
         enabled: definition?.enabled ?? true,
         source: this.getProviderSource(provider),
         label: definition?.label,

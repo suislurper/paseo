@@ -7,6 +7,7 @@ import {
   buildSelectableProviderSelectorProviders,
   buildSelectedTriggerLabel,
   filterAndRankModelRows,
+  filterCompatibleProviderEntries,
   matchesModelSearch,
   resolveSelectedModelLabel,
   resolveSubmissionReadiness,
@@ -34,6 +35,18 @@ describe("combined model selector data", () => {
       models: overrides.models ?? [codexModel],
     };
   }
+
+  it("keeps active-agent provider choices within the same base provider", () => {
+    const primary = snapshotEntry({ provider: "claude-primary", baseProvider: "claude" });
+    const secondary = snapshotEntry({ provider: "claude-secondary", baseProvider: "claude" });
+    const codex = snapshotEntry({ provider: "codex", baseProvider: "codex" });
+
+    expect(filterCompatibleProviderEntries([primary, secondary, codex], primary)).toEqual([
+      primary,
+      secondary,
+    ]);
+    expect(filterCompatibleProviderEntries([primary, secondary, codex], codex)).toEqual([codex]);
+  });
 
   it("builds selector providers from ready enabled snapshot entries", () => {
     expect(

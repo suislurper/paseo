@@ -5,7 +5,7 @@ import type { AgentProviderNotice } from "../../agent/agent-sdk-types.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 
 /**
- * The four agent-config response messages share one payload shape; deriving the
+ * The agent-config response messages share one payload shape; deriving the
  * type keeps it pinned to the protocol schema instead of restating it.
  */
 type AgentActionResponsePayload = Extract<
@@ -20,12 +20,13 @@ export interface AgentConfigSessionHost {
 /**
  * The per-agent config mutations this subsystem drives. The shell adapts these
  * onto the live AgentManager (mode still routes through setAgentModeCommand);
- * tests wire an in-memory fake. Mode and thinking yield a provider notice; model
- * and feature do not.
+ * tests wire an in-memory fake. Mode and thinking yield a provider notice; model,
+ * provider, and feature do not.
  */
 export interface AgentConfigOperations {
   setMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null>;
   setModel(agentId: string, modelId: string | null): Promise<void>;
+  setProvider(agentId: string, providerId: string, modelId: string | null): Promise<void>;
   setFeature(agentId: string, featureId: string, value: unknown): Promise<void>;
   setThinking(
     agentId: string,
@@ -97,6 +98,24 @@ export class AgentConfigSession {
         return undefined;
       },
       emitResponse: (payload) => this.host.emit({ type: "set_agent_model_response", payload }),
+    });
+  }
+
+  handleSetAgentProviderRequest(
+    msg: Extract<SessionInboundMessage, { type: "set_agent_provider_request" }>,
+  ): Promise<void> {
+    const { agentId, providerId, modelId, requestId } = msg;
+    return this.applyConfigChange({
+      agentId,
+      requestId,
+      logLabel: "set_agent_provider_request",
+      logFields: { agentId, providerId, modelId, requestId },
+      failureText: "Failed to set agent provider",
+      run: async () => {
+        await this.operations.setProvider(agentId, providerId, modelId);
+        return undefined;
+      },
+      emitResponse: (payload) => this.host.emit({ type: "set_agent_provider_response", payload }),
     });
   }
 

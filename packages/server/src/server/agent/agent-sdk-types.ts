@@ -103,6 +103,7 @@ export function normalizeAgentModelDefinition(model: AgentModelDefinition): Agen
 
 export interface ProviderSnapshotEntry {
   provider: AgentProvider;
+  baseProvider?: AgentProvider;
   status: ProviderStatus;
   enabled: boolean;
   source?: "builtin" | "custom";

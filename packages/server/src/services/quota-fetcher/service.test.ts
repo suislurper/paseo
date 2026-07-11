@@ -947,3 +947,152 @@ describe("real provider usage fetchers", () => {
     });
   });
 });
+
+describe("provider profile usage fetchers", () => {
+  let profileClaudeHome: string;
+  let profileCodexHome: string;
+  let fetchApi: typeof fetch;
+  let originalEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    profileClaudeHome = mkdtempSync(join(tmpdir(), "usage-test-claude-profile-"));
+    profileCodexHome = mkdtempSync(join(tmpdir(), "usage-test-codex-profile-"));
+    fetchApi = mockFetch(new Map());
+    originalEnv = { ...process.env };
+    delete process.env["CODEX_HOME"];
+    delete process.env["CLAUDE_HOME"];
+  });
+
+  afterEach(() => {
+    rmSync(profileClaudeHome, { recursive: true, force: true });
+    rmSync(profileCodexHome, { recursive: true, force: true });
+    for (const key in originalEnv) {
+      process.env[key] = originalEnv[key];
+    }
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+  });
+
+  function profileService(
+    providerProfiles: Record<
+      string,
+      { extends?: string; label?: string; enabled?: boolean; env?: Record<string, string> }
+    >,
+  ) {
+    const fetchThroughTestDouble = ((url: RequestInfo | URL, init?: RequestInit) =>
+      fetchApi(url, init)) as typeof fetch;
+    return new ProviderUsageService({
+      logger: createLogger(),
+      now: () => Date.parse("2026-06-19T00:00:00.000Z"),
+      fetch: fetchThroughTestDouble,
+      fetchers: [
+        usageFetcher({
+          providerId: "claude",
+          displayName: "Claude",
+          status: "available",
+          planLabel: "Max",
+          windows: [],
+        }),
+      ],
+      cacheTtlMs: 0,
+      providerProfiles: () => providerProfiles,
+    });
+  }
+
+  it("adds usage entries for claude and codex profiles with their own config homes", async () => {
+    writeClaudeCredentials(profileClaudeHome, "at_profile_claude");
+    writeCodexAuth(profileCodexHome, "at_profile_codex");
+    fetchApi = mockFetch(
+      new Map([
+        ["https://api.anthropic.com/api/oauth/usage", () => jsonResponse(makeClaudeResponse())],
+        ["https://chatgpt.com/backend-api/wham/usage", () => jsonResponse(makeCodexResponse())],
+      ]),
+    );
+
+    const result = await profileService({
+      "claude-work": {
+        extends: "claude",
+        label: "Claude (Work)",
+        env: { CLAUDE_CONFIG_DIR: profileClaudeHome },
+      },
+      "codex-work": {
+        extends: "codex",
+        label: "Codex (Work)",
+        env: { CODEX_HOME: profileCodexHome },
+      },
+    }).listUsage();
+
+    expect(findProvider(result, "claude").status).toBe("available");
+    expect(findProvider(result, "claude-work")).toMatchObject({
+      displayName: "Claude (Work)",
+      iconProviderId: "claude",
+      status: "available",
+    });
+    expect(findProvider(result, "codex-work")).toMatchObject({
+      displayName: "Codex (Work)",
+      iconProviderId: "codex",
+      status: "available",
+      planLabel: "plus",
+    });
+  });
+
+  it("skips disabled profiles, non claude/codex profiles, and profiles without a config home", async () => {
+    writeCodexAuth(profileCodexHome, "at_profile_codex");
+
+    const result = await profileService({
+      "codex-disabled": {
+        extends: "codex",
+        enabled: false,
+        env: { CODEX_HOME: profileCodexHome },
+      },
+      "zai-profile": { extends: "claude", label: "ZAI", env: { ANTHROPIC_AUTH_TOKEN: "zk" } },
+      "my-acp": { extends: "acp", label: "My ACP" },
+    }).listUsage();
+
+    expect(result.providers.map((provider) => provider.providerId)).toEqual(["claude"]);
+  });
+
+  it("reads codex profile auth only from the profile home, ignoring CODEX_HOME and defaults", async () => {
+    const envCodexHome = mkdtempSync(join(tmpdir(), "usage-test-codex-env-"));
+    process.env["CODEX_HOME"] = envCodexHome;
+    writeCodexAuth(envCodexHome, "at_env_codex");
+
+    try {
+      const result = await profileService({
+        "codex-work": {
+          extends: "codex",
+          label: "Codex (Work)",
+          env: { CODEX_HOME: profileCodexHome },
+        },
+      }).listUsage();
+
+      expect(findProvider(result, "codex-work").status).toBe("unavailable");
+    } finally {
+      rmSync(envCodexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("does not fall back to the macOS Keychain for claude profiles", async () => {
+    const logger = createLogger();
+    const keychain = vi.fn(async () => ({
+      claudeAiOauth: { accessToken: "at_default_account" },
+    }));
+    const fetcher = new ClaudeQuotaProvider({
+      logger,
+      claudeHome: profileClaudeHome,
+      claudeKeychainReader: keychain,
+      platform: "darwin",
+      fetch: fetchApi,
+      providerId: "claude-work",
+      displayName: "Claude (Work)",
+    });
+
+    const usage = await fetcher.fetchUsage();
+
+    expect(usage.status).toBe("unavailable");
+    expect(keychain).not.toHaveBeenCalled();
+  });
+});

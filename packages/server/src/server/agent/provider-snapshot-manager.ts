@@ -388,6 +388,12 @@ export class ProviderSnapshotManager {
     return { provider, diagnostic };
   }
 
+  // Effective provider overrides (persisted config plus mutable changes).
+  // Consumed by the provider usage service to derive per-profile fetchers.
+  getProviderOverrides(): Record<string, ProviderOverride> | undefined {
+    return this.providerOverrides;
+  }
+
   applyMutableProviderConfig(
     mutableProviders: MutableDaemonConfig["providers"] | undefined,
     options: ApplyMutableProviderConfigOptions = {},

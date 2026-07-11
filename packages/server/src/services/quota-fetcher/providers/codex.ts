@@ -76,6 +76,9 @@ interface CodexQuotaProviderOptions {
   logger: Logger;
   codexHome?: string;
   fetch?: ProviderApiFetch;
+  // Identity overrides for custom provider profiles that extend "codex".
+  providerId?: string;
+  displayName?: string;
 }
 
 function codexWindow(
@@ -89,13 +92,23 @@ function codexWindow(
 }
 
 export class CodexQuotaProvider implements ProviderUsageFetcher {
-  readonly providerId = "codex";
-  readonly displayName = "Codex";
+  readonly providerId: string;
+  readonly displayName: string;
+  readonly iconProviderId?: string;
 
   private readonly codexHome: string;
+  // Profile fetchers read auth only from their configured home; the env and
+  // ~/.config fallbacks would otherwise leak the default account's usage.
+  private readonly isProfileFetcher: boolean;
   private readonly fetchApi: ProviderApiFetch;
 
   constructor(options: CodexQuotaProviderOptions) {
+    this.providerId = options.providerId ?? "codex";
+    this.displayName = options.displayName ?? "Codex";
+    this.isProfileFetcher = this.providerId !== "codex";
+    if (this.isProfileFetcher) {
+      this.iconProviderId = "codex";
+    }
     this.codexHome = options.codexHome || process.env["CODEX_HOME"] || join(homedir(), ".codex");
     this.fetchApi = options.fetch ?? fetch;
   }
@@ -184,6 +197,7 @@ export class CodexQuotaProvider implements ProviderUsageFetcher {
     return {
       providerId: this.providerId,
       displayName: this.displayName,
+      ...(this.iconProviderId ? { iconProviderId: this.iconProviderId } : {}),
       status: "available",
       planLabel: resp.plan_type ?? null,
       windows,
@@ -194,11 +208,13 @@ export class CodexQuotaProvider implements ProviderUsageFetcher {
   }
 
   private async readCodexAuth(): Promise<CodexAuthRecord | null> {
-    const candidates = [
-      ...(process.env["CODEX_HOME"] ? [join(process.env["CODEX_HOME"], "auth.json")] : []),
-      join(homedir(), ".config", "codex", "auth.json"),
-      join(this.codexHome, "auth.json"),
-    ];
+    const candidates = this.isProfileFetcher
+      ? [join(this.codexHome, "auth.json")]
+      : [
+          ...(process.env["CODEX_HOME"] ? [join(process.env["CODEX_HOME"], "auth.json")] : []),
+          join(homedir(), ".config", "codex", "auth.json"),
+          join(this.codexHome, "auth.json"),
+        ];
     for (const path of candidates) {
       if (!existsSync(path)) continue;
       try {

@@ -4707,6 +4707,9 @@ export const ProviderUsageDetailSchema = z.object({
 export const ProviderUsageSchema = z.object({
   providerId: z.string(),
   displayName: z.string(),
+  // Base provider id for iconography when providerId is a custom profile
+  // (e.g. "codex-work" extending "codex"). Absent for built-in fetchers.
+  iconProviderId: z.string().optional(),
   status: ProviderUsageStatusSchema,
   planLabel: z.string().nullable(),
   sourceLabel: z.string().nullable().optional(),

@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 import type { ProviderUsage } from "../../server/messages.js";
-import { createProviderUsageFetchers } from "./manifest.js";
+import { createProfileUsageFetchers, createProviderUsageFetchers } from "./manifest.js";
+import type { ProviderUsageProfile } from "./manifest.js";
 import type { ProviderApiFetch, ProviderUsageFetcher } from "./provider.js";
 import { unavailableUsage } from "./usage.js";
 
@@ -10,6 +11,9 @@ export interface ProviderUsageServiceOptions {
   fetch?: ProviderApiFetch;
   cacheTtlMs?: number;
   now?: () => number;
+  // Live view of `agents.providers` so custom claude/codex profiles get their
+  // own usage entries. Read on every refresh to follow config changes.
+  providerProfiles?: () => Record<string, ProviderUsageProfile> | undefined;
 }
 
 export interface ProviderUsageListResult {
@@ -22,6 +26,8 @@ const DEFAULT_PROVIDER_USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 export class ProviderUsageService {
   private readonly logger: Logger;
   private readonly fetchers: ProviderUsageFetcher[];
+  private readonly fetchApi: ProviderApiFetch | undefined;
+  private readonly providerProfiles?: () => Record<string, ProviderUsageProfile> | undefined;
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
   private cached: { fetchedAtMs: number; result: ProviderUsageListResult } | null = null;
@@ -29,6 +35,8 @@ export class ProviderUsageService {
 
   constructor(options: ProviderUsageServiceOptions) {
     this.logger = options.logger.child({ module: "provider-usage-service" });
+    this.fetchApi = options.fetch;
+    this.providerProfiles = options.providerProfiles;
     this.fetchers =
       options.fetchers ??
       createProviderUsageFetchers({
@@ -64,10 +72,28 @@ export class ProviderUsageService {
     }
   }
 
+  private resolveFetchers(): ProviderUsageFetcher[] {
+    const profileFetchers = createProfileUsageFetchers(this.providerProfiles?.(), {
+      logger: this.logger,
+      fetch: this.fetchApi,
+    });
+    if (profileFetchers.length === 0) {
+      return this.fetchers;
+    }
+    // A profile id can never shadow a base fetcher (custom provider ids are
+    // distinct from built-in ids), but guard against duplicates regardless.
+    const baseIds = new Set(this.fetchers.map((fetcher) => fetcher.providerId));
+    return [
+      ...this.fetchers,
+      ...profileFetchers.filter((fetcher) => !baseIds.has(fetcher.providerId)),
+    ];
+  }
+
   private async fetchFreshUsage(nowMs: number): Promise<ProviderUsageListResult> {
-    const settled = await Promise.allSettled(this.fetchers.map((fetcher) => fetcher.fetchUsage()));
+    const fetchers = this.resolveFetchers();
+    const settled = await Promise.allSettled(fetchers.map((fetcher) => fetcher.fetchUsage()));
     const providers = settled.map((result, index) => {
-      const fetcher = this.fetchers[index];
+      const fetcher = fetchers[index];
       if (result.status === "fulfilled") {
         return result.value;
       }
@@ -78,6 +104,7 @@ export class ProviderUsageService {
       return unavailableUsage({
         providerId: fetcher.providerId,
         displayName: fetcher.displayName,
+        iconProviderId: fetcher.iconProviderId,
         error: result.reason instanceof Error ? result.reason.message : String(result.reason),
       });
     });

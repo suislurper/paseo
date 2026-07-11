@@ -72,6 +72,9 @@ interface ClaudeQuotaProviderOptions {
   claudeKeychainReader?: () => Promise<unknown | null>;
   platform?: typeof process.platform;
   fetch?: ProviderApiFetch;
+  // Identity overrides for custom provider profiles that extend "claude".
+  providerId?: string;
+  displayName?: string;
 }
 
 function buildClaudePlan(
@@ -99,16 +102,75 @@ async function readClaudeKeychainCredentials(): Promise<unknown | null> {
   }
 }
 
+function buildClaudeWindows(resp: ClaudeUsageResponse): ProviderUsageWindow[] {
+  const windows: ProviderUsageWindow[] = [];
+  if (resp.five_hour) {
+    windows.push(
+      windowFromUsedPct({
+        id: "five_hour",
+        label: "Session",
+        utilizationPct: resp.five_hour.utilization,
+        resetsAt: resp.five_hour.resets_at ?? null,
+        tone: "ok",
+      }),
+    );
+  }
+  if (resp.seven_day) {
+    windows.push(
+      windowFromUsedPct({
+        id: "weekly",
+        label: "Weekly",
+        utilizationPct: resp.seven_day.utilization,
+        resetsAt: resp.seven_day.resets_at ?? null,
+        tone: "ok",
+      }),
+    );
+  }
+  if (resp.seven_day_opus) {
+    windows.push(
+      windowFromUsedPct({
+        id: "weekly_opus",
+        label: "Weekly · Opus",
+        utilizationPct: resp.seven_day_opus.utilization,
+        resetsAt: resp.seven_day_opus.resets_at ?? null,
+        tone: "ok",
+      }),
+    );
+  }
+  if (resp.seven_day_omelette) {
+    windows.push(
+      windowFromUsedPct({
+        id: "weekly_omelette",
+        label: "Weekly · Omelette",
+        utilizationPct: resp.seven_day_omelette.utilization,
+        resetsAt: resp.seven_day_omelette.resets_at ?? null,
+        tone: "ok",
+      }),
+    );
+  }
+  return windows;
+}
+
 export class ClaudeQuotaProvider implements ProviderUsageFetcher {
-  readonly providerId = "claude";
-  readonly displayName = "Claude";
+  readonly providerId: string;
+  readonly displayName: string;
+  readonly iconProviderId?: string;
 
   private readonly claudeHome: string;
+  // Profile fetchers read credentials only from their configured home; the
+  // macOS Keychain fallback would otherwise leak the default account's usage.
+  private readonly isProfileFetcher: boolean;
   private readonly readKeychainCredentials: () => Promise<unknown | null>;
   private readonly platform: typeof process.platform;
   private readonly fetchApi: ProviderApiFetch;
 
   constructor(options: ClaudeQuotaProviderOptions) {
+    this.providerId = options.providerId ?? "claude";
+    this.displayName = options.displayName ?? "Claude";
+    this.isProfileFetcher = this.providerId !== "claude";
+    if (this.isProfileFetcher) {
+      this.iconProviderId = "claude";
+    }
     this.claudeHome =
       options.claudeHome || process.env["CLAUDE_HOME"] || join(homedir(), ".claude");
     this.readKeychainCredentials = options.claudeKeychainReader ?? readClaudeKeychainCredentials;
@@ -148,51 +210,7 @@ export class ClaudeQuotaProvider implements ProviderUsageFetcher {
       }
     }
 
-    const windows: ProviderUsageWindow[] = [];
-    if (resp.five_hour) {
-      windows.push(
-        windowFromUsedPct({
-          id: "five_hour",
-          label: "Session",
-          utilizationPct: resp.five_hour.utilization,
-          resetsAt: resp.five_hour.resets_at ?? null,
-          tone: "ok",
-        }),
-      );
-    }
-    if (resp.seven_day) {
-      windows.push(
-        windowFromUsedPct({
-          id: "weekly",
-          label: "Weekly",
-          utilizationPct: resp.seven_day.utilization,
-          resetsAt: resp.seven_day.resets_at ?? null,
-          tone: "ok",
-        }),
-      );
-    }
-    if (resp.seven_day_opus) {
-      windows.push(
-        windowFromUsedPct({
-          id: "weekly_opus",
-          label: "Weekly · Opus",
-          utilizationPct: resp.seven_day_opus.utilization,
-          resetsAt: resp.seven_day_opus.resets_at ?? null,
-          tone: "ok",
-        }),
-      );
-    }
-    if (resp.seven_day_omelette) {
-      windows.push(
-        windowFromUsedPct({
-          id: "weekly_omelette",
-          label: "Weekly · Omelette",
-          utilizationPct: resp.seven_day_omelette.utilization,
-          resetsAt: resp.seven_day_omelette.resets_at ?? null,
-          tone: "ok",
-        }),
-      );
-    }
+    const windows = buildClaudeWindows(resp);
 
     const details: ProviderUsageDetail[] = [];
     const extraUsageEnabled = resp.extra_usage?.is_enabled;
@@ -207,6 +225,7 @@ export class ClaudeQuotaProvider implements ProviderUsageFetcher {
     return {
       providerId: this.providerId,
       displayName: this.displayName,
+      ...(this.iconProviderId ? { iconProviderId: this.iconProviderId } : {}),
       status: "available",
       planLabel: plan,
       windows,
@@ -233,7 +252,7 @@ export class ClaudeQuotaProvider implements ProviderUsageFetcher {
       }
     }
 
-    if (this.platform === "darwin") {
+    if (this.platform === "darwin" && !this.isProfileFetcher) {
       const creds = ClaudeCredentialsSchema.safeParse(await this.readKeychainCredentials());
       const oauth = creds.success ? creds.data.claudeAiOauth : undefined;
       if (oauth?.accessToken) {

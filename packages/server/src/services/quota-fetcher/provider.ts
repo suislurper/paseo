@@ -6,6 +6,8 @@ export type ProviderApiFetch = typeof fetch;
 export interface ProviderUsageFetcher {
   readonly providerId: string;
   readonly displayName: string;
+  // Base provider id for iconography when providerId is a custom profile.
+  readonly iconProviderId?: string;
   fetchUsage(): Promise<ProviderUsage>;
 }
 

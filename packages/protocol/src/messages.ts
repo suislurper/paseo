@@ -2959,6 +2959,25 @@ export const WorkspaceScriptPayloadSchema = z.object({
   terminalId: z.string().nullable().optional().default(null),
 });
 
+// COMPAT(originDefaultRelation): added in v0.2.x, optional forever for old daemons/clients.
+// Describes HEAD vs the resolved origin default tip so already-landed work is not shown as unpushed.
+export const OriginDefaultRelationStateSchema = z.enum([
+  "exact",
+  "included",
+  "ahead",
+  "patch_equivalent_not_included",
+  "diverged_with_unique_commits",
+  "unverifiable",
+]);
+
+export const OriginDefaultRelationSchema = z.object({
+  state: OriginDefaultRelationStateSchema,
+  resolvedRef: z.string().nullable(),
+  ahead: z.number().nullable(),
+  behind: z.number().nullable(),
+  uniquePatchCount: z.number().nullable(),
+});
+
 const WorkspaceGitRuntimePayloadSchema = z
   .object({
     currentBranch: z.string().nullable().optional(),
@@ -2974,6 +2993,8 @@ const WorkspaceGitRuntimePayloadSchema = z
       .optional(),
     aheadOfOrigin: z.number().nullable().optional(),
     behindOfOrigin: z.number().nullable().optional(),
+    // COMPAT(originDefaultRelation): added in v0.2.x — missing on old daemons; preserve unpushed behavior.
+    originDefaultRelation: OriginDefaultRelationSchema.optional(),
   })
   .optional()
   .nullable();
@@ -3855,6 +3876,8 @@ const CheckoutStatusNotGitSchema = CheckoutStatusCommonSchema.extend({
   aheadBehind: z.null(),
   aheadOfOrigin: z.null(),
   behindOfOrigin: z.null(),
+  // COMPAT(originDefaultRelation): added in v0.2.x — optional; absent on not-git is fine.
+  originDefaultRelation: OriginDefaultRelationSchema.optional(),
   hasRemote: z.boolean(),
   remoteUrl: z.null(),
 });
@@ -3870,6 +3893,8 @@ const CheckoutStatusGitNonPaseoSchema = CheckoutStatusCommonSchema.extend({
   aheadBehind: AheadBehindSchema.nullable(),
   aheadOfOrigin: z.number().nullable(),
   behindOfOrigin: z.number().nullable(),
+  // COMPAT(originDefaultRelation): added in v0.2.x — optional for old clients.
+  originDefaultRelation: OriginDefaultRelationSchema.optional(),
   hasRemote: z.boolean(),
   remoteUrl: z.string().nullable(),
 });
@@ -3885,6 +3910,8 @@ const CheckoutStatusGitPaseoSchema = CheckoutStatusCommonSchema.extend({
   aheadBehind: AheadBehindSchema.nullable(),
   aheadOfOrigin: z.number().nullable(),
   behindOfOrigin: z.number().nullable(),
+  // COMPAT(originDefaultRelation): added in v0.2.x — optional for old clients.
+  originDefaultRelation: OriginDefaultRelationSchema.optional(),
   hasRemote: z.boolean(),
   remoteUrl: z.string().nullable(),
 });
@@ -5415,6 +5442,8 @@ export type SetAgentThinkingRequestMessage = z.infer<typeof SetAgentThinkingRequ
 export type SetAgentFeatureRequestMessage = z.infer<typeof SetAgentFeatureRequestMessageSchema>;
 export type AgentDetachRequestMessage = z.infer<typeof AgentDetachRequestMessageSchema>;
 export type AgentPermissionResponseMessage = z.infer<typeof AgentPermissionResponseMessageSchema>;
+export type OriginDefaultRelationState = z.infer<typeof OriginDefaultRelationStateSchema>;
+export type OriginDefaultRelation = z.infer<typeof OriginDefaultRelationSchema>;
 export type CheckoutStatusRequest = z.infer<typeof CheckoutStatusRequestSchema>;
 export type CheckoutStatusResponse = z.infer<typeof CheckoutStatusResponseSchema>;
 export type CheckoutStatusUpdate = z.infer<typeof CheckoutStatusUpdateSchema>;

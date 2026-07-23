@@ -31,6 +31,10 @@ const requiredHistory = [
     "ef189b45315da7cc1aa515c0f697b1eadb7ccca2",
     "landed-to-default sidebar status and fail-closed archive safety",
   ],
+  [
+    "36f08fff357f5bae0e07c5acd21d11ef48244a09",
+    "final deletion-boundary safety and exact canonical packaging enforcement",
+  ],
 ];
 
 function isAncestor(commit, descendant) {

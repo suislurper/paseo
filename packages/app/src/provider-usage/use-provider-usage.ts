@@ -1,24 +1,15 @@
 import { useCallback, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { providerUsageCopy } from "./copy";
 import { providerUsageQueryKey } from "./query-key";
-import type { ProviderUsageListPayload, ProviderUsageView } from "./types";
+import { refreshProviderUsageCache } from "./refresh";
+import type { ProviderUsageView } from "./types";
 
 export { providerUsageQueryKey } from "./query-key";
 
 export const PROVIDER_USAGE_STALE_TIME_MS = 5 * 60 * 1000;
-
-type ProviderUsageClient = Pick<DaemonClient, "listProviderUsage">;
-
-async function fetchProviderUsage(
-  client: ProviderUsageClient,
-  options?: { forceRefresh?: boolean },
-): Promise<ProviderUsageListPayload> {
-  return client.listProviderUsage(options);
-}
 
 interface UseProviderUsageOptions {
   enabled?: boolean;
@@ -50,7 +41,7 @@ export function useProviderUsage(
     if (!client) {
       throw new Error(providerUsageCopy.clientUnavailable);
     }
-    return fetchProviderUsage(client);
+    return client.listProviderUsage();
   }, [client]);
 
   const query = useQuery({
@@ -64,19 +55,12 @@ export function useProviderUsage(
   });
 
   const refresh = useCallback(async () => {
-    if (!canFetch) return;
-    await queryClient.invalidateQueries({ queryKey });
-    await queryClient.fetchQuery({
+    if (!canFetch || !client) return;
+    await refreshProviderUsageCache({
+      queryClient,
       queryKey,
-      queryFn: async () => {
-        if (!client) {
-          throw new Error(providerUsageCopy.clientUnavailable);
-        }
-        return fetchProviderUsage(client, {
-          forceRefresh: supportsForceRefresh,
-        });
-      },
-      staleTime: PROVIDER_USAGE_STALE_TIME_MS,
+      client,
+      forceRefresh: supportsForceRefresh,
     });
   }, [canFetch, client, queryClient, queryKey, supportsForceRefresh]);
 

@@ -9,6 +9,8 @@ export interface WorktreeCreateOptions extends CommandOptions {
   base?: string;
   branch?: string;
   prNumber?: string;
+  wait?: boolean;
+  waitTimeout?: string;
 }
 
 const VALID_MODES = ["branch-off", "checkout-branch", "checkout-pr"] as const;

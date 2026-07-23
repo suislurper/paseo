@@ -3,9 +3,11 @@ import type { Command } from "commander";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import type { CommandError, OutputSchema, SingleResult } from "../../output/index.js";
+import { parseDuration } from "../../utils/duration.js";
 import { buildCreateWorktreeRequest, type WorktreeCreateOptions } from "./create-input.js";
 
 export interface WorktreeCreateResult {
+  workspaceId: string;
   name: string;
   branchName: string;
   worktreePath: string;
@@ -20,21 +22,84 @@ export const createSchema: OutputSchema<WorktreeCreateResult> = {
   ],
 };
 
+interface CreateCommandDependencies {
+  connectToDaemon: typeof connectToDaemon;
+  now: () => number;
+  sleep: (milliseconds: number) => Promise<void>;
+}
+
+const DEFAULT_SETUP_WAIT_TIMEOUT = "30m";
+const SETUP_POLL_INTERVAL_MS = 250;
+
 function cmdError(code: string, message: string, details?: string): CommandError {
   return details ? { code, message, details } : { code, message };
 }
 
-export async function runCreateCommand(
+function resolveSetupWaitTimeout(options: WorktreeCreateOptions): number {
+  const rawTimeout = options.waitTimeout ?? DEFAULT_SETUP_WAIT_TIMEOUT;
+  try {
+    const timeoutMs = parseDuration(rawTimeout);
+    if (timeoutMs <= 0) {
+      throw new Error("Timeout must be positive");
+    }
+    return timeoutMs;
+  } catch (error) {
+    throw cmdError(
+      "INVALID_WAIT_TIMEOUT",
+      `Invalid --wait-timeout: ${rawTimeout}`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+async function waitForWorkspaceSetup(
+  client: DaemonClient,
+  workspaceId: string,
+  timeoutMs: number,
+  dependencies: Pick<CreateCommandDependencies, "now" | "sleep">,
+): Promise<void> {
+  const startedAt = dependencies.now();
+
+  while (true) {
+    const response = await client.fetchWorkspaceSetupStatus(workspaceId);
+    const snapshot = response.snapshot;
+    if (snapshot?.status === "completed") {
+      return;
+    }
+    if (snapshot?.status === "failed") {
+      throw cmdError(
+        "WORKTREE_SETUP_FAILED",
+        "Worktree setup failed",
+        snapshot.error ?? "The setup hook reported failure",
+      );
+    }
+
+    const elapsedMs = dependencies.now() - startedAt;
+    if (elapsedMs >= timeoutMs) {
+      throw cmdError(
+        "WORKTREE_SETUP_TIMEOUT",
+        `Worktree setup did not finish within ${Math.ceil(timeoutMs / 1000)} seconds`,
+        `The managed worktree remains registered as workspace ${workspaceId}; inspect its setup status before using or archiving it.`,
+      );
+    }
+
+    await dependencies.sleep(Math.min(SETUP_POLL_INTERVAL_MS, timeoutMs - elapsedMs));
+  }
+}
+
+export async function runCreateCommandWithDeps(
   options: WorktreeCreateOptions,
   _command: Command,
+  dependencies: CreateCommandDependencies,
 ): Promise<SingleResult<WorktreeCreateResult>> {
   const cwd = options.cwd ?? process.cwd();
   const request = buildCreateWorktreeRequest(options, cwd);
+  const setupWaitTimeoutMs = options.wait ? resolveSetupWaitTimeout(options) : null;
 
   const host = getDaemonHost({ host: options.host });
   let client: DaemonClient;
   try {
-    client = await connectToDaemon({ host: options.host });
+    client = await dependencies.connectToDaemon({ host: options.host });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw cmdError(
@@ -63,9 +128,14 @@ export async function runCreateCommand(
     }
     const worktreePath = workspace.workspaceDirectory;
 
+    if (setupWaitTimeoutMs !== null) {
+      await waitForWorkspaceSetup(client, workspace.id, setupWaitTimeoutMs, dependencies);
+    }
+
     return {
       type: "single",
       data: {
+        workspaceId: workspace.id,
         name: path.basename(worktreePath),
         branchName: workspace.name,
         worktreePath,
@@ -81,4 +151,15 @@ export async function runCreateCommand(
   } finally {
     await client.close().catch(() => {});
   }
+}
+
+export async function runCreateCommand(
+  options: WorktreeCreateOptions,
+  command: Command,
+): Promise<SingleResult<WorktreeCreateResult>> {
+  return runCreateCommandWithDeps(options, command, {
+    connectToDaemon,
+    now: Date.now,
+    sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  });
 }

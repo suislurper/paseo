@@ -24,6 +24,8 @@ export function createWorktreeCommand(): Command {
       )
       .option("--branch <name>", "Existing branch to check out (--mode checkout-branch)")
       .option("--pr-number <n>", "Pull request number (--mode checkout-pr)")
+      .option("--wait", "Wait for the worktree setup hook to complete successfully")
+      .option("--wait-timeout <duration>", "Maximum setup wait (default: 30m)", "30m")
       .option("--cwd <path>", "Repository directory (default: current)"),
   ).action(withOutput(runCreateCommand));
 

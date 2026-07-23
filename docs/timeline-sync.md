@@ -51,9 +51,24 @@ When a client resumes with a known cursor, it catches up after that cursor to co
 
 When a client resumes without a cursor, it fetches the latest tail page.
 
+## Selective delivery lifetime
+
+The app subscribes the daemon to the union of agents visible across its panes.
+Newly visible agents subscribe and catch up immediately. Visibility-driven
+removals remain subscribed for 30 seconds so brief chat, workspace, route, and
+app switches keep receiving live assistant and tool events instead of repeatedly
+unsubscribing and catching up.
+
+A desktop app remains timeline-visible while its page is visible, even when
+another window has keyboard focus. Disconnecting or disposing the session
+cancels pending grace timers because the live subscription no longer exists.
+After grace expires, reopening a chat performs the normal authoritative
+catch-up.
+
 ## Relevant code
 
 - Server live stream forwarding: `packages/server/src/server/session.ts`
 - App sync planning: `packages/app/src/timeline/timeline-sync-plan.ts`
+- App viewed-agent synchronization: `packages/app/src/timeline/viewed-timeline-sync.ts`
 - App stream/timeline reducer: `packages/app/src/timeline/session-stream-reducers.ts`
 - Session wiring: `packages/app/src/contexts/session-context.tsx`

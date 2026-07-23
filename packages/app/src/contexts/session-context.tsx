@@ -38,7 +38,7 @@ import type { AudioPlaybackSource } from "@/voice/audio-engine-types";
 import { useSessionStore, type MessageEntry, type SessionState } from "@/stores/session-store";
 import { useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
 import { sendOsNotification } from "@/utils/os-notifications";
-import { getIsAppActivelyVisible } from "@/utils/app-visibility";
+import { getIsAppActivelyVisible, getIsAppVisible } from "@/utils/app-visibility";
 import {
   getInitKey,
   getInitDeferred,
@@ -750,14 +750,14 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       reportError: (error) => {
         console.warn("[Session] viewed timeline synchronization failed", { serverId, error });
       },
-      scheduleRetry: (retry) => {
-        const timeout = setTimeout(retry, 1_000);
+      schedule: (task, delayMs) => {
+        const timeout = setTimeout(task, delayMs);
         return () => clearTimeout(timeout);
       },
     });
     viewedTimelineSyncRef.current = sync;
     setViewedTimelineSync(serverId, sync);
-    sync.setActive(getIsAppActivelyVisible(appStateRef.current));
+    sync.setActive(getIsAppVisible(appStateRef.current));
 
     return () => {
       if (viewedTimelineSyncRef.current === sync) {

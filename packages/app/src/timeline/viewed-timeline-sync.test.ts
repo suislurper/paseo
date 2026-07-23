@@ -1,6 +1,9 @@
 import { expect, test } from "vitest";
 import type { ProjectedTimelineForwardFetchPlan } from "./timeline-sync-plan";
-import { createViewedTimelineSync } from "./viewed-timeline-sync";
+import {
+  createViewedTimelineSync,
+  VIEWED_TIMELINE_UNSUBSCRIBE_GRACE_MS,
+} from "./viewed-timeline-sync";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -69,13 +72,17 @@ class TimelineWorld {
       const waiter = this.errorWaiters.shift();
       if (waiter) waiter(this.errors.at(-1) ?? "");
     },
-    scheduleRetry: (retry) => {
-      this.retries.push(retry);
+    schedule: (task, delayMs) => {
+      const scheduled = { task, delayMs };
+      this.scheduled.push(scheduled);
       const waiter = this.retryWaiters.shift();
-      if (waiter) waiter(this.retries.shift()!);
+      if (waiter && delayMs === 1_000) {
+        this.scheduled.splice(this.scheduled.indexOf(scheduled), 1);
+        waiter(task);
+      }
       return () => {
-        const index = this.retries.indexOf(retry);
-        if (index >= 0) this.retries.splice(index, 1);
+        const index = this.scheduled.indexOf(scheduled);
+        if (index >= 0) this.scheduled.splice(index, 1);
       };
     },
   });
@@ -90,7 +97,7 @@ class TimelineWorld {
   private readonly cursors = new Map<string, { epoch: string; startSeq: number; endSeq: number }>();
   private readonly authoritativeHistory = new Set<string>();
   private readonly errorWaiters: Array<(message: string) => void> = [];
-  private readonly retries: Array<() => void> = [];
+  private readonly scheduled: Array<{ task: () => void; delayMs: number }> = [];
   private readonly retryWaiters: Array<(retry: () => void) => void> = [];
 
   setCursor(agentId: string, endSeq: number): void {
@@ -129,9 +136,23 @@ class TimelineWorld {
   }
 
   nextRetry(): Promise<() => void> {
-    const retry = this.retries.shift();
-    if (retry) return Promise.resolve(retry);
+    const index = this.scheduled.findIndex((entry) => entry.delayMs === 1_000);
+    if (index >= 0) return Promise.resolve(this.scheduled.splice(index, 1)[0].task);
     return new Promise((resolve) => this.retryWaiters.push(resolve));
+  }
+
+  runUnsubscribeGrace(): void {
+    const index = this.scheduled.findIndex(
+      (entry) => entry.delayMs === VIEWED_TIMELINE_UNSUBSCRIBE_GRACE_MS,
+    );
+    expect(index).toBeGreaterThanOrEqual(0);
+    this.scheduled.splice(index, 1)[0].task();
+  }
+
+  expectNoPendingUnsubscribe(): void {
+    expect(
+      this.scheduled.filter((entry) => entry.delayMs === VIEWED_TIMELINE_UNSUBSCRIBE_GRACE_MS),
+    ).toEqual([]);
   }
 
   private releaseMembershipWaiter(): void {
@@ -211,6 +232,7 @@ test("membership changes during acknowledgement never catch up the stale set", a
   const staleMembership = await world.nextMembership();
 
   world.sync.replaceVisibleAgentIds("workspace", ["agent-b"]);
+  world.runUnsubscribeGrace();
   staleMembership.succeed();
   const currentMembership = await world.nextMembership();
   currentMembership.succeed();
@@ -236,6 +258,7 @@ test("removing one agent during paging cancels only that agent", async () => {
   ]);
 
   world.sync.replaceVisibleAgentIds("workspace", ["agent-b"]);
+  world.runUnsubscribeGrace();
   const replacement = await world.nextMembership();
   agentA.respond({ hasNewer: true, seq: 4 });
   agentB.respond({ hasNewer: true, seq: 7 });
@@ -284,6 +307,7 @@ test("overlapping sources deduplicate membership and source removal preserves re
   world.sync.replaceVisibleAgentIds("left-route", []);
   world.expectNoPendingMembership();
   world.sync.replaceVisibleAgentIds("right-route", ["agent-b"]);
+  world.runUnsubscribeGrace();
   const remaining = await world.nextMembership();
   remaining.succeed();
 
@@ -384,7 +408,7 @@ test("membership failure autonomously retries without another visibility declara
   });
 });
 
-test("background sends an empty set and foreground restores visible membership", async () => {
+test("background waits for grace before unsubscribing and catches up on return", async () => {
   const world = new TimelineWorld();
   world.sync.setConnected(true);
   world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
@@ -394,6 +418,8 @@ test("background sends an empty set and foreground restores visible membership",
   initialCatchUp.respond({ hasNewer: false });
 
   world.sync.setActive(false);
+  world.expectNoPendingMembership();
+  world.runUnsubscribeGrace();
   const background = await world.nextMembership();
   background.succeed();
   world.sync.setActive(true);
@@ -408,6 +434,42 @@ test("background sends an empty set and foreground restores visible membership",
   });
 });
 
+test("returning to a chat within grace preserves its live membership", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+  const catchUp = await world.nextFetch("agent-a");
+  catchUp.respond({ hasNewer: false });
+
+  world.sync.replaceVisibleAgentIds("workspace", []);
+  world.expectNoPendingMembership();
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+
+  world.expectNoPendingUnsubscribe();
+  world.expectNoPendingMembership();
+  world.expectNoPendingFetch();
+});
+
+test("unsubscribe grace expiry removes a hidden chat", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed();
+  const catchUp = await world.nextFetch("agent-a");
+  catchUp.respond({ hasNewer: false });
+
+  world.sync.replaceVisibleAgentIds("workspace", []);
+  world.runUnsubscribeGrace();
+  const unsubscribe = await world.nextMembership();
+  unsubscribe.succeed();
+
+  expect(unsubscribe.agentIds).toEqual([]);
+  world.expectNoPendingUnsubscribe();
+});
+
 test("stale membership retry cannot overwrite a newer effective set", async () => {
   const world = new TimelineWorld();
   world.sync.setConnected(true);
@@ -417,6 +479,7 @@ test("stale membership retry cannot overwrite a newer effective set", async () =
   const staleRetry = await world.nextRetry();
 
   world.sync.replaceVisibleAgentIds("workspace", ["agent-b"]);
+  world.runUnsubscribeGrace();
   const current = await world.nextMembership();
   staleRetry();
   current.succeed();

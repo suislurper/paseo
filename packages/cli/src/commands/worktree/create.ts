@@ -26,6 +26,10 @@ interface CreateCommandDependencies {
   connectToDaemon: typeof connectToDaemon;
   now: () => number;
   sleep: (milliseconds: number) => Promise<void>;
+  settleWithin: <T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+  ) => Promise<{ timedOut: true } | { timedOut: false; value: T }>;
 }
 
 const DEFAULT_SETUP_WAIT_TIMEOUT = "30m";
@@ -33,6 +37,14 @@ const SETUP_POLL_INTERVAL_MS = 250;
 
 function cmdError(code: string, message: string, details?: string): CommandError {
   return details ? { code, message, details } : { code, message };
+}
+
+function setupTimeoutError(workspaceId: string, timeoutMs: number): CommandError {
+  return cmdError(
+    "WORKTREE_SETUP_TIMEOUT",
+    `Worktree setup did not finish within ${Math.ceil(timeoutMs / 1000)} seconds`,
+    `The managed worktree remains registered as workspace ${workspaceId}; inspect its setup status before using or archiving it.`,
+  );
 }
 
 function resolveSetupWaitTimeout(options: WorktreeCreateOptions): number {
@@ -56,12 +68,26 @@ async function waitForWorkspaceSetup(
   client: DaemonClient,
   workspaceId: string,
   timeoutMs: number,
-  dependencies: Pick<CreateCommandDependencies, "now" | "sleep">,
+  dependencies: Pick<CreateCommandDependencies, "now" | "sleep" | "settleWithin">,
 ): Promise<void> {
   const startedAt = dependencies.now();
 
   while (true) {
-    const response = await client.fetchWorkspaceSetupStatus(workspaceId);
+    const elapsedBeforeRequestMs = dependencies.now() - startedAt;
+    const remainingBeforeRequestMs = timeoutMs - elapsedBeforeRequestMs;
+    if (remainingBeforeRequestMs <= 0) {
+      throw setupTimeoutError(workspaceId, timeoutMs);
+    }
+
+    const statusResult = await dependencies.settleWithin(
+      client.fetchWorkspaceSetupStatus(workspaceId),
+      remainingBeforeRequestMs,
+    );
+    if (statusResult.timedOut) {
+      throw setupTimeoutError(workspaceId, timeoutMs);
+    }
+
+    const response = statusResult.value;
     const snapshot = response.snapshot;
     if (snapshot?.status === "completed") {
       return;
@@ -76,11 +102,7 @@ async function waitForWorkspaceSetup(
 
     const elapsedMs = dependencies.now() - startedAt;
     if (elapsedMs >= timeoutMs) {
-      throw cmdError(
-        "WORKTREE_SETUP_TIMEOUT",
-        `Worktree setup did not finish within ${Math.ceil(timeoutMs / 1000)} seconds`,
-        `The managed worktree remains registered as workspace ${workspaceId}; inspect its setup status before using or archiving it.`,
-      );
+      throw setupTimeoutError(workspaceId, timeoutMs);
     }
 
     await dependencies.sleep(Math.min(SETUP_POLL_INTERVAL_MS, timeoutMs - elapsedMs));
@@ -161,5 +183,19 @@ export async function runCreateCommand(
     connectToDaemon,
     now: Date.now,
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    settleWithin: (promise, timeoutMs) =>
+      new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+        promise.then(
+          (value) => {
+            clearTimeout(timeout);
+            return resolve({ timedOut: false, value });
+          },
+          (error: unknown) => {
+            clearTimeout(timeout);
+            return reject(error);
+          },
+        );
+      }),
   });
 }

@@ -51,6 +51,10 @@ function createDependencies(client: DaemonClient, clock: { now: number }) {
     sleep: vi.fn(async (milliseconds: number) => {
       clock.now += milliseconds;
     }),
+    settleWithin: async <T>(promise: Promise<T>) => ({
+      timedOut: false as const,
+      value: await promise,
+    }),
   };
 }
 
@@ -113,7 +117,8 @@ describe("runCreateCommandWithDeps", () => {
 
   it("times out while setup remains unavailable", async () => {
     const client = createFakeDaemonClient([]);
-    const dependencies = createDependencies(client, { now: 0 });
+    const clock = { now: 0 };
+    const dependencies = createDependencies(client, clock);
 
     await expect(
       runCreateCommandWithDeps(
@@ -129,5 +134,33 @@ describe("runCreateCommandWithDeps", () => {
     ).rejects.toMatchObject({
       code: "WORKTREE_SETUP_TIMEOUT",
     });
+    expect(clock.now).toBe(500);
+  });
+
+  it("enforces the deadline when a setup-status request never resolves and closes the client", async () => {
+    const client = createFakeDaemonClient([]);
+    client.fetchWorkspaceSetupStatus = async () => new Promise(() => {});
+    const close = vi.spyOn(client, "close");
+    const dependencies = {
+      ...createDependencies(client, { now: 0 }),
+      settleWithin: vi.fn(async () => ({ timedOut: true as const })),
+    };
+
+    await expect(
+      runCreateCommandWithDeps(
+        {
+          mode: "branch-off",
+          newBranch: "feature/example",
+          wait: true,
+          waitTimeout: "5s",
+        },
+        {} as Command,
+        dependencies,
+      ),
+    ).rejects.toMatchObject({
+      code: "WORKTREE_SETUP_TIMEOUT",
+    });
+    expect(dependencies.settleWithin).toHaveBeenCalledWith(expect.any(Promise), 5_000);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });

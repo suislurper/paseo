@@ -75,6 +75,7 @@ See [docs/development.md](docs/development.md) for full setup, build sync requir
 
 ## Critical rules
 
+- **This operator runs the canonical fork at `suislurper/paseo:main`.** Its multi-profile Claude support, modeless cross-provider behavior, per-profile usage, and active-provider selection are required product behavior—not optional local patches. Never build or install the desktop app from `getpaseo/paseo` or from a branch that has not passed `npm run verify:operator-fork`. `npm run build:desktop` runs this check automatically. When updating from upstream, integrate upstream into the canonical fork while retaining the guarded history; never replace fork `main` with upstream history. See [docs/operator-fork.md](docs/operator-fork.md).
 - **NEVER restart the main Paseo daemon on port 6767 without permission** — it manages all running agents. If you're an agent, restarting it kills your own process.
 - **NEVER assume a timeout means the service needs restarting** — timeouts can be transient.
 - **NEVER add auth checks to tests** — agent providers handle their own auth.

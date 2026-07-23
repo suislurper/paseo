@@ -332,6 +332,20 @@ The desktop-managed daemon disables the bundled web UI by default (`PASEO_WEB_UI
 
 Package imports resolve through package exports to compiled `dist/` output, not sibling `src/` files. This is true in local dev and in published packages: the app, daemon, CLI, and SDK consumers should all exercise the same runtime paths.
 
+### Operator fork desktop builds
+
+The installed operator desktop app is built from `suislurper/paseo:main`, which includes
+required multi-profile and modeless-provider behavior. Before packaging, run:
+
+```bash
+npm run verify:operator-fork
+npm run build:desktop
+```
+
+The desktop build runs the verification automatically. See
+[operator-fork.md](operator-fork.md) for the canonical remote, protected features, and upstream
+integration rules.
+
 `npm run dev:server` builds the server-side workspace packages once, then keeps `@getpaseo/protocol` and `@getpaseo/client` fresh with TypeScript watch builds while the daemon runs. If you change protocol schemas or client code outside that watch workflow, rebuild the producer before trusting runtime behavior.
 
 Use the named root build targets instead of remembering workspace dependency chains:

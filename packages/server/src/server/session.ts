@@ -5406,15 +5406,21 @@ export class Session {
       }
 
       if (existing.kind === "worktree") {
-        const ownership = await isPaseoOwnedWorktreeCwd(existing.worktreeRoot ?? existing.cwd, {
-          paseoHome: this.paseoHome,
-          worktreesRoot: this.worktreesRoot,
-        });
-        if (!ownership.allowed) {
-          throw new Error(
-            "Cannot archive this worktree because it is not a Paseo-managed worktree. " +
-              "Remove it with Git, or hide its workspace without deleting files.",
-          );
+        const hasDurableOwnedPlacement =
+          existing.isPaseoOwnedWorktree &&
+          existing.worktreeRoot !== null &&
+          existing.mainRepoRoot !== null;
+        if (!hasDurableOwnedPlacement) {
+          const ownership = await isPaseoOwnedWorktreeCwd(existing.worktreeRoot ?? existing.cwd, {
+            paseoHome: this.paseoHome,
+            worktreesRoot: this.worktreesRoot,
+          });
+          if (!ownership.allowed) {
+            throw new Error(
+              "Cannot archive this worktree because it is not a Paseo-managed worktree. " +
+                "Remove it with Git, or hide its workspace without deleting files.",
+            );
+          }
         }
       }
 

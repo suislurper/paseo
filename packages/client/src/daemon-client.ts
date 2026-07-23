@@ -2954,7 +2954,7 @@ export class DaemonClient {
   ): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
-      type: "set_agent_provider_request",
+      type: "agent.provider.set.request",
       agentId,
       providerId,
       modelId,
@@ -2965,7 +2965,7 @@ export class DaemonClient {
       message,
       options: { skipQueue: true },
       select: (msg) => {
-        if (msg.type !== "set_agent_provider_response") {
+        if (msg.type !== "agent.provider.set.response") {
           return null;
         }
         if (msg.payload.requestId !== requestId) {
@@ -4424,11 +4424,15 @@ export class DaemonClient {
     });
   }
 
-  async listProviderUsage(options?: { requestId?: string }): Promise<ProviderUsageListPayload> {
+  async listProviderUsage(options?: {
+    requestId?: string;
+    forceRefresh?: boolean;
+  }): Promise<ProviderUsageListPayload> {
     return this.sendNamespacedCorrelatedSessionRequest({
       requestId: options?.requestId,
       message: {
         type: "provider.usage.list.request",
+        ...(options?.forceRefresh === true ? { forceRefresh: true } : {}),
       },
     });
   }

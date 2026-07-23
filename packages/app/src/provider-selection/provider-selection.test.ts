@@ -7,6 +7,7 @@ import {
   buildSelectableProviderSelectorProviders,
   buildSelectedTriggerLabel,
   applyDesktopModelSelection,
+  filterActiveAgentProviderEntries,
   filterAndRankModelRows,
   filterCompatibleProviderEntries,
   matchesModelSearch,
@@ -109,6 +110,19 @@ describe("combined model selector data", () => {
           ],
         },
       },
+    ]);
+  });
+
+  it("keeps legacy daemons on the active provider while newer daemons expose profiles", () => {
+    const primary = snapshotEntry({ provider: "claude-primary", baseProvider: "claude" });
+    const secondary = snapshotEntry({ provider: "claude-secondary", baseProvider: "claude" });
+
+    expect(filterActiveAgentProviderEntries([primary, secondary], primary, false)).toEqual([
+      primary,
+    ]);
+    expect(filterActiveAgentProviderEntries([primary, secondary], primary, true)).toEqual([
+      primary,
+      secondary,
     ]);
   });
 

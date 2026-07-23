@@ -1303,6 +1303,7 @@ export const ProviderDiagnosticRequestMessageSchema = z.object({
 
 export const ProviderUsageListRequestMessageSchema = z.object({
   type: z.literal("provider.usage.list.request"),
+  forceRefresh: z.boolean().optional(),
   requestId: z.string(),
 });
 
@@ -1433,7 +1434,7 @@ export const SetAgentModelResponseMessageSchema = z.object({
 });
 
 export const SetAgentProviderRequestMessageSchema = z.object({
-  type: z.literal("set_agent_provider_request"),
+  type: z.literal("agent.provider.set.request"),
   agentId: z.string(),
   providerId: z.string(),
   modelId: z.string().nullable(),
@@ -1441,6 +1442,21 @@ export const SetAgentProviderRequestMessageSchema = z.object({
 });
 
 export const SetAgentProviderResponseMessageSchema = z.object({
+  type: z.literal("agent.provider.set.response"),
+  payload: AgentActionResponsePayloadSchema,
+});
+
+// COMPAT(agentProviderSelectionFlatRpc): accepted through 2027-01-23.
+export const LegacySetAgentProviderRequestMessageSchema = z.object({
+  type: z.literal("set_agent_provider_request"),
+  agentId: z.string(),
+  providerId: z.string(),
+  modelId: z.string().nullable(),
+  requestId: z.string(),
+});
+
+// COMPAT(agentProviderSelectionFlatRpc): emitted only for legacy requests through 2027-01-23.
+export const LegacySetAgentProviderResponseMessageSchema = z.object({
   type: z.literal("set_agent_provider_response"),
   payload: AgentActionResponsePayloadSchema,
 });
@@ -2423,6 +2439,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentModeRequestMessageSchema,
   SetAgentModelRequestMessageSchema,
   SetAgentProviderRequestMessageSchema,
+  LegacySetAgentProviderRequestMessageSchema,
   SetAgentThinkingRequestMessageSchema,
   SetAgentFeatureRequestMessageSchema,
   AgentDetachRequestMessageSchema,
@@ -2709,6 +2726,10 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceRecovery: z.boolean().optional(),
         // COMPAT(providerUsageList): added in v0.1.98, drop the gate when daemon floor >= v0.1.98.
         providerUsageList: z.boolean().optional(),
+        // COMPAT(providerUsageForceRefresh): added in v0.1.X, drop the gate when daemon floor >= v0.1.X.
+        providerUsageForceRefresh: z.boolean().optional(),
+        // COMPAT(activeAgentProviderSelection): added in v0.1.X, drop the gate when daemon floor >= v0.1.X.
+        activeAgentProviderSelection: z.boolean().optional(),
         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
         agentDetach: z.boolean().optional(),
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
@@ -5061,6 +5082,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentModeResponseMessageSchema,
   SetAgentModelResponseMessageSchema,
   SetAgentProviderResponseMessageSchema,
+  LegacySetAgentProviderResponseMessageSchema,
   SetAgentThinkingResponseMessageSchema,
   SetAgentFeatureResponseMessageSchema,
   AgentDetachResponseMessageSchema,

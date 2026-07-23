@@ -169,7 +169,7 @@ describe("AgentConfigSession", () => {
     const { subsystem, emitted, operations } = makeSubsystem();
 
     await subsystem.handleSetAgentProviderRequest({
-      type: "set_agent_provider_request",
+      type: "agent.provider.set.request",
       agentId: "agent-1",
       providerId: "claude-secondary",
       modelId: "claude-opus-4-8",
@@ -185,8 +185,33 @@ describe("AgentConfigSession", () => {
     ]);
     expect(emitted).toEqual([
       {
-        type: "set_agent_provider_response",
+        type: "agent.provider.set.response",
         payload: { requestId: "req-1", agentId: "agent-1", accepted: true, error: null },
+      },
+    ]);
+  });
+
+  test("set provider: accepts the legacy flat RPC alias", async () => {
+    const { subsystem, emitted, operations } = makeSubsystem();
+
+    await subsystem.handleSetAgentProviderRequest({
+      type: "set_agent_provider_request",
+      agentId: "agent-1",
+      providerId: "claude-secondary",
+      modelId: "claude-opus-4-8",
+      requestId: "req-legacy",
+    });
+
+    expect(operations.providerCalls).toHaveLength(1);
+    expect(emitted).toEqual([
+      {
+        type: "set_agent_provider_response",
+        payload: {
+          requestId: "req-legacy",
+          agentId: "agent-1",
+          accepted: true,
+          error: null,
+        },
       },
     ]);
   });

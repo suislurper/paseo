@@ -51,6 +51,18 @@ export function applyDesktopModelSelection(input: {
   input.onSelectModel?.(input.modelId);
 }
 
+export function filterActiveAgentProviderEntries(
+  entries: ProviderSnapshotEntry[],
+  selectedEntry: ProviderSnapshotEntry,
+  supportsActiveAgentProviderSelection: boolean,
+): ProviderSnapshotEntry[] {
+  const compatibleEntries = filterCompatibleProviderEntries(entries, selectedEntry);
+  if (supportsActiveAgentProviderSelection) {
+    return compatibleEntries;
+  }
+  return compatibleEntries.filter((entry) => entry.provider === selectedEntry.provider);
+}
+
 function buildModelRows(
   provider: string,
   providerLabel: string,

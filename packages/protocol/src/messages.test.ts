@@ -146,6 +146,16 @@ describe("provider usage list message contract", () => {
     });
   });
 
+  test("accepts an optional forced usage refresh", () => {
+    const parsed = SessionInboundMessageSchema.parse({
+      type: "provider.usage.list.request",
+      forceRefresh: true,
+      requestId: "usage-force",
+    });
+
+    expect(parsed).toMatchObject({ forceRefresh: true });
+  });
+
   test("accepts new providers and new usage windows as normalized data", () => {
     const parsed = SessionOutboundMessageSchema.parse({
       type: "provider.usage.list.response",
@@ -292,6 +302,23 @@ describe("agent detach RPC", () => {
       throw new Error("Expected server info payload to parse");
     }
     expect(parsed.features?.agentDetach).toBe(true);
+  });
+
+  test("parses active-provider and forced-usage feature gates", () => {
+    const parsed = parseServerInfoStatusPayload({
+      status: "server_info",
+      serverId: "srv-test",
+      features: {
+        activeAgentProviderSelection: true,
+        providerUsageForceRefresh: true,
+      },
+    });
+
+    if (!parsed) {
+      throw new Error("Expected server info payload to parse");
+    }
+    expect(parsed.features?.activeAgentProviderSelection).toBe(true);
+    expect(parsed.features?.providerUsageForceRefresh).toBe(true);
   });
 
   test("parses the workspace-targeted session import feature gate", () => {

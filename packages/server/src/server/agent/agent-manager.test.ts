@@ -1464,6 +1464,152 @@ test("setAgentProvider reloads an active agent through a compatible provider pro
   );
 });
 
+test("setAgentProvider rejects pending permissions without canceling or resuming", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-switch-permission-"));
+  let targetAvailabilityChecks = 0;
+
+  class ProfileClient implements AgentClient {
+    readonly capabilities = TEST_CAPABILITIES;
+
+    constructor(readonly provider: string) {}
+
+    async isAvailable(): Promise<boolean> {
+      if (this.provider === "claude-secondary") {
+        targetAvailabilityChecks += 1;
+      }
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new TestAgentSession({
+        provider: this.provider,
+        cwd: config?.cwd ?? workdir,
+      });
+    }
+
+    async fetchCatalog() {
+      return { models: [], modes: [] };
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: {
+      "claude-primary": new ProfileClient("claude-primary"),
+      "claude-secondary": new ProfileClient("claude-secondary"),
+    },
+    providerDefinitions: {
+      "claude-primary": { enabled: true, derivedFromProviderId: "claude" },
+      "claude-secondary": { enabled: true, derivedFromProviderId: "claude" },
+    },
+    logger,
+  });
+  const created = await manager.createAgent(
+    { provider: "claude-primary", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+  manager.getAgent(created.id)?.pendingPermissions.set("perm-1", {
+    id: "perm-1",
+    provider: "claude-primary",
+    kind: "tool",
+    name: "Read file",
+  });
+
+  await expect(manager.setAgentProvider(created.id, "claude-secondary", "opus")).rejects.toThrow(
+    "running or awaiting permission",
+  );
+
+  expect(targetAvailabilityChecks).toBe(0);
+  expect(manager.getAgent(created.id)?.provider).toBe("claude-primary");
+  expect(manager.getAgent(created.id)?.pendingPermissions.size).toBe(1);
+});
+
+test("setAgentProvider reserves the session against concurrent lifecycle operations", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-switch-reservation-"));
+  const releaseAvailability = deferred<void>();
+
+  class ProfileClient implements AgentClient {
+    readonly capabilities = TEST_CAPABILITIES;
+
+    constructor(
+      readonly provider: string,
+      private readonly waitForAvailability = false,
+    ) {}
+
+    async isAvailable(): Promise<boolean> {
+      if (this.waitForAvailability) {
+        await releaseAvailability.promise;
+      }
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new TestAgentSession({
+        provider: this.provider,
+        cwd: config?.cwd ?? workdir,
+        model: config?.model,
+      });
+    }
+
+    async fetchCatalog() {
+      return { models: [], modes: [] };
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: {
+      "claude-primary": new ProfileClient("claude-primary"),
+      "claude-secondary": new ProfileClient("claude-secondary", true),
+    },
+    providerDefinitions: {
+      "claude-primary": { enabled: true, derivedFromProviderId: "claude" },
+      "claude-secondary": { enabled: true, derivedFromProviderId: "claude" },
+    },
+    logger,
+  });
+  const created = await manager.createAgent(
+    { provider: "claude-primary", cwd: workdir },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  const switching = manager.setAgentProvider(created.id, "claude-secondary", "opus");
+  await Promise.resolve();
+
+  await expect(manager.setAgentProvider(created.id, "claude-secondary", "opus")).rejects.toThrow(
+    "provider switch is in progress",
+  );
+  await expect(manager.reloadAgentSession(created.id)).rejects.toThrow(
+    "provider switch is in progress",
+  );
+  await expect(manager.closeAgent(created.id)).rejects.toThrow("provider switch is in progress");
+  await expect(manager.archiveAgent(created.id)).rejects.toThrow("provider switch is in progress");
+  await expect(manager.replaceAgentRun(created.id, "replacement")).rejects.toThrow(
+    "provider switch is in progress",
+  );
+  expect(() => manager.streamAgent(created.id, "new run")).toThrow(
+    "provider switch is in progress",
+  );
+
+  releaseAvailability.resolve();
+  await switching;
+  expect(manager.getAgent(created.id)?.provider).toBe("claude-secondary");
+});
+
 test("reloadAgentSession completes when the previous session close hangs", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-close-timeout-"));
   const storagePath = join(workdir, "agents");

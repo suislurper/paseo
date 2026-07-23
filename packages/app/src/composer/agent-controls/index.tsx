@@ -29,7 +29,7 @@ import {
   buildProviderSelectorProviders,
   buildSelectableProviderSelectorProviders,
   applyDesktopModelSelection,
-  filterCompatibleProviderEntries,
+  filterActiveAgentProviderEntries,
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
 import { useSessionStore } from "@/stores/session-store";
@@ -264,31 +264,6 @@ function makeBadgePressableStyle(
     (pressed || isOpen) && styles.modeBadgePressed,
     disabled && disabledStyle,
   ];
-}
-
-function pickSheetModel({
-  nextProviderId,
-  modelId,
-  currentProvider,
-  onSelectProviderAndModel,
-  onSelectProvider,
-  onSelectModel,
-}: {
-  nextProviderId: string;
-  modelId: string;
-  currentProvider: string;
-  onSelectProviderAndModel?: (provider: string, modelId: string) => void;
-  onSelectProvider?: (providerId: string) => void;
-  onSelectModel?: (modelId: string) => void;
-}) {
-  if (onSelectProviderAndModel) {
-    onSelectProviderAndModel(nextProviderId, modelId);
-    return;
-  }
-  if (nextProviderId !== currentProvider) {
-    onSelectProvider?.(nextProviderId);
-  }
-  onSelectModel?.(modelId);
 }
 
 function resolveProviderIcon(provider: string) {
@@ -552,16 +527,15 @@ function ControlledAgentControls({
 
   const handleSheetModelSelect = useCallback(
     (nextProviderId: string, modelId: string) => {
-      pickSheetModel({
+      applyDesktopModelSelection({
         nextProviderId,
         modelId,
         currentProvider: provider,
         onSelectProviderAndModel,
-        onSelectProvider,
         onSelectModel,
       });
     },
-    [onSelectModel, onSelectProvider, onSelectProviderAndModel, provider],
+    [onSelectModel, onSelectProviderAndModel, provider],
   );
 
   if (!hasAnyControl) {
@@ -1362,6 +1336,10 @@ export const AgentControls = memo(function AgentControls({
     useShallow((state) => selectAgentControlsSlice(state, serverId, agentId)),
   );
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const supportsActiveAgentProviderSelection = useSessionStore(
+    (state) =>
+      state.sessions[serverId]?.serverInfo?.features?.activeAgentProviderSelection === true,
+  );
   const toast = useToast();
 
   const {
@@ -1392,14 +1370,24 @@ export const AgentControls = memo(function AgentControls({
   const agentModelSelectorProviders = useMemo(() => {
     if (snapshotSelectedEntry && snapshotEntries) {
       return buildSelectableProviderSelectorProviders(
-        filterCompatibleProviderEntries(snapshotEntries, snapshotSelectedEntry),
+        filterActiveAgentProviderEntries(
+          snapshotEntries,
+          snapshotSelectedEntry,
+          supportsActiveAgentProviderSelection,
+        ),
       );
     }
     return buildProviderSelectorProviders({
       providerDefinitions: agentProviderDefinitions,
       modelsByProvider: agentProviderModels,
     });
-  }, [agentProviderDefinitions, agentProviderModels, snapshotEntries, snapshotSelectedEntry]);
+  }, [
+    agentProviderDefinitions,
+    agentProviderModels,
+    snapshotEntries,
+    snapshotSelectedEntry,
+    supportsActiveAgentProviderSelection,
+  ]);
 
   const modelSelection = resolveAgentModelSelection({
     models,
@@ -1578,7 +1566,9 @@ export const AgentControls = memo(function AgentControls({
       modelOptions={modelOptions}
       selectedModelId={modelSelection.activeModelId ?? undefined}
       onSelectModel={handleSelectModel}
-      onSelectProviderAndModel={handleSelectProviderAndModel}
+      onSelectProviderAndModel={
+        supportsActiveAgentProviderSelection ? handleSelectProviderAndModel : undefined
+      }
       favoriteKeys={favoriteKeys}
       onToggleFavoriteModel={handleToggleFavoriteModel}
       thinkingOptions={thinkingOptions.length > 1 ? thinkingOptions : undefined}

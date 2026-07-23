@@ -5,6 +5,7 @@ import { checkoutDiffQueryKey } from "@/git/query-keys";
 import { buildTerminalsQueryKey } from "@/screens/workspace/terminals/state";
 import { daemonConfigQueryKey } from "@/data/daemon-config";
 import { providersSnapshotQueryKey } from "@/data/providers-snapshot";
+import { providerUsageQueryKey } from "@/provider-usage/query-key";
 import {
   checkoutDiffPushRoute,
   invalidateServerDataQueriesAfterReconnect,
@@ -145,6 +146,10 @@ describe("server data push router", () => {
     const queryClient = new QueryClient();
     const fake = createFakeClient();
     const serverId = "server-1";
+    queryClient.setQueryData(providerUsageQueryKey(serverId), {
+      fetchedAt: "2026-01-01T00:00:00.000Z",
+      providers: [],
+    });
     const unmount = mountServerDataPushRouter({ client: fake.client, queryClient, serverId });
 
     fake.emit(providerUpdate("2026-01-01T00:00:00.000Z"));
@@ -159,6 +164,7 @@ describe("server data push router", () => {
       requestId: "providers_snapshot_update",
     });
     expect(queryClient.getQueryData(daemonConfigQueryKey(serverId))).toEqual(daemonConfig);
+    expect(queryClient.getQueryState(providerUsageQueryKey(serverId))?.isInvalidated).toBe(true);
 
     unmount();
     fake.emit(providerUpdate("2026-01-01T00:00:01.000Z"));

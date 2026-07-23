@@ -1790,6 +1790,7 @@ export class Session {
         return this.agentConfigSession.handleSetAgentModeRequest(msg);
       case "set_agent_model_request":
         return this.agentConfigSession.handleSetAgentModelRequest(msg);
+      case "agent.provider.set.request":
       case "set_agent_provider_request":
         return this.agentConfigSession.handleSetAgentProviderRequest(msg);
       case "set_agent_feature_request":

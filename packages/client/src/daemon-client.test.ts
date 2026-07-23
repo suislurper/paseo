@@ -5368,6 +5368,90 @@ test("sends provider.usage.list.request and resolves provider.usage.list.respons
   });
 });
 
+test("sends an explicit provider usage force refresh", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const usage = client.listProviderUsage({ requestId: "usage-force", forceRefresh: true });
+
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "session",
+    message: {
+      type: "provider.usage.list.request",
+      forceRefresh: true,
+      requestId: "usage-force",
+    },
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "provider.usage.list.response",
+      payload: {
+        requestId: "usage-force",
+        fetchedAt: "2026-07-23T00:00:00.000Z",
+        providers: [],
+      },
+    }),
+  );
+  await expect(usage).resolves.toMatchObject({ requestId: "usage-force" });
+});
+
+test("sends the namespaced active-provider selection RPC", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const selection = client.setAgentProvider("agent-1", "claude-secondary", "claude-opus-4-8");
+
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "session",
+    message: {
+      type: "agent.provider.set.request",
+      agentId: "agent-1",
+      providerId: "claude-secondary",
+      modelId: "claude-opus-4-8",
+      requestId: expect.any(String),
+    },
+  });
+
+  const requestId = JSON.parse(assertStr(mock.sent[0])).message.requestId as string;
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider.set.response",
+      payload: {
+        requestId,
+        agentId: "agent-1",
+        accepted: true,
+        error: null,
+      },
+    }),
+  );
+  await expect(selection).resolves.toBeUndefined();
+});
+
 test("sends close_items_request and resolves close_items_response", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

@@ -4,18 +4,20 @@ import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { providerUsageCopy } from "./copy";
+import { providerUsageQueryKey } from "./query-key";
 import type { ProviderUsageListPayload, ProviderUsageView } from "./types";
+
+export { providerUsageQueryKey } from "./query-key";
 
 export const PROVIDER_USAGE_STALE_TIME_MS = 5 * 60 * 1000;
 
 type ProviderUsageClient = Pick<DaemonClient, "listProviderUsage">;
 
-export function providerUsageQueryKey(serverId: string | null | undefined) {
-  return ["providerUsage", serverId ?? ""] as const;
-}
-
-async function fetchProviderUsage(client: ProviderUsageClient): Promise<ProviderUsageListPayload> {
-  return client.listProviderUsage();
+async function fetchProviderUsage(
+  client: ProviderUsageClient,
+  options?: { forceRefresh?: boolean },
+): Promise<ProviderUsageListPayload> {
+  return client.listProviderUsage(options);
 }
 
 interface UseProviderUsageOptions {
@@ -35,6 +37,10 @@ export function useProviderUsage(
   const isConnected = useHostRuntimeIsConnected(serverId ?? "");
   const supportsProviderUsage = useSessionStore(
     (state) => state.sessions[serverId ?? ""]?.serverInfo?.features?.providerUsageList === true,
+  );
+  const supportsForceRefresh = useSessionStore(
+    (state) =>
+      state.sessions[serverId ?? ""]?.serverInfo?.features?.providerUsageForceRefresh === true,
   );
   const queryKey = useMemo(() => providerUsageQueryKey(serverId), [serverId]);
   const canFetch = Boolean(serverId && client && isConnected && supportsProviderUsage);
@@ -62,10 +68,17 @@ export function useProviderUsage(
     await queryClient.invalidateQueries({ queryKey });
     await queryClient.fetchQuery({
       queryKey,
-      queryFn,
+      queryFn: async () => {
+        if (!client) {
+          throw new Error(providerUsageCopy.clientUnavailable);
+        }
+        return fetchProviderUsage(client, {
+          forceRefresh: supportsForceRefresh,
+        });
+      },
       staleTime: PROVIDER_USAGE_STALE_TIME_MS,
     });
-  }, [canFetch, queryClient, queryFn, queryKey]);
+  }, [canFetch, client, queryClient, queryKey, supportsForceRefresh]);
 
   const view = useMemo<ProviderUsageView>(() => {
     if (!serverId || !client || !isConnected) {

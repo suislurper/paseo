@@ -102,20 +102,27 @@ export class AgentConfigSession {
   }
 
   handleSetAgentProviderRequest(
-    msg: Extract<SessionInboundMessage, { type: "set_agent_provider_request" }>,
+    msg: Extract<
+      SessionInboundMessage,
+      { type: "agent.provider.set.request" | "set_agent_provider_request" }
+    >,
   ): Promise<void> {
     const { agentId, providerId, modelId, requestId } = msg;
+    const responseType =
+      msg.type === "agent.provider.set.request"
+        ? "agent.provider.set.response"
+        : "set_agent_provider_response";
     return this.applyConfigChange({
       agentId,
       requestId,
-      logLabel: "set_agent_provider_request",
+      logLabel: msg.type,
       logFields: { agentId, providerId, modelId, requestId },
       failureText: "Failed to set agent provider",
       run: async () => {
         await this.operations.setProvider(agentId, providerId, modelId);
         return undefined;
       },
-      emitResponse: (payload) => this.host.emit({ type: "set_agent_provider_response", payload }),
+      emitResponse: (payload) => this.host.emit({ type: responseType, payload }),
     });
   }
 

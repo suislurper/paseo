@@ -574,6 +574,7 @@ export class AgentManager {
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
+  private readonly agentSessionTransitions = new Map<string, string>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -1182,9 +1183,18 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: ReloadAgentSessionOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(
+    let transition: string;
+    try {
+      transition = this.beginAgentSessionTransition(agentId, "reload");
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const result = this.trackAgentRegistrationOperation(
       this.reloadAgentSessionInternal(agentId, overrides, options),
     );
+    return result.finally(() => {
+      this.endAgentSessionTransition(agentId, transition);
+    });
   }
 
   private async reloadAgentSessionInternal(
@@ -1222,6 +1232,9 @@ export class AgentManager {
     let handedToRegistration = false;
     try {
       this.assertAcceptingAgentRegistrations();
+      if (this.agents.get(agentId) !== existing) {
+        throw new Error(`Agent ${agentId} changed while its session was being reloaded`);
+      }
 
       const closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
       try {
@@ -1317,6 +1330,18 @@ export class AgentManager {
   }
 
   async closeAgent(agentId: string, options: { persistClosedState?: boolean } = {}): Promise<void> {
+    const transition = this.beginAgentSessionTransition(agentId, "close");
+    try {
+      await this.closeAgentInternal(agentId, options);
+    } finally {
+      this.endAgentSessionTransition(agentId, transition);
+    }
+  }
+
+  private async closeAgentInternal(
+    agentId: string,
+    options: { persistClosedState?: boolean } = {},
+  ): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1351,26 +1376,31 @@ export class AgentManager {
   }
 
   async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
-    const agent = this.requireAgent(agentId);
-    if (!this.registry) {
-      throw new Error("Agent storage is not configured");
+    const transition = this.beginAgentSessionTransition(agentId, "archive");
+    try {
+      const agent = this.requireAgent(agentId);
+      if (!this.registry) {
+        throw new Error("Agent storage is not configured");
+      }
+
+      await this.registry.applySnapshot(agent, {
+        internal: agent.internal,
+      });
+      const stored = await this.registry.get(agentId);
+      if (!stored) {
+        throw new Error(`Agent ${agentId} not found in storage after snapshot`);
+      }
+
+      const { archivedAt } = await this.markRecordArchived(stored);
+      agent.updatedAt = new Date(archivedAt);
+      await this.closeAgentInternal(agentId);
+
+      await this.cascadeArchiveChildren(agentId);
+
+      return { archivedAt };
+    } finally {
+      this.endAgentSessionTransition(agentId, transition);
     }
-
-    await this.registry.applySnapshot(agent, {
-      internal: agent.internal,
-    });
-    const stored = await this.registry.get(agentId);
-    if (!stored) {
-      throw new Error(`Agent ${agentId} not found in storage after snapshot`);
-    }
-
-    const { archivedAt } = await this.markRecordArchived(stored);
-    agent.updatedAt = new Date(archivedAt);
-    await this.closeAgent(agentId);
-
-    await this.cascadeArchiveChildren(agentId);
-
-    return { archivedAt };
   }
 
   // Children created via the MCP `create_agent` tool carry the parent-agent-id
@@ -1472,6 +1502,7 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
+    this.assertNoAgentSessionTransition(agentId, "change mode");
     const agent = this.requireSessionAgent(agentId);
     const notice = (await agent.session.setMode(modeId)) ?? null;
     const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
@@ -1487,6 +1518,7 @@ export class AgentManager {
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
+    this.assertNoAgentSessionTransition(agentId, "change model");
     const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
@@ -1508,35 +1540,46 @@ export class AgentManager {
     providerId: string,
     modelId: string | null,
   ): Promise<void> {
+    this.assertNoAgentSessionTransition(agentId, "change provider");
     const agent = this.requireSessionAgent(agentId);
     if (providerId === agent.provider) {
       await this.setAgentModel(agentId, modelId);
       return;
     }
 
-    this.requireEnabledProvider(providerId);
-    await this.requireAvailableClient({ provider: providerId });
-    const currentBase = this.providerBase.get(agent.provider) ?? agent.provider;
-    const targetBase = this.providerBase.get(providerId) ?? providerId;
-    if (currentBase !== targetBase || currentBase !== "claude") {
-      throw new Error(
-        `Cannot switch an active agent from '${agent.provider}' to incompatible provider '${providerId}'`,
+    const transition = this.beginAgentSessionTransition(agentId, "provider switch");
+    try {
+      this.assertAgentIdleForProviderSwitch(agentId, agent);
+      this.requireEnabledProvider(providerId);
+      await this.requireAvailableClient({ provider: providerId });
+      this.assertAgentIdleForProviderSwitch(agentId, agent);
+      const currentBase = this.providerBase.get(agent.provider) ?? agent.provider;
+      const targetBase = this.providerBase.get(providerId) ?? providerId;
+      if (currentBase !== targetBase || currentBase !== "claude") {
+        throw new Error(
+          `Cannot switch an active agent from '${agent.provider}' to incompatible provider '${providerId}'`,
+        );
+      }
+
+      agent.persistence = agent.session.describePersistence() ?? agent.persistence;
+
+      await this.trackAgentRegistrationOperation(
+        this.reloadAgentSessionInternal(
+          agentId,
+          { model: modelId ?? undefined },
+          { targetProvider: providerId },
+        ),
       );
+    } finally {
+      this.endAgentSessionTransition(agentId, transition);
     }
-
-    agent.persistence = agent.session.describePersistence() ?? agent.persistence;
-
-    await this.reloadAgentSession(
-      agentId,
-      { model: modelId ?? undefined },
-      { targetProvider: providerId },
-    );
   }
 
   async setAgentThinkingOption(
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
+    this.assertNoAgentSessionTransition(agentId, "change thinking option");
     const agent = this.requireSessionAgent(agentId);
     const normalizedThinkingOptionId =
       typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
@@ -1561,6 +1604,7 @@ export class AgentManager {
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
+    this.assertNoAgentSessionTransition(agentId, "change a feature");
     const agent = this.requireAgent(agentId);
 
     if (!agent.session.setFeature) {
@@ -1829,6 +1873,7 @@ export class AgentManager {
    * broadcast like normal timeline events.
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput): boolean {
+    this.assertNoAgentSessionTransition(agentId, "run an out-of-band command");
     const agent = this.requireSessionAgent(agentId);
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
@@ -1900,6 +1945,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.assertNoAgentSessionTransition(agentId, "start a run");
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -2045,6 +2091,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
+    this.assertNoAgentSessionTransition(agentId, "replace a run");
     const snapshot = this.requireAgent(agentId);
     if (
       snapshot.lifecycle !== "running" &&
@@ -2183,6 +2230,7 @@ export class AgentManager {
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
+    this.assertNoAgentSessionTransition(agentId, "respond to a permission");
     const agent = this.requireAgent(agentId);
     agent.inFlightPermissionResponses.add(requestId);
 
@@ -2327,6 +2375,7 @@ export class AgentManager {
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
+    this.assertNoAgentSessionTransition(agentId, "rewind");
     const agent = this.requireSessionAgent(agentId);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "rewind");
@@ -2822,7 +2871,9 @@ export class AgentManager {
     cancelReason: string,
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
-    this.agents.delete(agent.id);
+    if (this.agents.get(agent.id) === agent) {
+      this.agents.delete(agent.id);
+    }
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
       agent.unsubscribeSession();
@@ -2850,14 +2901,14 @@ export class AgentManager {
     if (agent.unsubscribeSession) {
       return;
     }
-    const agentId = agent.id;
     const unsubscribe = agent.session.subscribe((event: AgentStreamEvent) => {
-      this.enqueueSessionEvent(agentId, event);
+      this.enqueueSessionEvent(agent, event);
     });
     agent.unsubscribeSession = unsubscribe;
   }
 
-  private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
+  private enqueueSessionEvent(sourceAgent: ActiveManagedAgent, event: AgentStreamEvent): void {
+    const agentId = sourceAgent.id;
     this.logger.trace(
       {
         agentId,
@@ -2873,10 +2924,7 @@ export class AgentManager {
       .catch(() => undefined)
       .then(async () => {
         const current = this.agents.get(agentId);
-        if (!current) {
-          return;
-        }
-        if (current.session == null) {
+        if (!current || current !== sourceAgent || current.session == null) {
           return;
         }
         this.logger.trace(
@@ -3818,6 +3866,45 @@ export class AgentManager {
       return undefined;
     });
     return result;
+  }
+
+  private beginAgentSessionTransition(agentId: string, action: string): string {
+    const current = this.agentSessionTransitions.get(agentId);
+    if (current) {
+      throw new Error(`Cannot ${action} agent ${agentId} while ${current} is in progress`);
+    }
+    this.agentSessionTransitions.set(agentId, action);
+    return action;
+  }
+
+  private endAgentSessionTransition(agentId: string, action: string): void {
+    if (this.agentSessionTransitions.get(agentId) === action) {
+      this.agentSessionTransitions.delete(agentId);
+    }
+  }
+
+  private assertNoAgentSessionTransition(agentId: string, action: string): void {
+    const current = this.agentSessionTransitions.get(agentId);
+    if (current) {
+      throw new Error(`Cannot ${action} for agent ${agentId} while ${current} is in progress`);
+    }
+  }
+
+  private assertAgentIdleForProviderSwitch(agentId: string, expected: ActiveManagedAgent): void {
+    const current = this.agents.get(agentId);
+    if (current !== expected || current.session == null) {
+      throw new Error(`Agent ${agentId} changed while its provider was being switched`);
+    }
+    if (
+      this.hasInFlightRun(agentId) ||
+      current.pendingReplacement ||
+      current.pendingPermissions.size > 0 ||
+      current.inFlightPermissionResponses.size > 0
+    ) {
+      throw new Error(
+        `Cannot switch provider for agent ${agentId} while it is running or awaiting permission`,
+      );
+    }
   }
 
   /**

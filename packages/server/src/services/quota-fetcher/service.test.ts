@@ -257,6 +257,84 @@ describe("ProviderUsageService", () => {
     expect(calls).toBe(1);
   });
 
+  it("invalidates a fresh cache entry", async () => {
+    let calls = 0;
+    const service = new ProviderUsageService({
+      logger: createLogger(),
+      now: () => Date.parse("2026-06-19T00:00:00.000Z"),
+      fetchers: [
+        {
+          providerId: "claude",
+          displayName: "Claude",
+          fetchUsage: async () => {
+            calls += 1;
+            return {
+              providerId: "claude",
+              displayName: "Claude",
+              status: "available",
+              windows: [{ id: "session", label: "Session", usedPct: calls }],
+            };
+          },
+        },
+      ],
+    });
+
+    const first = await service.listUsage();
+    service.invalidate();
+    const second = await service.listUsage();
+
+    expect(calls).toBe(2);
+    expect(first.providers[0]?.windows[0]?.usedPct).toBe(1);
+    expect(second.providers[0]?.windows[0]?.usedPct).toBe(2);
+  });
+
+  it("does not let an invalidated in-flight request repopulate the cache", async () => {
+    const resolvers: Array<(usage: ProviderUsage) => void> = [];
+    let calls = 0;
+    const service = new ProviderUsageService({
+      logger: createLogger(),
+      now: () => Date.parse("2026-06-19T00:00:00.000Z"),
+      fetchers: [
+        {
+          providerId: "claude",
+          displayName: "Claude",
+          fetchUsage: () => {
+            calls += 1;
+            return new Promise<ProviderUsage>((resolve) => {
+              resolvers.push(resolve);
+            });
+          },
+        },
+      ],
+    });
+
+    const stale = service.listUsage();
+    service.invalidate();
+    const current = service.listUsage();
+    expect(calls).toBe(2);
+
+    resolvers[1]?.({
+      providerId: "claude",
+      displayName: "Claude",
+      status: "available",
+      windows: [{ id: "session", label: "Session", usedPct: 2 }],
+    });
+    const currentResult = await current;
+
+    resolvers[0]?.({
+      providerId: "claude",
+      displayName: "Claude",
+      status: "available",
+      windows: [{ id: "session", label: "Session", usedPct: 1 }],
+    });
+    await stale;
+
+    const cached = await service.listUsage();
+    expect(calls).toBe(2);
+    expect(cached).toBe(currentResult);
+    expect(cached.providers[0]?.windows[0]?.usedPct).toBe(2);
+  });
+
   it("isolates one provider error without dropping other providers", async () => {
     const service = new ProviderUsageService({
       logger: createLogger(),

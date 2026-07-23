@@ -605,12 +605,17 @@ export class VoiceAssistantWebSocketServer {
       this.speech?.onReadinessChange((snapshot) => {
         this.publishSpeechReadiness(snapshot);
       }) ?? null;
+    this.providerUsageService = new ProviderUsageService({
+      logger: this.logger,
+      providerProfiles: () => this.providerSnapshotManager.getProviderOverrides(),
+    });
     this.unsubscribeDaemonConfigChange = this.daemonConfigStore.onChange((config, details) => {
       const nextAgentManagerState = this.providerSnapshotManager.applyMutableProviderConfig(
         config.providers,
         { removeProviders: details.removedProviders },
       );
       this.agentManager.updateProviderRegistry(nextAgentManagerState);
+      this.providerUsageService.invalidate();
       this.broadcastDaemonConfigChanged(config);
     });
 
@@ -623,11 +628,6 @@ export class VoiceAssistantWebSocketServer {
       void this.broadcastAgentAttention(params).catch((err) => {
         this.logger.warn({ err, agentId: params.agentId }, "Failed to broadcast agent attention");
       });
-    });
-
-    this.providerUsageService = new ProviderUsageService({
-      logger: this.logger,
-      providerProfiles: () => this.providerSnapshotManager.getProviderOverrides(),
     });
 
     this.wss = this.createWebSocketServer(server, wsConfig, auth);
@@ -1383,6 +1383,10 @@ export class VoiceAssistantWebSocketServer {
         workspaceRecovery: true,
         // COMPAT(providerUsageList): added in v0.1.98, drop the gate when daemon floor >= v0.1.98.
         providerUsageList: true,
+        // COMPAT(providerUsageForceRefresh): added in v0.1.X, drop the gate when daemon floor >= v0.1.X.
+        providerUsageForceRefresh: true,
+        // COMPAT(activeAgentProviderSelection): added in v0.1.X, drop the gate when daemon floor >= v0.1.X.
+        activeAgentProviderSelection: true,
         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
         agentDetach: true,
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.

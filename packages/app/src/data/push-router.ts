@@ -8,6 +8,7 @@ import { agentCommandsQueryRoot } from "@/hooks/agent-commands-query";
 import { orderCheckoutDiffFiles } from "@/git/diff-order";
 import { daemonConfigQueryKey } from "@/data/daemon-config";
 import { providersSnapshotQueryKey, providersSnapshotQueryRoot } from "@/data/providers-snapshot";
+import { providerUsageQueryKey } from "@/provider-usage/query-key";
 
 type ProvidersSnapshotUpdateMessage = Extract<
   SessionOutboundMessage,
@@ -403,6 +404,9 @@ function applyDaemonConfigStatus(input: {
     daemonConfigQueryKey(input.serverId),
     payload.config,
   );
+  void input.queryClient.invalidateQueries({
+    queryKey: providerUsageQueryKey(input.serverId),
+  });
 }
 
 function applyCheckoutDiffUpdate(input: {

@@ -30,8 +30,16 @@ export class ProviderUsageService {
   private readonly providerProfiles?: () => Record<string, ProviderUsageProfile> | undefined;
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
-  private cached: { fetchedAtMs: number; result: ProviderUsageListResult } | null = null;
-  private inFlight: Promise<ProviderUsageListResult> | null = null;
+  private generation = 0;
+  private cached: {
+    generation: number;
+    fetchedAtMs: number;
+    result: ProviderUsageListResult;
+  } | null = null;
+  private inFlight: {
+    generation: number;
+    request: Promise<ProviderUsageListResult>;
+  } | null = null;
 
   constructor(options: ProviderUsageServiceOptions) {
     this.logger = options.logger.child({ module: "provider-usage-service" });
@@ -49,27 +57,35 @@ export class ProviderUsageService {
 
   async listUsage(options?: { forceRefresh?: boolean }): Promise<ProviderUsageListResult> {
     const nowMs = this.now();
+    const generation = this.generation;
     if (
       !options?.forceRefresh &&
       this.cached &&
+      this.cached.generation === generation &&
       nowMs - this.cached.fetchedAtMs < this.cacheTtlMs
     ) {
       return this.cached.result;
     }
 
-    if (this.inFlight) {
-      return this.inFlight;
+    if (this.inFlight?.generation === generation) {
+      return this.inFlight.request;
     }
 
-    const request = this.fetchFreshUsage(nowMs);
-    this.inFlight = request;
+    const request = this.fetchFreshUsage(nowMs, generation);
+    const inFlight = { generation, request };
+    this.inFlight = inFlight;
     try {
       return await request;
     } finally {
-      if (this.inFlight === request) {
+      if (this.inFlight === inFlight) {
         this.inFlight = null;
       }
     }
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+    this.cached = null;
   }
 
   private resolveFetchers(): ProviderUsageFetcher[] {
@@ -89,7 +105,10 @@ export class ProviderUsageService {
     ];
   }
 
-  private async fetchFreshUsage(nowMs: number): Promise<ProviderUsageListResult> {
+  private async fetchFreshUsage(
+    nowMs: number,
+    generation: number,
+  ): Promise<ProviderUsageListResult> {
     const fetchers = this.resolveFetchers();
     const settled = await Promise.allSettled(fetchers.map((fetcher) => fetcher.fetchUsage()));
     const providers = settled.map((result, index) => {
@@ -110,7 +129,9 @@ export class ProviderUsageService {
     });
 
     const result = { fetchedAt: new Date(nowMs).toISOString(), providers };
-    this.cached = { fetchedAtMs: nowMs, result };
+    if (this.generation === generation) {
+      this.cached = { generation, fetchedAtMs: nowMs, result };
+    }
     return result;
   }
 }

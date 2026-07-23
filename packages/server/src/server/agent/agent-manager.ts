@@ -218,6 +218,11 @@ interface AgentManagerRescueTimeouts {
   interruptSessionMs?: number;
 }
 
+interface ReloadAgentSessionOptions {
+  rehydrateFromDisk?: boolean;
+  targetProvider?: AgentProvider;
+}
+
 interface ProviderEnabledFlag {
   enabled: boolean;
   derivedFromProviderId?: string | null;
@@ -1175,7 +1180,7 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean; targetProvider?: AgentProvider },
+    options?: ReloadAgentSessionOptions,
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
       this.reloadAgentSessionInternal(agentId, overrides, options),
@@ -1185,7 +1190,7 @@ export class AgentManager {
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: ReloadAgentSessionOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);

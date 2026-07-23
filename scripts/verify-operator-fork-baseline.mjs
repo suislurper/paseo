@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const headArgIndex = process.argv.indexOf("--head");
+const hasExplicitHead = headArgIndex >= 0;
 const head = headArgIndex >= 0 ? process.argv[headArgIndex + 1] : "HEAD";
+const canonicalRepository = "github.com/suislurper/paseo";
 
 if (!head) {
   console.error("Missing value for --head");
@@ -43,6 +45,57 @@ function isAncestor(commit, descendant) {
   }
 }
 
+function git(args) {
+  return execFileSync("git", args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function isCanonicalRemoteUrl(url) {
+  const normalized = url
+    .trim()
+    .replace(/\.git$/i, "")
+    .replace(/^ssh:\/\/git@/i, "");
+  return (
+    normalized.toLowerCase() === `https://${canonicalRepository}` ||
+    normalized.toLowerCase() === `git@github.com:suislurper/paseo` ||
+    normalized.toLowerCase() === canonicalRepository
+  );
+}
+
+function verifyCanonicalPackagingCheckout() {
+  const branch = git(["branch", "--show-current"]);
+  if (branch !== "main") {
+    throw new Error(
+      `packaging requires branch 'main'; current branch is '${branch || "<detached>"}'`,
+    );
+  }
+
+  const remotes = git(["remote"]).split(/\r?\n/).filter(Boolean);
+  const canonicalRemote = remotes.find((remote) =>
+    isCanonicalRemoteUrl(git(["remote", "get-url", remote])),
+  );
+  if (!canonicalRemote) {
+    throw new Error(`no Git remote points to ${canonicalRepository}`);
+  }
+
+  const canonicalMainRef = `refs/remotes/${canonicalRemote}/main`;
+  let canonicalMain;
+  try {
+    canonicalMain = git(["rev-parse", "--verify", canonicalMainRef]);
+  } catch {
+    throw new Error(`missing ${canonicalMainRef}; fetch ${canonicalRemote} main before packaging`);
+  }
+  const buildHead = git(["rev-parse", "HEAD"]);
+  if (buildHead !== canonicalMain) {
+    throw new Error(
+      `HEAD ${buildHead} does not equal ${canonicalRemote}/main ${canonicalMain}; push and verify canonical main before packaging`,
+    );
+  }
+}
+
 const missing = requiredHistory.filter(([commit]) => !isAncestor(commit, head));
 if (missing.length > 0) {
   console.error(`Refusing operator Paseo build from ${head}: required fork history is missing.`);
@@ -55,4 +108,24 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-console.log(`Operator fork baseline verified at ${head}.`);
+if (!hasExplicitHead) {
+  try {
+    verifyCanonicalPackagingCheckout();
+  } catch (error) {
+    console.error(
+      `Refusing operator Paseo package from this checkout: ${
+        error instanceof Error ? error.message : String(error)
+      }.`,
+    );
+    console.error(
+      "Use suislurper/paseo main at the exact fetched remote-main commit. Use --head only for ancestry review/testing.",
+    );
+    process.exit(1);
+  }
+}
+
+console.log(
+  hasExplicitHead
+    ? `Operator fork ancestry verified at ${head} (review/testing mode).`
+    : `Canonical operator fork packaging checkout verified at ${head}.`,
+);

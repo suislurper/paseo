@@ -135,7 +135,7 @@ function createHarness(overrides?: {
         ({
           archivedAgentIds: [],
           archivedWorkspaceIds: [],
-          removedDirectory: false,
+          removedDirectory: true,
         }) satisfies ArchiveResult),
   ) as unknown as ArchiveIfSafeDependencies["archiveByScope"];
   const resolveWorkspaceIdAtPath = vi.fn(
@@ -155,6 +155,7 @@ function createHarness(overrides?: {
     resolveWorkspaceIdAtPath,
     isPaseoOwnedWorktreeCwd,
     killTerminalsForWorkspace: vi.fn(),
+    readHeadOid: vi.fn(async () => "safe-head"),
   };
   const log = createLogger();
   const inFlight = new Set<string>();
@@ -798,16 +799,97 @@ describe("archiveIfSafe", () => {
         paseoHome: PASEO_HOME,
         workspaceGitService: harness.options.workspaceGitService,
       }),
-      {
+      expect.objectContaining({
         scope: { kind: "workspace", workspaceId: "ws-auto-archive" },
         requestId: "auto-archive-on-merge",
-      },
+        safeWorktreeRemoval: {
+          validateBeforeDelete: expect.any(Function),
+        },
+      }),
     );
     expect(harness.log.info).toHaveBeenCalledWith(
       { cwd: CWD },
       "Auto-archived worktree after PR merge",
     );
     expect(harness.inFlight.has(CWD)).toBe(false);
+  });
+
+  test("preserves work created after the initial safe snapshot", async () => {
+    const getSnapshot = vi
+      .fn()
+      .mockResolvedValueOnce(createSnapshot())
+      .mockResolvedValueOnce(createSnapshot({ git: { isDirty: true } }));
+    const archiveByScope = vi.fn(
+      async (
+        _dependencies: unknown,
+        request: {
+          safeWorktreeRemoval?: {
+            validateBeforeDelete: (targetPath: string) => Promise<boolean>;
+          };
+        },
+      ) => {
+        const safeToDelete = await request.safeWorktreeRemoval?.validateBeforeDelete(CWD);
+        return {
+          archivedAgentIds: [],
+          archivedWorkspaceIds: ["ws-auto-archive"],
+          removedDirectory: safeToDelete === true,
+        } satisfies ArchiveResult;
+      },
+    );
+    const harness = createHarness({
+      getSnapshot: getSnapshot as unknown as () => Promise<WorkspaceGitRuntimeSnapshot | null>,
+      archiveByScope: archiveByScope as unknown as ArchiveIfSafeDependencies["archiveByScope"],
+    });
+
+    await runArchiveIfSafe(harness);
+
+    expect(getSnapshot).toHaveBeenNthCalledWith(1, CWD, {
+      force: true,
+      includeForge: false,
+      reason: "auto-archive-on-merge",
+    });
+    expect(getSnapshot).toHaveBeenNthCalledWith(2, CWD, {
+      force: true,
+      includeForge: false,
+      reason: "auto-archive-before-delete",
+    });
+    expect(harness.deps.readHeadOid).toHaveBeenCalledTimes(1);
+    expect(harness.log.info).not.toHaveBeenCalled();
+    expect(harness.log.warn).toHaveBeenCalledWith(
+      { cwd: CWD },
+      "Auto-archive preserved worktree because final safe removal did not complete",
+    );
+  });
+
+  test("preserves the worktree when HEAD changes during teardown", async () => {
+    const getSnapshot = vi.fn(async () => createSnapshot());
+    const archiveByScope = vi.fn(
+      async (
+        _dependencies: unknown,
+        request: {
+          safeWorktreeRemoval?: {
+            validateBeforeDelete: (targetPath: string) => Promise<boolean>;
+          };
+        },
+      ) => ({
+        archivedAgentIds: [],
+        archivedWorkspaceIds: ["ws-auto-archive"],
+        removedDirectory: (await request.safeWorktreeRemoval?.validateBeforeDelete(CWD)) === true,
+      }),
+    );
+    const harness = createHarness({
+      getSnapshot: getSnapshot as unknown as () => Promise<WorkspaceGitRuntimeSnapshot | null>,
+      archiveByScope: archiveByScope as unknown as ArchiveIfSafeDependencies["archiveByScope"],
+    });
+    vi.mocked(harness.deps.readHeadOid)
+      .mockResolvedValueOnce("initial-head")
+      .mockResolvedValueOnce("replacement-head");
+
+    await runArchiveIfSafe(harness);
+
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+    expect(harness.deps.readHeadOid).toHaveBeenCalledTimes(2);
+    expect(harness.log.info).not.toHaveBeenCalled();
   });
 
   test("refuses archive when forced fresh snapshot shows dirty after a previously safe cache", async () => {

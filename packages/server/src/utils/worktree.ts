@@ -1075,6 +1075,12 @@ export interface DeletePaseoWorktreeOptions {
   worktreesRoot?: string;
   paseoHome?: string;
   worktreesBaseRoot?: string;
+  /**
+   * Defaults to true for explicit/rollback cleanup. Auto-archive passes false
+   * so Git remains the final dirty-worktree guard and no recursive fallback
+   * can erase work created after the preceding safety snapshot.
+   */
+  force?: boolean;
 }
 
 export async function deletePaseoWorktree({
@@ -1085,6 +1091,7 @@ export async function deletePaseoWorktree({
   worktreesRoot,
   paseoHome,
   worktreesBaseRoot,
+  force = true,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   if (!worktreePath && !worktreeSlug) {
     throw new Error("worktreePath or worktreeSlug is required");
@@ -1128,29 +1135,18 @@ export async function deletePaseoWorktree({
     }
   }
 
-  if (cwd) {
-    try {
-      await runGitCommand(["worktree", "remove", resolvedWorktree, "--force"], {
-        cwd,
-        timeout: 120_000,
-      });
-    } catch {
-      // `git worktree remove` fails if the admin dir is already gone (e.g. a
-      // prior archive attempt removed it before the working tree could be
-      // fully cleaned up), or if the repo root has moved. Fall through to the
-      // rm retry loop below so the operation stays idempotent.
-    }
+  await removeWorktreeWithGit({ cwd, resolvedWorktree, force });
+
+  if (force) {
+    await removeDirectoryWithRetries(resolvedWorktree);
+  } else if (await pathExists(resolvedWorktree)) {
+    throw new WorktreeTeardownError(
+      "Safe worktree removal left the directory present; refusing recursive deletion",
+      [],
+    );
   }
 
-  await removeDirectoryWithRetries(resolvedWorktree);
-
-  if (cwd) {
-    try {
-      await runGitCommand(["worktree", "prune"], { cwd, timeout: 30_000 });
-    } catch {
-      // not critical; git will prune lazily
-    }
-  }
+  await pruneWorktreesIfPossible(cwd);
 }
 
 export async function rollbackCreatedPaseoWorktree(
@@ -1183,6 +1179,54 @@ async function pathExists(path: string): Promise<boolean> {
       return false;
     }
     throw error;
+  }
+}
+
+async function removeWorktreeWithGit(input: {
+  cwd: string | null;
+  resolvedWorktree: string;
+  force: boolean;
+}): Promise<void> {
+  if (!input.force && !input.cwd && (await pathExists(input.resolvedWorktree))) {
+    throw new WorktreeTeardownError(
+      "Safe worktree removal requires an available repository root",
+      [],
+    );
+  }
+  if (!input.cwd) {
+    return;
+  }
+
+  try {
+    await runGitCommand(
+      ["worktree", "remove", input.resolvedWorktree, ...(input.force ? ["--force"] : [])],
+      {
+        cwd: input.cwd,
+        timeout: 120_000,
+      },
+    );
+  } catch (error) {
+    if (!input.force) {
+      throw new WorktreeTeardownError(
+        `Safe worktree removal refused: ${error instanceof Error ? error.message : String(error)}`,
+        [],
+      );
+    }
+    // `git worktree remove` fails if the admin dir is already gone (e.g. a
+    // prior archive attempt removed it before the working tree could be fully
+    // cleaned up), or if the repo root moved. Forced cleanup remains
+    // idempotent via the recursive retry path.
+  }
+}
+
+async function pruneWorktreesIfPossible(cwd: string | null): Promise<void> {
+  if (!cwd) {
+    return;
+  }
+  try {
+    await runGitCommand(["worktree", "prune"], { cwd, timeout: 30_000 });
+  } catch {
+    // not critical; git will prune lazily
   }
 }
 

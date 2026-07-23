@@ -65,6 +65,13 @@ export interface ArchiveResult {
 export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
+  /**
+   * Auto-archive supplies this fail-closed policy. Interactive archive keeps
+   * its existing force-removal behavior after explicit user confirmation.
+   */
+  safeWorktreeRemoval?: {
+    validateBeforeDelete: (targetPath: string) => Promise<boolean>;
+  };
 }
 
 interface BackingDirectory {
@@ -291,7 +298,7 @@ async function archiveTargetRecords(
 
 async function maybeRemoveDirectory(
   dependencies: ArchiveDependencies,
-  request: Pick<ArchiveByScopeRequest, "requestId">,
+  request: Pick<ArchiveByScopeRequest, "requestId" | "safeWorktreeRemoval">,
   target: ArchiveTarget,
   archivedWorkspaceIds: string[],
 ): Promise<boolean> {
@@ -342,6 +349,24 @@ async function maybeRemoveDirectory(
     return false;
   }
 
+  if (request.safeWorktreeRemoval) {
+    try {
+      if (!(await request.safeWorktreeRemoval.validateBeforeDelete(backing.path))) {
+        dependencies.sessionLogger?.warn(
+          { targetPath: backing.path, requestId: request.requestId },
+          "Safe worktree removal validation failed; preserving directory",
+        );
+        return false;
+      }
+    } catch (error) {
+      dependencies.sessionLogger?.warn(
+        { err: error, targetPath: backing.path, requestId: request.requestId },
+        "Safe worktree removal validation errored; preserving directory",
+      );
+      return false;
+    }
+  }
+
   try {
     await deletePaseoWorktree({
       cwd: backing.mainRepoRoot,
@@ -350,6 +375,7 @@ async function maybeRemoveDirectory(
       worktreesRoot: backing.paseoWorktreesRoot ?? undefined,
       paseoHome: dependencies.paseoHome,
       worktreesBaseRoot: dependencies.paseoWorktreesBaseRoot,
+      force: request.safeWorktreeRemoval === undefined,
     });
     dependencies.github.invalidate({ cwd: backing.path });
     return true;

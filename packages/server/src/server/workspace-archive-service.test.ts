@@ -217,6 +217,46 @@ describe("archiveByScope", () => {
     expect(existsSync(worktree.worktreePath)).toBe(false);
   });
 
+  test("safe removal preserves work created at the final deletion boundary", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "safe-removal-race");
+    const workspaceId = "ws-safe-removal-race";
+    const lateFile = path.join(worktree.worktreePath, "late-work.txt");
+
+    const result = await archiveByScope(
+      createArchiveDeps({
+        paseoHome,
+        activeWorkspaces: [
+          {
+            workspaceId,
+            cwd: worktree.worktreePath,
+            kind: "worktree",
+          },
+        ],
+      }),
+      {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-safe-removal-race",
+        safeWorktreeRemoval: {
+          validateBeforeDelete: async () => {
+            // Simulate an editor/external process writing after the final
+            // snapshot. The non-forced Git removal must remain the last guard.
+            writeFileSync(lateFile, "must survive");
+            return true;
+          },
+        },
+      },
+    );
+
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [workspaceId],
+      removedDirectory: false,
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+    expect(readFileSync(lateFile, "utf8")).toBe("must survive");
+  });
+
   test("workspace scope runs teardown while keeping a directory referenced by a sibling", async () => {
     const { tempDir, repoDir } = createGitRepo();
     writeFileSync(

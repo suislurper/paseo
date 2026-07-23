@@ -28,9 +28,15 @@ npm run verify:operator-fork
 `npm run build:desktop` invokes the same check automatically and refuses to package a branch
 that is missing the reviewed fork history.
 
+Production packaging additionally requires the checkout to be on local `main`, to have a remote
+pointing at `suislurper/paseo`, and for `HEAD` to equal that remote's fetched `main` ref. The
+explicit `--head <sha>` form checks ancestry only and is reserved for review/testing; it does not
+authorize packaging.
+
 Do not build from upstream `main`, an arbitrary feature branch, or a checkout selected only by
-directory name. Verify Git history. If an upstream change supersedes a guarded fork commit,
-port and review the replacement first, then update the guard in the same change.
+directory name. Verify Git history and canonical remote identity. If an upstream change supersedes
+a guarded fork commit, port and review the replacement first, then update the guard in the same
+change.
 
 The guard is the executable operator-feature manifest. When a required feature is developed on a
 side branch, add its reviewed integration commit to the guard before packaging. A green build from

@@ -16,6 +16,7 @@ import type {
 import type { ForgeService } from "../../services/forge-service.js";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
+import { runGitCommand } from "../../utils/run-git-command.js";
 
 export interface AutoArchiveArchiveOptions {
   paseoHome: string;
@@ -39,6 +40,7 @@ export interface ArchiveIfSafeDependencies {
   resolveWorkspaceIdAtPath: typeof resolveWorkspaceIdAtPath;
   isPaseoOwnedWorktreeCwd: typeof isPaseoOwnedWorktreeCwd;
   killTerminalsForWorkspace: typeof killTerminalsForWorkspace;
+  readHeadOid: (cwd: string) => Promise<string | null>;
 }
 
 const defaultDependencies: ArchiveIfSafeDependencies = {
@@ -46,6 +48,17 @@ const defaultDependencies: ArchiveIfSafeDependencies = {
   resolveWorkspaceIdAtPath,
   isPaseoOwnedWorktreeCwd,
   killTerminalsForWorkspace,
+  readHeadOid: async (cwd) => {
+    try {
+      const { stdout } = await runGitCommand(["rev-parse", "HEAD"], {
+        cwd,
+        envOverlay: { GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" },
+      });
+      return stdout.trim() || null;
+    } catch {
+      return null;
+    }
+  },
 };
 
 /**
@@ -123,6 +136,11 @@ export async function archiveIfSafe(input: {
     if (!snapshot || !isSnapshotSafeForAutoArchive(snapshot)) {
       return;
     }
+    const initialBranch = snapshot.git.currentBranch;
+    const initialHeadOid = await deps.readHeadOid(cwd);
+    if (!initialHeadOid) {
+      return;
+    }
 
     const ownership = await deps.isPaseoOwnedWorktreeCwd(cwd, {
       paseoHome: options.paseoHome,
@@ -145,7 +163,7 @@ export async function archiveIfSafe(input: {
         return;
       }
 
-      await deps.archiveByScope(
+      const result = await deps.archiveByScope(
         {
           paseoHome: options.paseoHome,
           paseoWorktreesBaseRoot: options.paseoWorktreesBaseRoot,
@@ -172,8 +190,32 @@ export async function archiveIfSafe(input: {
         {
           scope: { kind: "workspace", workspaceId },
           requestId: "auto-archive-on-merge",
+          safeWorktreeRemoval: {
+            validateBeforeDelete: async (targetPath) => {
+              const finalSnapshot = await options.workspaceGitService.getSnapshot(targetPath, {
+                force: true,
+                includeForge: false,
+                reason: "auto-archive-before-delete",
+              });
+              if (
+                !finalSnapshot ||
+                !isSnapshotSafeForAutoArchive(finalSnapshot) ||
+                finalSnapshot.git.currentBranch !== initialBranch
+              ) {
+                return false;
+              }
+              return (await deps.readHeadOid(targetPath)) === initialHeadOid;
+            },
+          },
         },
       );
+      if (!result.removedDirectory) {
+        log.warn(
+          { cwd },
+          "Auto-archive preserved worktree because final safe removal did not complete",
+        );
+        return;
+      }
       log.info({ cwd }, "Auto-archived worktree after PR merge");
     } catch (error) {
       log.warn({ err: error, cwd }, "Auto-archive after merge failed");

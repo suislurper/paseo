@@ -235,6 +235,7 @@ import {
   ProjectDirectoryRequestError,
 } from "./project-directory-service.js";
 import { runGitCommand } from "../utils/run-git-command.js";
+import { isPaseoOwnedWorktreeCwd } from "../utils/worktree.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 
 // TODO: Remove once all app store clients are on >=0.1.45 and understand arbitrary provider strings.
@@ -5402,6 +5403,19 @@ export class Session {
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
+      }
+
+      if (existing.kind === "worktree") {
+        const ownership = await isPaseoOwnedWorktreeCwd(existing.worktreeRoot ?? existing.cwd, {
+          paseoHome: this.paseoHome,
+          worktreesRoot: this.worktreesRoot,
+        });
+        if (!ownership.allowed) {
+          throw new Error(
+            "Cannot archive this worktree because it is not a Paseo-managed worktree. " +
+              "Remove it with Git, or hide its workspace without deleting files.",
+          );
+        }
       }
 
       await archiveByScope(

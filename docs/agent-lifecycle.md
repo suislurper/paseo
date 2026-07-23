@@ -46,6 +46,14 @@ The provider still owns the underlying runtime. Paseo keeps an agent record so t
 
 Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is closed, and the agent disappears from active lists. Archive is **global** — it lives on the server and propagates to every connected client.
 
+Archiving a worktree-kind workspace is also a filesystem operation. It is
+accepted only when Paseo owns the backing worktree; on the last active
+workspace reference, Paseo runs teardown and removes that worktree. An
+externally created worktree is rejected before its workspace or agents are
+archived, so the UI cannot report success while leaving an unexpected checkout
+on disk. External worktrees must be removed with Git or explicitly hidden
+without deleting files.
+
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). If the same request created a Paseo worktree through its `worktree` field, auto-archive archives that worktree too, which removes the agent records inside the worktree.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):

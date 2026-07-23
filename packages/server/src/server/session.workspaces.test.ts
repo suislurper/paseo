@@ -5517,6 +5517,45 @@ test("archive_workspace_request hides non-destructive workspace records", async 
   expect(response?.payload.error).toBeNull();
 });
 
+test("archive_workspace_request refuses to hide an unmanaged worktree", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-unmanaged-worktree-archive-"));
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-unmanaged-worktree",
+    projectId: "proj-unmanaged-worktree",
+    cwd: tempDir,
+    kind: "worktree",
+    displayName: "unmanaged-worktree",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  let archiveCalls = 0;
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.archive = async () => {
+    archiveCalls += 1;
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-unmanaged-worktree-archive",
+    });
+
+    expect(archiveCalls).toBe(0);
+    expect(workspace.archivedAt).toBeNull();
+    const response = findByType(emitted, "archive_workspace_response");
+    expect(response?.payload.error).toContain("not a Paseo-managed worktree");
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("archive_workspace_request archives a worktree-kind workspace and removes the directory on last reference", async () => {
   const tempDir = mkdtempSync(path.join(tmpdir(), "session-worktree-kind-archive-"));
   const repoDir = path.join(tempDir, "repo");

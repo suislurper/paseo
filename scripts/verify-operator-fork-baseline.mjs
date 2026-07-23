@@ -21,6 +21,14 @@ const requiredHistory = [
   ["114f9448d", "Claude account profile switching"],
   ["19b82f0c9", "base-provider retention for custom profiles"],
   ["26befb70c", "desktop active-provider selection"],
+  [
+    "72e5e6ecb2674bc6662d13bb53e6e73f140f6089",
+    "reviewed provider switching, compatibility, and forced usage refresh fixes",
+  ],
+  [
+    "ef189b45315da7cc1aa515c0f697b1eadb7ccca2",
+    "landed-to-default sidebar status and fail-closed archive safety",
+  ],
 ];
 
 function isAncestor(commit, descendant) {

@@ -14,6 +14,8 @@ The fork carries required behavior that is not optional during upstream updates:
 - modeless cross-provider agent creation
 - control-plane calls that preserve pending Claude permissions
 - Paseo-owned worktree archive cleanup and live chat synchronization
+- workspace-sidebar landed-to-default status, refreshed against the remote default branch
+- fail-closed archive checks that distinguish landed work from unpushed or unknown work
 
 ## Build invariant
 
@@ -30,14 +32,21 @@ Do not build from upstream `main`, an arbitrary feature branch, or a checkout se
 directory name. Verify Git history. If an upstream change supersedes a guarded fork commit,
 port and review the replacement first, then update the guard in the same change.
 
+The guard is the executable operator-feature manifest. When a required feature is developed on a
+side branch, add its reviewed integration commit to the guard before packaging. A green build from
+an older, incomplete manifest is not sufficient.
+
 ## Updating canonical main
 
 Integrate newer upstream history with the fork features preserved. Before any non-fast-forward
 replacement of the fork's `main`:
 
 1. create and push a named backup ref for the previous fork `main`;
-2. verify the combined branch with focused tests, typecheck, lint, and exact-SHA review;
-3. use `--force-with-lease` against the exact previously observed remote SHA;
-4. verify the remote `main` SHA after the push.
+2. inventory every local and `suislurper/paseo` side branch and account for each operator feature;
+3. update the executable feature manifest in `scripts/verify-operator-fork-baseline.mjs`;
+4. verify the combined branch with focused tests, typecheck, lint, and exact-SHA review;
+5. use `--force-with-lease` against the exact previously observed remote SHA;
+6. verify the remote `main` SHA after the push;
+7. remove integrated temporary feature refs so they cannot be mistaken for the canonical build.
 
 Never point fork `main` at upstream history that omits the guarded operator features.

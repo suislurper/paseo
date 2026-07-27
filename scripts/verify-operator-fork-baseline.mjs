@@ -35,6 +35,11 @@ const requiredHistory = [
     "36f08fff357f5bae0e07c5acd21d11ef48244a09",
     "final deletion-boundary safety and exact canonical packaging enforcement",
   ],
+  ["3778a52d9292e6d9e67f56b025464bff3447b5a1", "Opus 5 Claude model manifest entries"],
+  [
+    "ca0d84741b23d5eadb7a040bf76f3f4ec9a2c96d",
+    "fail-closed desktop UI export verification (stale app-dist cannot be packaged)",
+  ],
 ];
 
 function isAncestor(commit, descendant) {

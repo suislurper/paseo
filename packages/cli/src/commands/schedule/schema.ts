@@ -2,6 +2,21 @@ import type { OutputSchema } from "../../output/index.js";
 import { formatCadence, formatTarget, type ScheduleRow } from "./shared.js";
 import type { ScheduleRecord, ScheduleRunRecord } from "./types.js";
 
+export interface ScheduleIdentityRecord {
+  id: string;
+  name: string | null;
+  cadence: ScheduleRecord["cadence"];
+  target: ScheduleRecord["target"];
+  status: ScheduleRecord["status"];
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  pausedAt: string | null;
+  expiresAt: string | null;
+  maxRuns: number | null;
+}
+
 export const scheduleSchema: OutputSchema<ScheduleRow> = {
   idField: "id",
   columns: [
@@ -29,6 +44,37 @@ export function createScheduleInspectSchema(
       { header: "VALUE", field: "value", width: 80 },
     ],
     serialize: () => record,
+  };
+}
+
+export function toScheduleIdentityRecord(record: ScheduleRecord): ScheduleIdentityRecord {
+  return {
+    id: record.id,
+    name: record.name,
+    cadence: record.cadence,
+    target: record.target,
+    status: record.status,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    nextRunAt: record.nextRunAt,
+    lastRunAt: record.lastRunAt,
+    pausedAt: record.pausedAt,
+    expiresAt: record.expiresAt,
+    maxRuns: record.maxRuns,
+  };
+}
+
+export function createScheduleIdentityInspectSchema(
+  record: ScheduleRecord,
+): OutputSchema<ScheduleInspectRow> {
+  const identity = toScheduleIdentityRecord(record);
+  return {
+    idField: "key",
+    columns: [
+      { header: "KEY", field: "key", width: 18 },
+      { header: "VALUE", field: "value", width: 80 },
+    ],
+    serialize: () => identity,
   };
 }
 
@@ -87,4 +133,10 @@ export function createScheduleInspectRows(schedule: ScheduleRecord): ScheduleIns
     { key: "MaxRuns", value: schedule.maxRuns == null ? "null" : `${schedule.maxRuns}` },
     { key: "RunCount", value: `${schedule.runs.length}` },
   ];
+}
+
+export function createScheduleIdentityInspectRows(schedule: ScheduleRecord): ScheduleInspectRow[] {
+  return createScheduleInspectRows(schedule).filter(
+    (row) => row.key !== "Prompt" && row.key !== "RunCount",
+  );
 }

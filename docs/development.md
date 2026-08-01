@@ -395,7 +395,12 @@ npm run cli -- inspect <id>          # Show detailed agent info
 npm run cli -- logs <id>             # View agent timeline
 npm run cli -- daemon status         # Check daemon status
 npm run cli -- clone owner/repo --dir ~/workspace # Clone GitHub repo and register project
+npm run cli -- schedule inspect <id> --identity-only --json # Bounded schedule identity
 ```
+
+Use `schedule inspect --identity-only --json` for machine identity checks. It
+keeps the full schedule target but omits the prompt and run history, so output
+does not grow with every recurring run.
 
 Use `--host <host:port>` to point the CLI at a different daemon:
 

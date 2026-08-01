@@ -44,7 +44,11 @@ export function createScheduleCommand(): Command {
   );
 
   addJsonAndDaemonHostOptions(
-    schedule.command("inspect").description("Inspect a schedule").argument("<id>", "Schedule ID"),
+    schedule
+      .command("inspect")
+      .description("Inspect a schedule")
+      .argument("<id>", "Schedule ID")
+      .option("--identity-only", "Return bounded schedule identity without prompt or run history"),
   ).action(withOutput(runInspectCommand));
 
   addJsonAndDaemonHostOptions(

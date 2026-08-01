@@ -40,6 +40,10 @@ const requiredHistory = [
     "ca0d84741b23d5eadb7a040bf76f3f4ec9a2c96d",
     "fail-closed desktop UI export verification (stale app-dist cannot be packaged)",
   ],
+  [
+    "1b668a654a37c43d8626b34eb59cc732751a2c9a",
+    "server-projected bounded schedule identity inspection",
+  ],
 ];
 
 function isAncestor(commit, descendant) {

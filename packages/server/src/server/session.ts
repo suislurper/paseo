@@ -2033,6 +2033,8 @@ export class Session {
         return this.chatScheduleLoopSession.handleScheduleListRequest(msg);
       case "schedule/inspect":
         return this.chatScheduleLoopSession.handleScheduleInspectRequest(msg);
+      case "schedule.identity.request":
+        return this.chatScheduleLoopSession.handleScheduleIdentityRequest(msg);
       case "schedule/logs":
         return this.chatScheduleLoopSession.handleScheduleLogsRequest(msg);
       case "schedule/pause":

@@ -398,9 +398,12 @@ npm run cli -- clone owner/repo --dir ~/workspace # Clone GitHub repo and regist
 npm run cli -- schedule inspect <id> --identity-only --json # Bounded schedule identity
 ```
 
-Use `schedule inspect --identity-only --json` for machine identity checks. It
-keeps the full schedule target but omits the prompt and run history, so output
-does not grow with every recurring run.
+Use `schedule inspect --identity-only --json` for machine identity checks. An
+updated host projects the bounded identity before sending it: exact agent target
+or new-agent provider, cadence class, status, and expiry. Prompt, run history,
+cron text, workspace, model, MCP, and provider configuration never cross the
+connection, so output stays bounded as recurring history grows. The command
+fails closed when the host does not advertise this RPC.
 
 Use `--host <host:port>` to point the CLI at a different daemon:
 

@@ -36,6 +36,24 @@ export interface ChatScheduleLoopSessionOptions {
   logger: pino.Logger;
 }
 
+export function toScheduleIdentity(
+  schedule: Awaited<ReturnType<ScheduleService["inspect"]>>,
+): Extract<SessionOutboundMessage, { type: "schedule.identity.response" }>["payload"]["schedule"] {
+  return {
+    id: schedule.id,
+    cadence:
+      schedule.cadence.type === "every"
+        ? { type: "every", everyMs: schedule.cadence.everyMs }
+        : { type: "cron" },
+    target:
+      schedule.target.type === "agent"
+        ? { type: "agent", agentId: schedule.target.agentId }
+        : { type: "new-agent", provider: schedule.target.config.provider },
+    status: schedule.status,
+    expiresAt: schedule.expiresAt,
+  };
+}
+
 /**
  * A client's chat, schedule, and loop request surface. The three families are the
  * least-coupled in the session: each is a stateless request/response over its own
@@ -270,6 +288,7 @@ export class ChatScheduleLoopSession {
           | "schedule/create"
           | "schedule/list"
           | "schedule/inspect"
+          | "schedule.identity.request"
           | "schedule/logs"
           | "schedule/pause"
           | "schedule/resume"
@@ -351,6 +370,24 @@ export class ChatScheduleLoopSession {
         payload: {
           requestId: request.requestId,
           schedule,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitScheduleRpcError(request, error);
+    }
+  }
+
+  async handleScheduleIdentityRequest(
+    request: Extract<SessionInboundMessage, { type: "schedule.identity.request" }>,
+  ): Promise<void> {
+    try {
+      const schedule = await this.scheduleService.inspect(request.scheduleId);
+      this.host.emit({
+        type: "schedule.identity.response",
+        payload: {
+          requestId: request.requestId,
+          schedule: toScheduleIdentity(schedule),
           error: null,
         },
       });

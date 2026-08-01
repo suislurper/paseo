@@ -64,6 +64,20 @@ export interface ScheduleRecord {
   runs: ScheduleRunRecord[];
 }
 
+export type ScheduleIdentityCadence = { type: "every"; everyMs: number } | { type: "cron" };
+
+export type ScheduleIdentityTarget =
+  | { type: "agent"; agentId: string }
+  | { type: "new-agent"; provider: string };
+
+export interface ScheduleIdentityRecord {
+  id: string;
+  cadence: ScheduleIdentityCadence;
+  target: ScheduleIdentityTarget;
+  status: ScheduleStatus;
+  expiresAt: string | null;
+}
+
 export interface ScheduleListItem {
   id: string;
   name: string | null;
@@ -104,6 +118,12 @@ export interface ScheduleListPayload {
 export interface ScheduleInspectPayload {
   requestId: string;
   schedule: ScheduleRecord | null;
+  error: string | null;
+}
+
+export interface ScheduleIdentityPayload {
+  requestId: string;
+  schedule: ScheduleIdentityRecord | null;
   error: string | null;
 }
 
@@ -164,11 +184,15 @@ export interface ScheduleDaemonClient {
   scheduleCreate(input: CreateScheduleInput): Promise<ScheduleCreatePayload>;
   scheduleList(): Promise<ScheduleListPayload>;
   scheduleInspect(input: { id: string }): Promise<ScheduleInspectPayload>;
+  scheduleIdentity(input: { id: string }): Promise<ScheduleIdentityPayload>;
   scheduleLogs(input: { id: string }): Promise<ScheduleLogsPayload>;
   schedulePause(input: { id: string }): Promise<SchedulePausePayload>;
   scheduleResume(input: { id: string }): Promise<ScheduleResumePayload>;
   scheduleDelete(input: { id: string }): Promise<ScheduleDeletePayload>;
   scheduleRunOnce(input: { id: string }): Promise<ScheduleRunOncePayload>;
   scheduleUpdate(input: UpdateScheduleInput): Promise<ScheduleUpdatePayload>;
+  getLastServerInfoMessage(): {
+    features?: { scheduleIdentity?: boolean };
+  } | null;
   close(): Promise<void>;
 }

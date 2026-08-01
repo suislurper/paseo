@@ -1,7 +1,44 @@
 import { describe, expect, it } from "vitest";
-import { ScheduleCreateRequestSchema, ScheduleUpdateRequestSchema } from "./rpc-schemas.js";
+import {
+  ScheduleCreateRequestSchema,
+  ScheduleIdentityResponseSchema,
+  ScheduleUpdateRequestSchema,
+} from "./rpc-schemas.js";
 
 describe("schedule RPC schemas", () => {
+  it("accepts only the bounded schedule identity surface", () => {
+    const parsed = ScheduleIdentityResponseSchema.parse({
+      type: "schedule.identity.response",
+      payload: {
+        requestId: "request-identity",
+        schedule: {
+          id: "fb12e97c",
+          cadence: { type: "cron", expression: "*/5 * * * *" },
+          target: {
+            type: "new-agent",
+            provider: "codex",
+            cwd: "/secret/workspace",
+            systemPrompt: "secret system prompt",
+          },
+          status: "active",
+          expiresAt: null,
+          prompt: "secret wake prompt",
+          runs: [{ output: "secret output" }],
+        },
+        error: null,
+      },
+    });
+
+    expect(parsed.payload.schedule).toEqual({
+      id: "fb12e97c",
+      cadence: { type: "cron" },
+      target: { type: "new-agent", provider: "codex" },
+      status: "active",
+      expiresAt: null,
+    });
+    expect(JSON.stringify(parsed)).not.toContain("secret");
+  });
+
   it("round-trips new-agent run options on create requests", () => {
     expect(
       ScheduleCreateRequestSchema.parse({

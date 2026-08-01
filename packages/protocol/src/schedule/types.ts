@@ -52,6 +52,38 @@ export const ScheduleTargetSchema = z.discriminatedUnion("type", [
 ]);
 export type ScheduleTarget = z.infer<typeof ScheduleTargetSchema>;
 
+export const ScheduleIdentityCadenceSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("every"),
+    everyMs: z.number().int().positive(),
+  }),
+  z.object({
+    type: z.literal("cron"),
+  }),
+]);
+export type ScheduleIdentityCadence = z.infer<typeof ScheduleIdentityCadenceSchema>;
+
+export const ScheduleIdentityTargetSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("agent"),
+    agentId: z.guid(),
+  }),
+  z.object({
+    type: z.literal("new-agent"),
+    provider: AgentProviderSchema,
+  }),
+]);
+export type ScheduleIdentityTarget = z.infer<typeof ScheduleIdentityTargetSchema>;
+
+export const ScheduleIdentitySchema = z.object({
+  id: z.string().trim().min(1).max(128),
+  cadence: ScheduleIdentityCadenceSchema,
+  target: ScheduleIdentityTargetSchema,
+  status: ScheduleStatusSchema,
+  expiresAt: z.string().max(64).nullable(),
+});
+export type ScheduleIdentity = z.infer<typeof ScheduleIdentitySchema>;
+
 export const ScheduleRunSchema = z.object({
   id: z.string(),
   scheduledFor: z.string(),

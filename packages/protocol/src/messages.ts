@@ -25,6 +25,7 @@ import {
   ScheduleCreateRequestSchema,
   ScheduleListRequestSchema,
   ScheduleInspectRequestSchema,
+  ScheduleIdentityRequestSchema,
   ScheduleLogsRequestSchema,
   SchedulePauseRequestSchema,
   ScheduleResumeRequestSchema,
@@ -34,6 +35,7 @@ import {
   ScheduleCreateResponseSchema,
   ScheduleListResponseSchema,
   ScheduleInspectResponseSchema,
+  ScheduleIdentityResponseSchema,
   ScheduleLogsResponseSchema,
   SchedulePauseResponseSchema,
   ScheduleResumeResponseSchema,
@@ -2518,6 +2520,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ScheduleCreateRequestSchema,
   ScheduleListRequestSchema,
   ScheduleInspectRequestSchema,
+  ScheduleIdentityRequestSchema,
   ScheduleLogsRequestSchema,
   SchedulePauseRequestSchema,
   ScheduleResumeRequestSchema,
@@ -2766,6 +2769,8 @@ export const ServerInfoStatusPayloadSchema = z
         selectiveAgentTimeline: z.boolean().optional(),
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
         stableProjectIdentity: z.boolean().optional(),
+        // COMPAT(scheduleIdentity): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
+        scheduleIdentity: z.boolean().optional(),
       })
       .optional(),
   })
@@ -5193,6 +5198,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ScheduleCreateResponseSchema,
   ScheduleListResponseSchema,
   ScheduleInspectResponseSchema,
+  ScheduleIdentityResponseSchema,
   ScheduleLogsResponseSchema,
   SchedulePauseResponseSchema,
   ScheduleResumeResponseSchema,
@@ -5348,6 +5354,7 @@ export type ChatWaitResponse = z.infer<typeof ChatWaitResponseSchema>;
 export type ScheduleCreateResponse = z.infer<typeof ScheduleCreateResponseSchema>;
 export type ScheduleListResponse = z.infer<typeof ScheduleListResponseSchema>;
 export type ScheduleInspectResponse = z.infer<typeof ScheduleInspectResponseSchema>;
+export type ScheduleIdentityResponse = z.infer<typeof ScheduleIdentityResponseSchema>;
 export type ScheduleLogsResponse = z.infer<typeof ScheduleLogsResponseSchema>;
 export type SchedulePauseResponse = z.infer<typeof SchedulePauseResponseSchema>;
 export type ScheduleResumeResponse = z.infer<typeof ScheduleResumeResponseSchema>;
@@ -5415,6 +5422,7 @@ export type ChatWaitRequest = z.infer<typeof ChatWaitRequestSchema>;
 export type ScheduleCreateRequest = z.infer<typeof ScheduleCreateRequestSchema>;
 export type ScheduleListRequest = z.infer<typeof ScheduleListRequestSchema>;
 export type ScheduleInspectRequest = z.infer<typeof ScheduleInspectRequestSchema>;
+export type ScheduleIdentityRequest = z.infer<typeof ScheduleIdentityRequestSchema>;
 export type ScheduleLogsRequest = z.infer<typeof ScheduleLogsRequestSchema>;
 export type SchedulePauseRequest = z.infer<typeof SchedulePauseRequestSchema>;
 export type ScheduleResumeRequest = z.infer<typeof ScheduleResumeRequestSchema>;

@@ -513,6 +513,10 @@ type ScheduleInspectPayload = Extract<
   SessionOutboundMessage,
   { type: "schedule/inspect/response" }
 >["payload"];
+type ScheduleIdentityPayload = Extract<
+  SessionOutboundMessage,
+  { type: "schedule.identity.response" }
+>["payload"];
 type ScheduleLogsPayload = Extract<
   SessionOutboundMessage,
   { type: "schedule/logs/response" }
@@ -4965,6 +4969,17 @@ export class DaemonClient {
         scheduleId: options.id,
       },
       responseType: "schedule/inspect/response",
+    });
+  }
+
+  async scheduleIdentity(options: InspectScheduleOptions): Promise<ScheduleIdentityPayload> {
+    return this.sendCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "schedule.identity.request",
+        scheduleId: options.id,
+      },
+      responseType: "schedule.identity.response",
     });
   }
 

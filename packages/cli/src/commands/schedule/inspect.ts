@@ -24,16 +24,27 @@ export async function runInspectCommand(
 ): Promise<ListResult<ScheduleInspectRow>> {
   const { client } = await connectScheduleClient(options.host);
   try {
-    const payload = await client.scheduleInspect({ id });
-    if (payload.error || !payload.schedule) {
-      throw new Error(payload.error ?? `Schedule not found: ${id}`);
-    }
     if (options.identityOnly) {
+      if (client.getLastServerInfoMessage()?.features?.scheduleIdentity !== true) {
+        throw {
+          code: "DAEMON_UPDATE_REQUIRED",
+          message: "This daemon does not support bounded schedule identity inspection.",
+          details: "Update the host to use --identity-only.",
+        };
+      }
+      const payload = await client.scheduleIdentity({ id });
+      if (payload.error || !payload.schedule) {
+        throw new Error(payload.error ?? `Schedule not found: ${id}`);
+      }
       return {
         type: "list",
         data: createScheduleIdentityInspectRows(payload.schedule),
         schema: createScheduleIdentityInspectSchema(payload.schedule),
       };
+    }
+    const payload = await client.scheduleInspect({ id });
+    if (payload.error || !payload.schedule) {
+      throw new Error(payload.error ?? `Schedule not found: ${id}`);
     }
     const rows = createScheduleInspectRows(payload.schedule);
     return {

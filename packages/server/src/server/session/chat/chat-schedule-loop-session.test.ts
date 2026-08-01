@@ -3,6 +3,7 @@ import pino from "pino";
 import {
   ChatScheduleLoopSession,
   type ChatScheduleLoopSessionHost,
+  toScheduleIdentity,
 } from "./chat-schedule-loop-session.js";
 import { createStub } from "../../test-utils/class-mocks.js";
 import { findByType } from "../../test-utils/session-stubs.js";
@@ -54,6 +55,56 @@ function makeSubsystem(options: MakeOptions = {}) {
 }
 
 describe("ChatScheduleLoopSession", () => {
+  it("projects bounded schedule identity before transport", () => {
+    const identity = toScheduleIdentity({
+      id: "fb12e97c",
+      name: "Release Captain audit wake",
+      prompt: "secret wake prompt",
+      cadence: { type: "cron", expression: "*/5 * * * *", timezone: "UTC" },
+      target: {
+        type: "new-agent",
+        config: {
+          provider: "codex",
+          cwd: "/secret/workspace",
+          systemPrompt: "secret system prompt",
+          mcpServers: { private: { headers: { Authorization: "secret token" } } },
+          featureValues: { private: "secret feature" },
+        },
+      },
+      status: "active",
+      createdAt: "2026-07-28T16:26:48.515Z",
+      updatedAt: "2026-08-01T21:41:50.556Z",
+      nextRunAt: "2026-08-01T21:51:48.515Z",
+      lastRunAt: "2026-08-01T21:41:50.556Z",
+      pausedAt: null,
+      expiresAt: null,
+      maxRuns: null,
+      runs: [
+        {
+          id: "run-1",
+          scheduledFor: "2026-08-01T21:41:48.515Z",
+          startedAt: "2026-08-01T21:41:50.556Z",
+          endedAt: null,
+          status: "running",
+          agentId: null,
+          output: "large secret output",
+          error: null,
+        },
+      ],
+    });
+
+    expect(identity).toEqual({
+      id: "fb12e97c",
+      cadence: { type: "cron" },
+      target: { type: "new-agent", provider: "codex" },
+      status: "active",
+      expiresAt: null,
+    });
+    expect(JSON.stringify(identity)).not.toMatch(
+      /secret|prompt|runs|headers|cwd|expression|timezone/i,
+    );
+  });
+
   it("chat/post emits the stored message and does not fan out without mentions", async () => {
     const message: ChatMessageFixture = {
       id: "m1",

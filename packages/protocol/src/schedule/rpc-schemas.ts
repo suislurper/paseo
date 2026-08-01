@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   ScheduleCadenceSchema,
+  ScheduleIdentitySchema,
   ScheduleRunSchema,
   ScheduleSummarySchema,
   StoredScheduleSchema,
@@ -43,6 +44,12 @@ export const ScheduleListRequestSchema = z.object({
 
 export const ScheduleInspectRequestSchema = z.object({
   type: z.literal("schedule/inspect"),
+  requestId: z.string(),
+  scheduleId: z.string(),
+});
+
+export const ScheduleIdentityRequestSchema = z.object({
+  type: z.literal("schedule.identity.request"),
   requestId: z.string(),
   scheduleId: z.string(),
 });
@@ -122,6 +129,15 @@ export const ScheduleInspectResponseSchema = z.object({
   payload: z.object({
     requestId: z.string(),
     schedule: StoredScheduleSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const ScheduleIdentityResponseSchema = z.object({
+  type: z.literal("schedule.identity.response"),
+  payload: z.object({
+    requestId: z.string(),
+    schedule: ScheduleIdentitySchema.nullable(),
     error: z.string().nullable(),
   }),
 });

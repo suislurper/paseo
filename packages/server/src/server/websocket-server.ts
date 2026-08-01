@@ -1421,6 +1421,8 @@ export class VoiceAssistantWebSocketServer {
         selectiveAgentTimeline: true,
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
         stableProjectIdentity: true,
+        // COMPAT(scheduleIdentity): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
+        scheduleIdentity: true,
       },
     };
   }

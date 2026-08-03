@@ -272,9 +272,9 @@ Example: two different Anthropic accounts as separate profiles:
 }
 ```
 
-Each profile appears as a separate provider in the Paseo app. You can select one when launching an agent. Active Claude agents can also switch to another Claude profile through the model selector; Paseo reloads the provider session in place, preserving the workspace and conversation.
+Each profile appears as a separate provider in the Paseo app. You can select one when launching an agent. Active Claude and Codex agents can also switch to another profile of the same provider through the model selector; Paseo reloads the provider session in place, preserving the workspace and conversation.
 
-When Claude profiles use separate `CLAUDE_CONFIG_DIR` values, Paseo copies the active session transcript and its session artifacts into the target profile before resuming. Credentials and other profile settings remain isolated; only the selected conversation is transferred.
+When Claude profiles use separate `CLAUDE_CONFIG_DIR` values, Paseo copies the active session transcript and its session artifacts into the target profile before resuming. Codex profiles work the same way with separate `CODEX_HOME` values: Paseo copies the session rollout files (including referenced sub-agent threads) into the target profile home before resuming. Rollout files are append-only, so the transfer keeps whichever side already holds the longer history and refuses to overwrite a diverged rollout. Credentials and other profile settings remain isolated; only the selected conversation is transferred.
 
 You can also combine profiles with model overrides to pin specific models per profile:
 

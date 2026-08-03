@@ -1464,6 +1464,82 @@ test("setAgentProvider reloads an active agent through a compatible provider pro
   );
 });
 
+test("setAgentProvider reloads an active Codex agent through a compatible provider profile", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-codex-provider-switch-"));
+  const resumeCalls: Array<{
+    provider: string;
+    handle: AgentPersistenceHandle;
+    config: Partial<AgentSessionConfig> | undefined;
+  }> = [];
+
+  class ProfileClient implements AgentClient {
+    readonly capabilities = TEST_CAPABILITIES;
+
+    constructor(readonly provider: string) {}
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumeCalls.push({ provider: this.provider, handle, config });
+      return new TestAgentSession({
+        provider: this.provider,
+        cwd: config?.cwd ?? workdir,
+        model: config?.model,
+      });
+    }
+
+    async fetchCatalog() {
+      return { models: [], modes: [] };
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: {
+      codex: new ProfileClient("codex"),
+      "codex-work": new ProfileClient("codex-work"),
+      claude: new ProfileClient("claude"),
+    },
+    providerDefinitions: {
+      codex: { enabled: true },
+      "codex-work": { enabled: true, derivedFromProviderId: "codex" },
+      claude: { enabled: true },
+    },
+    logger,
+  });
+  const created = await manager.createAgent(
+    { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  const switched = await manager.setAgentProvider(created.id, "codex-work", "gpt-5.4");
+
+  expect(switched).toBeUndefined();
+  expect(manager.getAgent(created.id)).toMatchObject({
+    provider: "codex-work",
+    config: { provider: "codex-work", model: "gpt-5.4" },
+  });
+  expect(resumeCalls).toEqual([
+    {
+      provider: "codex-work",
+      handle: expect.objectContaining({ provider: "codex-work" }),
+      config: expect.objectContaining({ provider: "codex-work", model: "gpt-5.4" }),
+    },
+  ]);
+  await expect(manager.setAgentProvider(created.id, "claude", "opus")).rejects.toThrow(
+    "incompatible provider",
+  );
+});
+
 test("setAgentProvider rejects pending permissions without canceling or resuming", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-switch-permission-"));
   let targetAvailabilityChecks = 0;

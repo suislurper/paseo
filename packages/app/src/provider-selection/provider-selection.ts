@@ -171,7 +171,7 @@ export function filterCompatibleProviderEntries(
     return selectedEntry ? [selectedEntry] : [];
   }
   const selectedBase = selectedEntry.baseProvider ?? selectedEntry.provider;
-  if (selectedBase !== "claude") {
+  if (selectedBase !== "claude" && selectedBase !== "codex") {
     return [selectedEntry];
   }
   return entries.filter((entry) => (entry.baseProvider ?? entry.provider) === selectedBase);

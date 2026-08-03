@@ -50,6 +50,17 @@ describe("combined model selector data", () => {
     expect(filterCompatibleProviderEntries([primary, secondary, codex], codex)).toEqual([codex]);
   });
 
+  it("offers Codex account profiles for an active Codex agent", () => {
+    const codex = snapshotEntry({ provider: "codex", baseProvider: "codex" });
+    const codexWork = snapshotEntry({ provider: "codex-work", baseProvider: "codex" });
+    const claude = snapshotEntry({ provider: "claude", baseProvider: "claude" });
+
+    expect(filterCompatibleProviderEntries([codex, codexWork, claude], codexWork)).toEqual([
+      codex,
+      codexWork,
+    ]);
+  });
+
   it("applies a desktop model selection through the provider switch handler", () => {
     const onSelectProviderAndModel = vi.fn();
     const onSelectModel = vi.fn();

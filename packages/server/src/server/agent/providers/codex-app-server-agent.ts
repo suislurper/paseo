@@ -38,10 +38,11 @@ import type { Logger } from "pino";
 
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { Dirent } from "node:fs";
+import { createReadStream, Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { composeSystemPromptParts } from "../system-prompt.js";
@@ -519,6 +520,219 @@ async function checkCodexLaunchAvailable(launch: ResolvedProviderLaunch) {
 
 function resolveCodexHomeDir(): string {
   return process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+}
+
+const PASEO_CODEX_HOME_METADATA_KEY = "paseoCodexHome";
+const CODEX_ROLLOUT_THREAD_ID_PATTERN =
+  /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const CODEX_ANY_THREAD_ID_PATTERN =
+  /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+// Effective CODEX_HOME for a spawned app-server: launch-context env overrides
+// profile runtime settings, which override the daemon process env. This must
+// match the overlay order in createProviderEnvSpec.
+function resolveCodexHomeFor(
+  runtimeSettings?: ProviderRuntimeSettings,
+  launchEnv?: Record<string, string>,
+): string {
+  const launchHome = launchEnv?.CODEX_HOME;
+  if (typeof launchHome === "string" && launchHome.trim().length > 0) {
+    return launchHome;
+  }
+  const settingsHome = runtimeSettings?.env?.CODEX_HOME;
+  if (typeof settingsHome === "string" && settingsHome.trim().length > 0) {
+    return settingsHome;
+  }
+  return resolveCodexHomeDir();
+}
+
+// threadId (lowercase) -> rollout path relative to codexHome. Active sessions
+// win over archived ones when a thread id appears in both trees.
+async function indexCodexRollouts(codexHome: string): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  for (const root of ["sessions", "archived_sessions"]) {
+    const stack = [path.join(codexHome, root)];
+    while (stack.length > 0) {
+      const dir = stack.pop()!;
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const absolute = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(absolute);
+          continue;
+        }
+        if (!entry.isFile()) {
+          continue;
+        }
+        const match = CODEX_ROLLOUT_THREAD_ID_PATTERN.exec(entry.name);
+        const threadId = match?.[1]?.toLowerCase();
+        if (threadId && !index.has(threadId)) {
+          index.set(threadId, path.relative(codexHome, absolute));
+        }
+      }
+    }
+  }
+  return index;
+}
+
+// Rollouts reference sub-agent child threads by id; resume replays those child
+// histories, so they must travel with the root rollout across profile homes.
+async function collectCodexReferencedThreadIds(rolloutPath: string): Promise<Set<string>> {
+  const ids = new Set<string>();
+  const reader = readline.createInterface({
+    input: createReadStream(rolloutPath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of reader) {
+    for (const match of line.matchAll(CODEX_ANY_THREAD_ID_PATTERN)) {
+      ids.add(match[0].toLowerCase());
+    }
+  }
+  return ids;
+}
+
+async function codexFileIsPrefixOf(prefixPath: string, fullPath: string): Promise<boolean> {
+  const [prefixStat, fullStat] = await Promise.all([fs.stat(prefixPath), fs.stat(fullPath)]);
+  if (prefixStat.size > fullStat.size) {
+    return false;
+  }
+  const [prefixHandle, fullHandle] = await Promise.all([
+    fs.open(prefixPath, "r"),
+    fs.open(fullPath, "r"),
+  ]);
+  try {
+    const chunkSize = 1024 * 1024;
+    const prefixBuffer = Buffer.allocUnsafe(chunkSize);
+    const fullBuffer = Buffer.allocUnsafe(chunkSize);
+    let offset = 0;
+    while (offset < prefixStat.size) {
+      const length = Math.min(chunkSize, prefixStat.size - offset);
+      const [prefixRead, fullRead] = await Promise.all([
+        prefixHandle.read(prefixBuffer, 0, length, offset),
+        fullHandle.read(fullBuffer, 0, length, offset),
+      ]);
+      if (
+        prefixRead.bytesRead !== length ||
+        fullRead.bytesRead !== length ||
+        !prefixBuffer.subarray(0, length).equals(fullBuffer.subarray(0, length))
+      ) {
+        return false;
+      }
+      offset += length;
+    }
+    return true;
+  } finally {
+    await Promise.all([prefixHandle.close(), fullHandle.close()]);
+  }
+}
+
+// Rollout files are append-only, which makes cross-profile publication safe:
+// identical target -> no-op, target a prefix of source -> source is newer,
+// overwrite; source a prefix of target -> target is already complete, keep it;
+// anything else means the thread diverged between homes and we refuse.
+async function publishCodexRollout(input: {
+  sourcePath: string;
+  targetPath: string;
+  threadId: string;
+}): Promise<void> {
+  const sourceStat = await fs.stat(input.sourcePath);
+  let targetStat;
+  try {
+    targetStat = await fs.stat(input.targetPath);
+  } catch {
+    targetStat = null;
+  }
+  if (!targetStat) {
+    await fs.mkdir(path.dirname(input.targetPath), { recursive: true });
+    await fs.copyFile(input.sourcePath, input.targetPath);
+    return;
+  }
+  const diverged = () =>
+    new Error(
+      `Codex session rollout '${input.threadId}' has diverged between profile homes; refusing to overwrite '${input.targetPath}'`,
+    );
+  if (targetStat.size === sourceStat.size) {
+    if (await codexFileIsPrefixOf(input.sourcePath, input.targetPath)) {
+      return;
+    }
+    throw diverged();
+  }
+  if (sourceStat.size > targetStat.size) {
+    if (await codexFileIsPrefixOf(input.targetPath, input.sourcePath)) {
+      await fs.copyFile(input.sourcePath, input.targetPath);
+      return;
+    }
+    throw diverged();
+  }
+  if (await codexFileIsPrefixOf(input.sourcePath, input.targetPath)) {
+    return;
+  }
+  throw diverged();
+}
+
+// Serialize transfers per target home so concurrent switches cannot interleave
+// partial rollout copies into the same profile.
+const codexHomeTransferChains = new Map<string, Promise<void>>();
+
+function serializeCodexHomeTransfer(targetHome: string, task: () => Promise<void>): Promise<void> {
+  const key = path.resolve(targetHome);
+  const previous = codexHomeTransferChains.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(task);
+  codexHomeTransferChains.set(
+    key,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
+async function transferCodexSessionBetweenHomes(input: {
+  sourceHome: string;
+  targetHome: string;
+  threadId: string;
+  logger: Logger;
+}): Promise<void> {
+  const rootThreadId = input.threadId.toLowerCase();
+  await serializeCodexHomeTransfer(input.targetHome, async () => {
+    const index = await indexCodexRollouts(input.sourceHome);
+    const rootRelative = index.get(rootThreadId);
+    if (!rootRelative) {
+      throw new Error(
+        `Codex session rollout '${input.threadId}' was not found in '${input.sourceHome}'`,
+      );
+    }
+    const referencedIds = await collectCodexReferencedThreadIds(
+      path.join(input.sourceHome, rootRelative),
+    );
+    const rollouts = new Map<string, string>([[rootThreadId, rootRelative]]);
+    for (const threadId of referencedIds) {
+      const relative = index.get(threadId);
+      if (relative && !rollouts.has(threadId)) {
+        rollouts.set(threadId, relative);
+      }
+    }
+    for (const [threadId, relative] of rollouts) {
+      await publishCodexRollout({
+        sourcePath: path.join(input.sourceHome, relative),
+        targetPath: path.join(input.targetHome, relative),
+        threadId,
+      });
+    }
+    input.logger.debug(
+      {
+        provider: CODEX_PROVIDER,
+        threadId: input.threadId,
+        sourceHome: input.sourceHome,
+        targetHome: input.targetHome,
+        copiedRollouts: rollouts.size,
+      },
+      "Transferred Codex session between profile homes",
+    );
+  });
 }
 
 function decodeEscapedChar(next: string): string {
@@ -3170,6 +3384,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly goalsEnabled: boolean = false,
     private readonly autoReviewEnabled: boolean = false,
     private readonly agentId?: string,
+    private readonly codexHome?: string,
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -4175,6 +4390,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         extra: this.config.extra,
         systemPrompt: this.config.systemPrompt,
         mcpServers: this.config.mcpServers,
+        ...(this.codexHome ? { [PASEO_CODEX_HOME_METADATA_KEY]: this.codexHome } : {}),
       },
     };
   }
@@ -6282,6 +6498,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       goalsEnabled,
       autoReviewEnabled,
       launchContext?.agentId,
+      resolveCodexHomeFor(this.runtimeSettings, launchContext?.env),
     );
     await session.connect();
     return session;
@@ -6299,6 +6516,20 @@ export class CodexAppServerAgentClient implements AgentClient {
       provider: CODEX_PROVIDER,
       cwd: overrides?.cwd ?? storedConfig.cwd ?? process.cwd(),
     };
+    const targetHome = resolveCodexHomeFor(this.runtimeSettings, launchContext?.env);
+    const sourceHome = handle.metadata?.[PASEO_CODEX_HOME_METADATA_KEY];
+    if (
+      typeof sourceHome === "string" &&
+      sourceHome.length > 0 &&
+      path.resolve(sourceHome) !== path.resolve(targetHome)
+    ) {
+      await transferCodexSessionBetweenHomes({
+        sourceHome,
+        targetHome,
+        threadId: handle.sessionId,
+        logger: this.logger,
+      });
+    }
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
     const session = new CodexAppServerAgentSession(
@@ -6312,6 +6543,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       goalsEnabled,
       autoReviewEnabled,
       launchContext?.agentId,
+      targetHome,
     );
     await session.connect();
     return session;

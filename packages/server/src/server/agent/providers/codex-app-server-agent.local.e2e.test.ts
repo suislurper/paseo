@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 
 import { CodexAppServerAgentClient } from "./codex-app-server-agent.js";
@@ -186,6 +186,29 @@ request_max_retries = 0
 stream_max_retries = 0
 `,
   );
+}
+
+function findRolloutPath(codexHome: string, threadId: string): string | null {
+  const suffix = `-${threadId}.jsonl`;
+  const stack = [path.join(codexHome, "sessions"), path.join(codexHome, "archived_sessions")];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const absolute = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(absolute);
+      } else if (entry.isFile() && entry.name.endsWith(suffix)) {
+        return absolute;
+      }
+    }
+  }
+  return null;
 }
 
 function waitForEvent<TEvent extends AgentStreamEvent>(params: {
@@ -376,5 +399,100 @@ describe("Codex app-server provider (local e2e)", () => {
       }
     },
     30_000,
+  );
+
+  test.runIf(isCodexInstalled())(
+    "moves a live session into another Codex profile home on resume",
+    async () => {
+      const cwd = mkdtempSync(path.join(os.tmpdir(), "codex-profile-switch-cwd-"));
+      const homeA = mkdtempSync(path.join(os.tmpdir(), "codex-profile-switch-home-a-"));
+      const homeB = mkdtempSync(path.join(os.tmpdir(), "codex-profile-switch-home-b-"));
+      const mockServer = await startMockResponsesServer([
+        assistantMessageSse("hello from profile A"),
+        assistantMessageSse("hello from profile B"),
+      ]);
+
+      const turnTerminal = (
+        session: Parameters<typeof waitForEvent>[0]["session"],
+        label: string,
+      ) =>
+        waitForEvent({
+          session,
+          timeoutMs: 20_000,
+          label,
+          predicate: (
+            event,
+          ): event is Extract<
+            AgentStreamEvent,
+            { type: "turn_completed" | "turn_failed" | "turn_canceled" }
+          > =>
+            event.type === "turn_completed" ||
+            event.type === "turn_failed" ||
+            event.type === "turn_canceled",
+        });
+
+      try {
+        writeMockCodexConfig(homeA, mockServer.url);
+        writeMockCodexConfig(homeB, mockServer.url);
+
+        const clientA = new CodexAppServerAgentClient(createTestLogger(), {
+          env: { CODEX_HOME: homeA },
+        });
+        const sessionA = await clientA.createSession({
+          provider: "codex",
+          cwd,
+          modeId: "auto",
+          model: "mock-model",
+          thinkingOptionId: "medium",
+        });
+
+        const handle = await (async () => {
+          try {
+            const firstTurn = turnTerminal(sessionA, "first turn completion");
+            await sessionA.startTurn("say hi");
+            expect((await firstTurn).type).toBe("turn_completed");
+
+            const persistence = sessionA.describePersistence();
+            expect(persistence?.metadata?.paseoCodexHome).toBe(homeA);
+            return persistence;
+          } finally {
+            await sessionA.close();
+          }
+        })();
+        if (!handle) {
+          throw new Error("Expected a persistence handle after the first turn");
+        }
+        const threadId = handle.sessionId;
+        expect(findRolloutPath(homeA, threadId)).not.toBeNull();
+        expect(findRolloutPath(homeB, threadId)).toBeNull();
+
+        const clientB = new CodexAppServerAgentClient(createTestLogger(), {
+          env: { CODEX_HOME: homeB },
+        });
+        const sessionB = await clientB.resumeSession(handle, {
+          cwd,
+          modeId: "auto",
+          model: "mock-model",
+          thinkingOptionId: "medium",
+        });
+        try {
+          // The rollout moved into the target home and the thread resumes there.
+          expect(findRolloutPath(homeB, threadId)).not.toBeNull();
+          expect(sessionB.describePersistence()?.metadata?.paseoCodexHome).toBe(homeB);
+
+          const secondTurn = turnTerminal(sessionB, "second turn completion");
+          await sessionB.startTurn("say hi again");
+          expect((await secondTurn).type).toBe("turn_completed");
+        } finally {
+          await sessionB.close();
+        }
+      } finally {
+        await mockServer.close();
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(homeA, { recursive: true, force: true });
+        rmSync(homeB, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 });

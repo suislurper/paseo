@@ -439,6 +439,13 @@ interface SubscriptionRecord {
 }
 
 const BUSY_STATUSES: Set<AgentLifecycleStatus> = new Set(["initializing", "running"]);
+// Base providers whose live sessions can migrate between derived account
+// profiles: each carries a per-profile home directory the provider knows how
+// to transfer session state into (Claude config dir, Codex CODEX_HOME).
+const PROFILE_SWITCHABLE_BASE_PROVIDERS: Record<string, true> = {
+  claude: true,
+  codex: true,
+};
 const AgentIdSchema = z.guid();
 
 function isAgentBusy(status: AgentLifecycleStatus): boolean {
@@ -1555,7 +1562,7 @@ export class AgentManager {
       this.assertAgentIdleForProviderSwitch(agentId, agent);
       const currentBase = this.providerBase.get(agent.provider) ?? agent.provider;
       const targetBase = this.providerBase.get(providerId) ?? providerId;
-      if (currentBase !== targetBase || currentBase !== "claude") {
+      if (currentBase !== targetBase || !PROFILE_SWITCHABLE_BASE_PROVIDERS[currentBase]) {
         throw new Error(
           `Cannot switch an active agent from '${agent.provider}' to incompatible provider '${providerId}'`,
         );

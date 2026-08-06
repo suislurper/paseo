@@ -865,23 +865,26 @@ def live_pid_map(
 def load_snapshot(path: str) -> tuple[dict[str, Any] | None, str | None]:
     """Load a process-census snapshot with an explicit load outcome.
 
-    Returns ``(snap, None)`` on success. On failure ``(None, tag)`` where tag is:
+    Open the path directly (no pre-stat / isfile gate). Returns ``(snap, None)``
+    on success. On failure ``(None, tag)`` where tag is:
 
-    - ``snapshot_missing`` — path absent (atomic-replace gaps stay pollable)
+    - ``snapshot_missing`` — only ``FileNotFoundError`` (true absence and
+      atomic-replace gaps stay pollable)
     - ``snapshot_malformed`` — JSON parse failure or non-object root (nontransient)
-    - ``snapshot_unreadable`` — read OSError other than path absence (nontransient)
+    - ``snapshot_unreadable`` — every other ``OSError``, including
+      ``IsADirectoryError`` and ``PermissionError`` on present paths (nontransient;
+      must not be polled as missing or retain prior exclusive-transient tags)
     """
-    if not os.path.isfile(path):
-        return None, "snapshot_missing"
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        # TOCTOU / atomic replace: treat absence as missing (pollable).
+        # Path absent, including atomic-replace gaps: pollable.
         return None, "snapshot_missing"
     except json.JSONDecodeError:
         return None, "snapshot_malformed"
     except OSError:
+        # Present but unreadable as a file (directory, permission, etc.).
         return None, "snapshot_unreadable"
     if not isinstance(data, dict):
         return None, "snapshot_malformed"

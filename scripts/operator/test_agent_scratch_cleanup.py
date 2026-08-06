@@ -1419,6 +1419,13 @@ class Tests(unittest.TestCase):
         self.assertIsNone(snap)
         self.assertEqual(err, "snapshot_malformed")
 
+        # Present directory must be unreadable, never collapsed to missing via isfile.
+        as_dir = self.h.root / "census-as-dir"
+        as_dir.mkdir()
+        snap, err = M.load_snapshot(str(as_dir))
+        self.assertIsNone(snap)
+        self.assertEqual(err, "snapshot_unreadable")
+
         # Permission denied → unreadable (skip if we cannot drop mode as this user).
         denied = self.h.root / "denied.json"
         denied.write_text('{"ok": true}', encoding="utf-8")
@@ -1437,6 +1444,110 @@ class Tests(unittest.TestCase):
         snap, err = M.load_snapshot(str(self.h.census))
         self.assertIsInstance(snap, dict)
         self.assertIsNone(err)
+
+    def test_present_directory_census_is_unreadable_immediately(self) -> None:
+        """M1: census path that is a directory → snapshot_unreadable, no poll."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.seed_proc()
+        if self.h.census.exists() and not self.h.census.is_dir():
+            self.h.census.unlink()
+        # Present directory at census path (IsADirectoryError on open).
+        self.h.census.mkdir(parents=True, exist_ok=True)
+
+        sleep_calls: list[float] = []
+        with mock.patch.object(M.time, "sleep", side_effect=lambda s: sleep_calls.append(s)):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_unreadable", c["reasons"])
+        self.assertNotIn("snapshot_missing", c["reasons"])
+        self.assertEqual(sleep_calls, [])
+
+    def test_directory_replacement_after_transient_not_process_new(self) -> None:
+        """M1: after exclusive transient, directory at census path fails closed now.
+
+        Must return snapshot_unreadable immediately and must not retain process_new
+        through deadline polling (pre-open isfile would have mis-tagged as missing).
+        """
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                # Replace census file with a present directory.
+                self.h.census.unlink()
+                self.h.census.mkdir()
+
+        with mock.patch.object(M.time, "sleep", side_effect=on_sleep):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_unreadable", c["reasons"])
+        self.assertNotIn("process_new", c["reasons"])
+        self.assertNotIn("snapshot_missing", c["reasons"])
+        # One sleep to discover the directory replacement; no deadline polling.
+        self.assertEqual(sleep_n["n"], 1)
+
+    def test_true_absence_still_polls_and_recovers(self) -> None:
+        """M1: true path absence stays snapshot_missing (pollable) and can recover."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.seed_proc()
+        if self.h.census.exists():
+            self.h.census.unlink()
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                # Atomic-replace style: path reappears as a good census file.
+                self.h.write_census(captured_at=iso(self.h.now))
+
+        with mock.patch.object(M.time, "sleep", side_effect=on_sleep):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        self.assertGreaterEqual(sleep_n["n"], 1)
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "eligible", c)
+        self.assertNotIn("snapshot_unreadable", c["reasons"])
+        self.assertNotIn("snapshot_missing", c["reasons"])
 
     def test_wait_for_snapshot_setup_delay_does_not_extend_absolute_deadline(self) -> None:
         """M2: 10s setup with wait_s=75 must finish by mono 75, not 85.

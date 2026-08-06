@@ -112,6 +112,28 @@ const OPENCODE_PERMISSION_ACTION_ALLOW_ALWAYS = "allow_always";
 // resumes must attach to that same helper server to receive live global events.
 const openCodeChildSessionServerUrls = new Map<string, string>();
 
+/** Managed per-agent runtime storage keys injected when agents.runtimeRoot is set. */
+const MANAGED_AGENT_RUNTIME_STORAGE_ENV_KEYS = [
+  "PASEO_AGENT_SCRATCH_DIR",
+  "PASEO_AGENT_SCRATCH_GENERATION",
+  "PASEO_AGENT_ARTIFACT_DIR",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+] as const;
+
+function hasManagedAgentRuntimeStorageEnv(
+  env: Readonly<Record<string, string>> | undefined,
+): boolean {
+  if (!env) {
+    return false;
+  }
+  return MANAGED_AGENT_RUNTIME_STORAGE_ENV_KEYS.some((key) => {
+    const value = env[key];
+    return typeof value === "string" && value.length > 0;
+  });
+}
+
 function registerOpenCodeChildSessionServerUrl(sessionId: string, serverUrl: string): void {
   openCodeChildSessionServerUrls.delete(sessionId);
   openCodeChildSessionServerUrls.set(sessionId, serverUrl);
@@ -1377,6 +1399,15 @@ export class OpenCodeAgentClient implements AgentClient {
     };
     const openCodeConfig = this.assertConfig(config);
     const registeredServerUrl = getOpenCodeChildSessionServerUrl(handle.sessionId);
+    // Adopted children may reuse the parent's registered OpenCode server only when
+    // they do not carry managed per-agent runtime storage. Managed TMPDIR/scratch
+    // keys would pin the child to parent-server process env and violate isolation.
+    // PASEO_AGENT_ID alone preserves the prior adopted-child path.
+    if (registeredServerUrl && hasManagedAgentRuntimeStorageEnv(launchContext?.env)) {
+      throw new Error(
+        "OpenCode adopted child cannot use parent server with managed runtime storage",
+      );
+    }
     const registeredAcquisition = registeredServerUrl
       ? this.serverManager.acquireExisting(registeredServerUrl)
       : null;

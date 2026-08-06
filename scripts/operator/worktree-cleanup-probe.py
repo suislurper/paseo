@@ -41,6 +41,7 @@ ToolError = _asc.ToolError
 wait_for_snapshot = _asc.wait_for_snapshot
 process_proof = _asc.process_proof
 ensure_no_symlink_components = _asc.ensure_no_symlink_components
+interpret_schedule_identity_target = _asc.interpret_schedule_identity_target
 DEFAULT_CENSUS = _asc.DEFAULT_CENSUS
 SNAPSHOT_WAIT_S = _asc.SNAPSHOT_WAIT_S
 REF_KINDS = _asc.REF_KINDS
@@ -334,11 +335,23 @@ def process_owners_from_snapshot(
     return owners
 
 
+def resolve_repo_common_git_dir(repo: str) -> str:
+    """Resolve the repository's absolute common Git directory once per probe."""
+    raw = checked(
+        ["git", "-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        timeout=30,
+    ).strip()
+    if not raw or not os.path.isabs(raw):
+        raise ProbeError("repo-common-git-dir-unresolved")
+    return normalize_path(raw)
+
+
 def collect_process_census(
     *,
     census_path: str,
     proc_root: str,
     managed_root: str,
+    common_git_dir: str,
     started_at: datetime,
     now_fn: Callable[[], datetime],
     wait_s: float,
@@ -346,7 +359,9 @@ def collect_process_census(
 ) -> tuple[bool, list[str], dict[int, dict[str, Any]], dict[str, Any]]:
     """Wait for a post-start ≤45s complete same-boot snapshot and prove identity.
 
-    Returns (ok, reasons, by_pid, summary). Failures block all candidates.
+    Snapshot roots must cover both the managed worktree root and the repo common
+    Git directory. Returns (ok, reasons, by_pid, summary). Failures block all
+    candidates.
     """
     summary: dict[str, Any] = {
         "complete": False,
@@ -378,7 +393,9 @@ def collect_process_census(
     summary["captured_at"] = snap.get("captured_at")
     summary["boot_id"] = snap.get("boot_id")
     try:
-        process_ok, process_reasons, by_pid = process_proof(snap, proc_root, managed_root)
+        process_ok, process_reasons, by_pid = process_proof(
+            snap, proc_root, managed_root, common_git_dir
+        )
     except ToolError as exc:
         summary["reasons"] = [f"process_proof:{exc}"]
         return False, list(summary["reasons"]), {}, summary
@@ -430,6 +447,7 @@ def paseo_census(manual_pins: list[str]) -> dict[str, Any]:
             errors.append(f"pin:{agent_id}:{exc}")
 
     schedules: list[dict[str, Any]] = []
+    global_schedule_blocks: list[str] = []
     try:
         listed = json_command(["paseo", "schedule", "ls", "--json"], timeout=30)
         if not isinstance(listed, list):
@@ -446,21 +464,26 @@ def paseo_census(manual_pins: list[str]) -> dict[str, Any]:
                 ["paseo", "schedule", "inspect", schedule_id, "--identity-only", "--json"],
                 timeout=30,
             )
-            target = detail.get("target") if isinstance(detail, dict) else None
-            target_id = target.get("agentId") if isinstance(target, dict) else None
+            if not isinstance(detail, dict):
+                raise ProbeError(f"schedules:identity-not-object:{schedule_id}")
+            kind, payload = interpret_schedule_identity_target(detail, schedule_id=schedule_id)
+            if kind == "global_block":
+                if payload not in global_schedule_blocks:
+                    global_schedule_blocks.append(payload)
+                schedules.append(detail)
+                continue
+            target_id = payload
             target_cwd = next(
                 (agent["cwd"] for agent in agents if agent["id"] == target_id),
                 None,
             )
-            if isinstance(target_id, str) and target_cwd is None:
+            if target_cwd is None:
                 target_detail = json_command(["paseo", "inspect", target_id, "--json"], timeout=30)
                 raw_target_cwd = field(target_detail, "cwd", "Cwd")
                 if not isinstance(raw_target_cwd, str):
                     raise ProbeError(f"schedules:target-cwd-unresolved:{schedule_id}:{target_id}")
                 target_cwd = normalize_path(raw_target_cwd)
-            if isinstance(detail, dict):
-                detail = {**detail, "targetCwd": target_cwd}
-            schedules.append(detail)
+            schedules.append({**detail, "targetCwd": target_cwd})
     except ProbeError as exc:
         errors.append(str(exc))
 
@@ -489,6 +512,7 @@ def paseo_census(manual_pins: list[str]) -> dict[str, Any]:
         "agents": agents,
         "pins": pins,
         "active_schedules": schedules,
+        "global_schedule_blocks": global_schedule_blocks,
         "terminals": terminals,
         "pending_permissions": permissions,
     }
@@ -714,6 +738,9 @@ def inspect_candidate(
     owners = relevant_agent_ids(path, census)
     pins = pinned_agent_ids(path, census)
     scheduled = scheduled_agent_ids(path, census)
+    for reason in census.get("global_schedule_blocks") or []:
+        if isinstance(reason, str) and reason:
+            blockers.append(reason)
     if owners:
         blockers.append(f"unarchived-agents:{','.join(owners)}")
     if pins:
@@ -860,10 +887,13 @@ def run_probe(
         if not census["complete"]:
             raise ProbeError("paseo-census-incomplete")
 
+        # Resolve once: census roots must cover managed worktrees + common Git dir.
+        common_git_dir = resolve_repo_common_git_dir(repo_n)
         process_ok, process_reasons, by_pid, process_summary = collect_process_census(
             census_path=census_path,
             proc_root=proc_root,
             managed_root=managed_n,
+            common_git_dir=common_git_dir,
             started_at=started,
             now_fn=now_fn,
             wait_s=wait_s,

@@ -2454,6 +2454,63 @@ describe("OpenCode provider subagent contract", () => {
     ]);
   });
 
+  test("rejects adopted child resume when managed runtime storage env is present", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const parentClient = new TestOpenCodeClient();
+    parentClient.sessionCreateResponse = { data: { id: "ses_parent_managed" } };
+    runtime.enqueueClient(parentClient);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const parent = await client.createSession(
+      { provider: "opencode", cwd: "/workspace/repo" },
+      { env: { PASEO_AGENT_ID: "parent-agent" } },
+    );
+
+    parentClient.emitEvent({
+      type: "session.created",
+      properties: {
+        info: {
+          id: "ses_child_managed",
+          parentID: "ses_parent_managed",
+          title: "Managed child",
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await expect(
+      client.resumeSession(
+        {
+          provider: "opencode",
+          sessionId: "ses_child_managed",
+          nativeHandle: "ses_child_managed",
+          metadata: { cwd: "/workspace/repo" },
+        },
+        undefined,
+        {
+          env: {
+            PASEO_AGENT_ID: "child-agent",
+            PASEO_AGENT_SCRATCH_DIR: "/runtime/scratch/child-agent",
+            PASEO_AGENT_SCRATCH_GENERATION: "11111111-1111-1111-1111-111111111111",
+            PASEO_AGENT_ARTIFACT_DIR: "/runtime/artifacts/child-agent",
+            TMPDIR: "/runtime/scratch/child-agent",
+            TMP: "/runtime/scratch/child-agent",
+            TEMP: "/runtime/scratch/child-agent",
+          },
+        },
+      ),
+    ).rejects.toThrow(/adopted child cannot use parent server with managed runtime storage/i);
+
+    expect(runtime.acquisitions.filter((entry) => entry.kind === "existing")).toEqual([]);
+    expect(runtime.acquisitions).toEqual([
+      { kind: "dedicated", env: { PASEO_AGENT_ID: "parent-agent" }, releaseCount: 0 },
+    ]);
+    await parent.close();
+  });
+
   test("synthesizes a turn for externally driven adopted child timeline events", async () => {
     const { child, childClient, parent } = await createAdoptedChildSession();
     const completed = createTestDeferred<void>();

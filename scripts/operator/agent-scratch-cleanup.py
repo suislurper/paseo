@@ -501,6 +501,36 @@ def inspect_schedule_identity(
     return data
 
 
+def interpret_schedule_identity_target(
+    identity: dict[str, Any],
+    *,
+    schedule_id: str,
+) -> tuple[str, str]:
+    """Interpret an authoritative identity-only schedule target.
+
+    Bounded identity omits configured cwd/workspace for new-agent targets, so those
+    (and unknown/malformed targets) must globally block every cleanup candidate.
+
+    Returns:
+      ("agent", agent_id) for exact agent/self targets.
+      ("global_block", reason) for new-agent or unknown/malformed targets.
+        new-agent uses reason ``active_new_agent_schedule``.
+    """
+    target = identity.get("target")
+    if not isinstance(target, dict):
+        return "global_block", f"schedule_identity_malformed:{schedule_id}"
+    ttype = target.get("type")
+    if ttype == "new-agent":
+        return "global_block", "active_new_agent_schedule"
+    if ttype not in ("agent", "self"):
+        return "global_block", f"schedule_identity_unknown_target:{schedule_id}"
+    tid = target.get("agentId") or target.get("agent_id")
+    try:
+        return "agent", _require_agent_id(tid, f"schedule identity {schedule_id}")
+    except ToolError:
+        return "global_block", f"schedule_identity_malformed:{schedule_id}"
+
+
 def collect_paseo_census(
     runner: Callable[[list[str]], tuple[int, str, str]],
 ) -> dict[str, Any]:
@@ -551,21 +581,18 @@ def collect_paseo_census(
 
     # Authoritative active-schedule targets via identity-only inspect.
     protected_schedule_agents: set[str] = set()
+    global_schedule_blocks: list[str] = []
     for sch in schedules:
         if sch.get("status") != "active":
             continue
         sid = str(sch["id"])
         identity = inspect_schedule_identity(runner, sid)
-        target = identity.get("target")
-        if not isinstance(target, dict):
-            raise ToolError(f"schedule identity {sid}: malformed target")
-        ttype = target.get("type")
-        if ttype == "new-agent":
+        kind, payload = interpret_schedule_identity_target(identity, schedule_id=sid)
+        if kind == "global_block":
+            if payload not in global_schedule_blocks:
+                global_schedule_blocks.append(payload)
             continue
-        if ttype not in ("agent", "self"):
-            raise ToolError(f"schedule identity {sid}: unknown target type {ttype!r}")
-        tid = target.get("agentId") or target.get("agent_id")
-        protected_schedule_agents.add(_require_agent_id(tid, f"schedule identity {sid}"))
+        protected_schedule_agents.add(payload)
 
     # Descendant ancestry via authoritative inspect ParentAgentId (not --label).
     parent_of: dict[str, str | None] = {}
@@ -594,6 +621,7 @@ def collect_paseo_census(
         "permits": permits,
         "terminals": terminals,
         "protected_schedule_agents": protected_schedule_agents,
+        "global_schedule_blocks": global_schedule_blocks,
         "parent_of": parent_of,
     }
 
@@ -901,9 +929,11 @@ def _well_formed_reference(ref: Any) -> bool:
 
 
 def snapshot_roots_cover(
-    snap: dict[str, Any], runtime_root: str
+    snap: dict[str, Any],
+    required_path: str,
+    *extra_required_paths: str,
 ) -> tuple[bool, list[str]]:
-    """Require well-formed absolute roots that cover configured runtimeRoot."""
+    """Require well-formed absolute roots that cover every required path."""
     reasons: list[str] = []
     roots = snap.get("roots")
     if not isinstance(roots, list):
@@ -943,9 +973,10 @@ def snapshot_roots_cover(
         return False, out
     if not norm_roots:
         return False, ["snapshot_roots_empty"]
-    rr = norm(runtime_root)
-    if not any(under(rr, r) for r in norm_roots):
-        return False, ["snapshot_roots_unrelated"]
+    for req in (required_path, *extra_required_paths):
+        rr = norm(req)
+        if not any(under(rr, r) for r in norm_roots):
+            return False, ["snapshot_roots_unrelated"]
     return True, []
 
 
@@ -953,10 +984,13 @@ def process_proof(
     snap: dict[str, Any],
     proc_root: str,
     runtime_root: str,
+    *extra_required_roots: str,
 ) -> tuple[bool, list[str], dict[int, dict[str, Any]]]:
     """Every live non-kernel pid matches snapshot pid+start_time; every record complete."""
     reasons: list[str] = []
-    roots_ok, roots_reasons = snapshot_roots_cover(snap, runtime_root)
+    roots_ok, roots_reasons = snapshot_roots_cover(
+        snap, runtime_root, *extra_required_roots
+    )
     if not roots_ok:
         reasons.extend(roots_reasons)
 
@@ -1413,6 +1447,7 @@ def run_probe(
         "permits": [],
         "terminals": [],
         "protected_schedule_agents": set(),
+        "global_schedule_blocks": [],
         "parent_of": {},
     }
     try:
@@ -1424,6 +1459,12 @@ def run_probe(
     if not paseo_ok:
         process_ok = False
         process_reasons = process_reasons + paseo_reasons
+
+    global_schedule_blocks = paseo.get("global_schedule_blocks") or []
+    if global_schedule_blocks:
+        # Active new-agent (or unknown/malformed) schedules omit bound cwd; block all.
+        process_ok = False
+        process_reasons = process_reasons + list(global_schedule_blocks)
 
     if report_blockers:
         # Aggregate timeout/unreadable: bytes null + exact error, and block every

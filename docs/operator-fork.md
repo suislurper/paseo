@@ -173,9 +173,11 @@ paths themselves.
   `paseo-process-census.timer` (timer cadence: every **30 seconds**)
 - Installed executable path: `/usr/local/libexec/paseo-process-census`
 - Fixed roots (production unit): `/home/user/.paseo/worktrees`,
-  `/mnt/data/paseo-runtime`, and `/tmp` (the `/tmp` root exists so the legacy
-  `/tmp` recovery lane can require a covering `roots` entry; it still emits only
-  redacted in-root path references — never argv/env)
+  `/mnt/data/paseo-runtime`, `/mnt/data/shab/.git`, and `/tmp`
+  (`/mnt/data/shab/.git` covers administrative Git paths for linked worktrees;
+  the `/tmp` root exists so the legacy `/tmp` recovery lane can require a covering
+  `roots` entry; it still emits only redacted in-root path references — never
+  argv/env)
 - Output: `/run/paseo/process-census.json` (mode `0644`; parent `/run/paseo` mode
   `0755`)
 
@@ -298,7 +300,10 @@ IDs, page-limit ambiguity, terminal cwd ambiguity, permits, or active schedules)
 - every **active** schedule target is resolved with
   `paseo schedule inspect <id> --identity-only` (never trust abbreviated display
   targets from `schedule ls`); protect any schedule whose identity target resolves to
-  the candidate;
+  an exact `agent`/`self` id for the candidate; any active `new-agent` target (bounded
+  identity omits configured cwd/workspace) or unknown/malformed identity target
+  **globally blocks every candidate** with reason `active_new_agent_schedule` (or a
+  clear malformed/unknown equivalent);
 - protect pending permissions for the candidate and terminals/processes whose absolute
   paths fall within its scratch; protect a present per-agent lock.
 
@@ -379,7 +384,10 @@ an exact-SHA review lands. Agents must not install, overwrite, or restart live
 - Managed path membership under the configured managed root (Paseo list remains
   authoritative for archive decisions).
 - Manual pins from the policy file; global unarchived agents; exact pin inspects;
-  active schedule identity (`paseo schedule inspect <id> --identity-only`);
+  active schedule identity (`paseo schedule inspect <id> --identity-only`; exact
+  `agent` targets protect matching paths; active `new-agent` or unknown/malformed
+  identity targets globally block every candidate with `active_new_agent_schedule`
+  or a clear equivalent);
   terminals; pending permissions; filesystem/Git locks; dirty/untracked trees;
   ignored roots via exactly
   `git status --porcelain=v1 -z --ignored=matching -unormal`;
@@ -397,16 +405,19 @@ helpers from sibling `agent-scratch-cleanup.py` (no second process parser). CLI:
   **45s**)
 
 Requires a **complete** same-boot snapshot captured **after** probe `started_at`, age
-≤ **45s**, with `roots` covering the managed worktree root. Validates every current
-non-kernel PID + `start_time_ticks`, `scope_complete`, well-formed absolute
-references, malformed/duplicate process records/roots, snapshot root symlinks, and
-live races. Any failure sets `process_census.complete=false` / `status=blocked` and
-blocks all candidates.
+≤ **45s**, with `roots` covering **both** the managed worktree root **and** the
+repository's absolute common Git directory (resolved once per probe via
+`git rev-parse --path-format=absolute --git-common-dir`). Missing either coverage
+blocks every candidate. Validates every current non-kernel PID + `start_time_ticks`,
+`scope_complete`, well-formed absolute references, malformed/duplicate process
+records/roots, snapshot root symlinks, and live races. Any failure sets
+`process_census.complete=false` / `status=blocked` and blocks all candidates.
 
 Redacted census references become **owner evidence** (no argv/env): protect a
 candidate when any `cwd`, `exe`, `interpreter_script`, or `open_fd` path falls under
-the checkout **or** its exact git-dir. Each evidence row carries `pid`, `uid`,
-`name`, `kind`, and `path`.
+the checkout **or** its exact candidate git-dir (including
+`.git/worktrees/<name>`). Each evidence row carries `pid`, `uid`, `name`, `kind`,
+and `path`.
 
 ### Output
 
@@ -474,7 +485,9 @@ infer abbreviated IDs; unarchived list cap `<200`):
 
 - every unarchived agent via exact UUID inspect (`Cwd` under candidate protects);
 - active schedules via `paseo schedule inspect <id> --identity-only` then target agent
-  inspect (target cwd under candidate protects);
+  inspect (exact `agent`/`self` target cwd under candidate protects); active
+  `new-agent` or unknown/malformed identity targets **globally block** with reason
+  `active_new_agent_schedule` (or a clear equivalent);
 - all terminals (`cwd` under candidate protects);
 - all permits (permitted agent cwd under candidate protects).
 

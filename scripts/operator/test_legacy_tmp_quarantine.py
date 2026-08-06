@@ -362,6 +362,22 @@ class Tests(unittest.TestCase):
         self.assertEqual(result["classification"], "protected")
         self.assertIn("active_schedule_target_cwd_under_candidate", result["reasons"])
 
+    def test_active_new_agent_schedule_blocks_candidate(self) -> None:
+        src = self.h.put_candidate()
+        self.h.mark_agent(A, cwd=str(self.h.root / "other"))
+        self.h.paseo.schedules.append(
+            {"id": "s-new", "status": "active", "target": "new-agent"}
+        )
+        self.h.paseo.schedule_identity["s-new"] = {
+            "id": "s-new",
+            "target": {"type": "new-agent", "config": {"provider": "claude", "cwd": "/ws"}},
+            "status": "active",
+        }
+        self.h.write_census()
+        result = self.h.probe(src)
+        self.assertEqual(result["classification"], "blocked")
+        self.assertIn("active_new_agent_schedule", result["reasons"])
+
     def test_protected_terminal_and_permit(self) -> None:
         src = self.h.put_candidate()
         self.h.mark_agent(A, cwd=str(self.h.root / "ws"))

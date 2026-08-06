@@ -145,13 +145,14 @@ class Harness:
                     "references": p.get("references", []),
                 }
             )
+        default_roots = [str(self.managed), str(self.repo / ".git")]
         wjson(
             self.census,
             {
                 "schema_version": schema_version,
                 "boot_id": boot_id,
                 "captured_at": captured_at or iso(self.now),
-                "roots": roots if roots is not None else [str(self.managed)],
+                "roots": roots if roots is not None else default_roots,
                 "complete": complete,
                 "errors": [],
                 "processes": recs,
@@ -291,6 +292,30 @@ class ProcessOwnerTests(unittest.TestCase):
         self.assertEqual(len(owners), 2)
         self.assertTrue(all(o["pid"] == 7 for o in owners))
 
+    def test_owner_open_fd_and_cwd_under_git_worktrees_name(self) -> None:
+        """Protect exact candidate git-dir under .git/worktrees/<name>."""
+        cand = str(self.h.candidate)
+        git_dir = str(self.h.git_dir)
+        self.assertIn("/.git/worktrees/", git_dir.replace("\\", "/"))
+        by_pid = {
+            11: {
+                "pid": 11,
+                "uid": 1000,
+                "name": "git",
+                "references": [
+                    {"kind": "cwd", "path": git_dir},
+                    {"kind": "open_fd", "path": f"{git_dir}/commondir"},
+                    {"kind": "open_fd", "path": f"{git_dir}/logs/HEAD"},
+                ],
+            }
+        }
+        owners = M.process_owners_from_snapshot(cand, git_dir, by_pid)
+        kinds = {(o["kind"], o["path"]) for o in owners}
+        self.assertIn(("cwd", git_dir), kinds)
+        self.assertIn(("open_fd", f"{git_dir}/commondir"), kinds)
+        self.assertIn(("open_fd", f"{git_dir}/logs/HEAD"), kinds)
+        self.assertEqual(len(owners), 3)
+
     def test_no_owner_when_refs_outside(self) -> None:
         cand = str(self.h.candidate)
         by_pid = {
@@ -319,6 +344,7 @@ class CensusConsumerTests(unittest.TestCase):
             census_path=str(self.h.census),
             proc_root=str(self.h.proc),
             managed_root=str(self.h.managed),
+            common_git_dir=str(self.h.repo / ".git"),
             started_at=self.h.started,
             now_fn=lambda: self.h.now,
             wait_s=0.0,
@@ -424,6 +450,7 @@ class CensusConsumerTests(unittest.TestCase):
             census_path=str(self.h.census),
             proc_root=str(self.h.proc),
             managed_root=str(self.h.managed),
+            common_git_dir=str(self.h.repo / ".git"),
             started_at=self.h.started,
             now_fn=lambda: self.h.now,
             wait_s=0.0,
@@ -442,6 +469,7 @@ class CensusConsumerTests(unittest.TestCase):
             census_path=str(self.h.census),
             proc_root=str(self.h.proc),
             managed_root=str(self.h.managed),
+            common_git_dir=str(self.h.repo / ".git"),
             started_at=self.h.started,
             now_fn=lambda: self.h.now,
             wait_s=0.0,
@@ -449,6 +477,17 @@ class CensusConsumerTests(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertIn("live_process_unreadable", reasons)
+
+    def test_missing_common_git_root_coverage_blocks(self) -> None:
+        # Managed covered, common git directory not covered → block all.
+        ok, reasons, _, _ = self._collect(roots=[str(self.h.managed)])
+        self.assertFalse(ok)
+        self.assertIn("snapshot_roots_unrelated", reasons)
+
+    def test_missing_managed_root_coverage_blocks(self) -> None:
+        ok, reasons, _, _ = self._collect(roots=[str(self.h.repo / ".git")])
+        self.assertFalse(ok)
+        self.assertIn("snapshot_roots_unrelated", reasons)
 
     def test_snapshot_roots_symlink(self) -> None:
         target = self.h.root / "real-root"
@@ -469,6 +508,7 @@ class CensusConsumerTests(unittest.TestCase):
             census_path=str(link),
             proc_root=str(self.h.proc),
             managed_root=str(self.h.managed),
+            common_git_dir=str(self.h.repo / ".git"),
             started_at=self.h.started,
             now_fn=lambda: self.h.now,
             wait_s=0.0,
@@ -527,6 +567,7 @@ class InspectAndSourceTests(unittest.TestCase):
             "agents": [],
             "pins": [],
             "active_schedules": [],
+            "global_schedule_blocks": [],
             "terminals": [],
             "pending_permissions": [],
         }
@@ -552,6 +593,42 @@ class InspectAndSourceTests(unittest.TestCase):
             result["blockers"],
         )
         self.assertEqual(result["processes"], [])
+
+    def test_active_new_agent_schedule_blocks_all_candidates(self) -> None:
+        census = {
+            "complete": True,
+            "errors": [],
+            "agents": [],
+            "pins": [],
+            "active_schedules": [
+                {
+                    "id": "s-new",
+                    "status": "active",
+                    "target": {"type": "new-agent", "config": {"provider": "claude"}},
+                }
+            ],
+            "global_schedule_blocks": ["active_new_agent_schedule"],
+            "terminals": [],
+            "pending_permissions": [],
+        }
+        remote = {"remote": "origin", "ref": "refs/heads/main", "sha": self.h.remote_sha}
+        with mock.patch.object(M, "run", side_effect=self.h.fake_run), mock.patch.object(
+            M, "checked", side_effect=self.h.fake_checked
+        ), mock.patch.object(M, "size_bytes", return_value=(4096, None)):
+            result = M.inspect_candidate(
+                self.h.worktree_item(),
+                repo=str(self.h.repo),
+                managed_root=str(self.h.managed),
+                remote=remote,
+                census=census,
+                process_ok=True,
+                process_reasons=[],
+                by_pid={},
+                locks=[],
+                lock_error=None,
+            )
+        self.assertEqual(result["local_gate"], "blocked")
+        self.assertIn("active_new_agent_schedule", result["blockers"])
 
     def test_open_fd_owner_blocks_candidate(self) -> None:
         cand = str(self.h.candidate)

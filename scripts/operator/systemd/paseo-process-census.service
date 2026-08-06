@@ -11,6 +11,7 @@ Type=oneshot
 ExecStart=/usr/local/libexec/paseo-process-census \
   --root /home/user/.paseo/worktrees \
   --root /mnt/data/paseo-runtime \
+  --root /mnt/data/shab/.git \
   --root /tmp \
   --output /run/paseo/process-census.json
 User=root

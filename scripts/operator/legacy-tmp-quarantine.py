@@ -25,7 +25,28 @@ if _spec is None or _spec.loader is None:
     raise RuntimeError(f"unable to load shared operator helpers from {_ASC_PATH}")
 _asc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_asc)
-for _n in ('ToolError', 'is_uuid', 'require_abs', 'norm', 'under', 'free_bytes', 'ensure_no_symlink_components', 'fsync_dir', 'mkdir_exact', 'default_paseo_runner', 'cli_json', 'inspect_agent', '_require_agent_id', 'wait_for_snapshot', 'process_proof', 'file_sha256', 'SNAPSHOT_WAIT_S', 'INVENTORY_TIMEOUT_S', 'DEFAULT_CENSUS'):
+for _n in (
+    "ToolError",
+    "is_uuid",
+    "require_abs",
+    "norm",
+    "under",
+    "free_bytes",
+    "ensure_no_symlink_components",
+    "fsync_dir",
+    "mkdir_exact",
+    "default_paseo_runner",
+    "cli_json",
+    "inspect_agent",
+    "_require_agent_id",
+    "interpret_schedule_identity_target",
+    "wait_for_snapshot",
+    "process_proof",
+    "file_sha256",
+    "SNAPSHOT_WAIT_S",
+    "INVENTORY_TIMEOUT_S",
+    "DEFAULT_CENSUS",
+):
     globals()[_n] = getattr(_asc, _n)
 
 SCHEMA_VERSION = 1
@@ -114,15 +135,12 @@ def collect_paseo_protections(
         )
         if not isinstance(identity, dict):
             raise ToolError(f"schedule identity {sid}: expected object")
-        target = identity.get("target")
-        if not isinstance(target, dict):
-            raise ToolError(f"schedule identity {sid}: malformed target")
-        ttype = target.get("type")
-        if ttype == "new-agent":
+        kind, payload = interpret_schedule_identity_target(identity, schedule_id=sid)
+        if kind == "global_block":
+            # new-agent (and unknown/malformed) omit bound cwd/workspace → block all.
+            reasons.append(payload)
             continue
-        if ttype not in ("agent", "self"):
-            raise ToolError(f"schedule identity {sid}: unknown target type {ttype!r}")
-        tid = _require_agent_id(target.get("agentId") or target.get("agent_id"), f"schedule {sid}")
+        tid = payload
         if tid not in agent_cwds:
             agent_cwds[tid] = agent_cwd(inspect_agent(runner, tid), f"schedule target {tid}")
         if under(agent_cwds[tid], cand):
@@ -466,7 +484,13 @@ def classify_source(
         out["reasons"] = [f"paseo_census:{exc}"]
         return out
     if paseo_reasons:
-        out["classification"] = "protected"
+        # Exact agent/cwd protections remain "protected". Active new-agent (or
+        # unknown/malformed) identity targets omit bound cwd → fail closed as blocked.
+        global_block = any(
+            r == "active_new_agent_schedule" or r.startswith("schedule_identity_")
+            for r in paseo_reasons
+        )
+        out["classification"] = "blocked" if global_block else "protected"
         out["reasons"] = paseo_reasons
         return out
     if processes_touching(by_pid, source):

@@ -677,6 +677,45 @@ class Tests(unittest.TestCase):
         self.assertEqual(c["classification"], "protected")
         self.assertIn("active_schedule", c["reasons"])
 
+    def test_active_new_agent_schedule_blocks_all_candidates(self) -> None:
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.paseo.schedules.append(
+            {"id": "s-new", "status": "active", "target": "new-agent:claude"}
+        )
+        self.h.paseo.schedule_identity["s-new"] = {
+            "id": "s-new",
+            "cadence": {"type": "every", "everyMs": 60_000},
+            "target": {"type": "new-agent", "config": {"provider": "claude", "cwd": "/ws"}},
+            "status": "active",
+            "expiresAt": None,
+        }
+        self.h.write_census()
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("active_new_agent_schedule", c["reasons"])
+
+    def test_malformed_schedule_identity_target_blocks_all(self) -> None:
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.paseo.schedules.append(
+            {"id": "s-bad", "status": "active", "target": "agent:????"}
+        )
+        self.h.paseo.schedule_identity["s-bad"] = {
+            "id": "s-bad",
+            "target": {"type": "mystery"},
+            "status": "active",
+        }
+        self.h.write_census()
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertTrue(
+            any(
+                r == "active_new_agent_schedule" or r.startswith("schedule_identity_")
+                for r in c["reasons"]
+            )
+        )
+
     def test_malformed_permit_and_terminal_cwd(self) -> None:
         self.h.put_scratch()
         self.h.mark_archived()

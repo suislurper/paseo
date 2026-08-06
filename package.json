@@ -85,6 +85,7 @@
     "dev:desktop": "cross-env PASEO_LISTEN=127.0.0.1:6768 npm run dev --workspace=@getpaseo/desktop",
     "dev:win:desktop": "npm run dev:win --workspace=@getpaseo/desktop",
     "verify:operator-fork": "node scripts/verify-operator-fork-baseline.mjs",
+    "test:process-census": "python3 scripts/operator/test_process_census.py",
     "verify:desktop-bundle": "node scripts/verify-desktop-bundle.mjs --dist",
     "verify:desktop-packaged": "node scripts/verify-desktop-bundle.mjs --packaged",
     "prebuild:desktop": "npm run verify:operator-fork",

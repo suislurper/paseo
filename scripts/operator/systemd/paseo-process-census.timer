@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Paseo process census every five minutes
+Documentation=file:///usr/local/share/doc/paseo/operator-fork.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1min
+Persistent=true
+Unit=paseo-process-census.service
+
+[Install]
+WantedBy=timers.target

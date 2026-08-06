@@ -124,3 +124,79 @@ replacement of the fork's `main`:
 7. remove integrated temporary feature refs so they cannot be mistaken for the canonical build.
 
 Never point fork `main` at upstream history that omits the guarded operator features.
+
+## Process census
+
+The operator host can run a **root-owned, read-only** process census so unprivileged
+cleanup probes can resolve PID reuse without scanning other users' command lines or
+paths themselves.
+
+### What it is
+
+- Source: `scripts/operator/process-census.py`
+- Unit templates: `scripts/operator/systemd/paseo-process-census.service` and
+  `paseo-process-census.timer` (timer cadence: every five minutes)
+- Installed executable path: `/usr/local/libexec/paseo-process-census`
+- Fixed roots (production unit): `/home/user/.paseo/worktrees` and
+  `/mnt/data/paseo-runtime`
+- Output: `/run/paseo/process-census.json` (mode `0644`; parent `/run/paseo` mode
+  `0755`)
+
+The helper walks `/proc` **without changing processes**. The snapshot includes
+`schema_version`, `boot_id`, `captured_at`, `roots`, `complete`, `errors`, and one
+record per current non-kernel process. Successful records carry `pid`, Linux
+`start_time_ticks`, `uid`, `name`, `scope_complete`, and `references`.
+
+### Redaction and path scope
+
+Each reference is only `{ "kind", "path" }` for `cwd`, `exe`, `interpreter_script`,
+or `open_fd` paths that fall under a configured root. Processes with no in-root paths
+get an empty `references` array — never their raw off-root paths.
+
+The tool **must not** emit argv, command lines, environment, file contents, secrets,
+or paths outside the configured roots. Cmdline is parsed in memory only to recognize
+an actual interpreter script path under a root (for example `python3 job.py`);
+arbitrary arguments are discarded.
+
+Process exit races during the scan are skipped and do **not** mark the snapshot
+incomplete. A permission or read error on a **still-existing** non-kernel process
+sets `complete=false` and records only `pid` / `start_time_ticks` plus an error
+class — no sensitive detail.
+
+### Install and security contract
+
+1. Install a copy of `process-census.py` to `/usr/local/libexec/paseo-process-census`.
+2. The installed file **must** be **root-owned** and **not group- or world-writable**
+   (typical mode `0755` or `0555`, owner `root:root`).
+3. **Forbidden:** running a user-writable checkout script (or any path writable by a
+   non-root user) as root via the unit or `sudo`. That would turn a cleanup helper into
+   a root RCE footgun. Always execute the installed libexec path after verifying
+   ownership and mode.
+4. Install the systemd unit/timer from `scripts/operator/systemd/`, then enable the
+   **timer** only (not ad-hoc `start` from agent sessions unless the operator asked).
+5. The unit runs as root with fixed roots and output path above. Hardening that does
+   not prevent full `/proc` reads or writing `/run/paseo` is allowed; do not enable
+   `ProcSubset=pid`, `PrivateUsers=yes`, or other settings that hide foreign processes.
+
+Agents in this repo must not install, start, or restart these units, and must not
+mutate the live `/home/user/.paseo` probe state, unless the operator explicitly
+requests that packet.
+
+### Consumer merge rule (closes the timer race)
+
+Snapshot freshness alone is **not** proof that a PID still refers to the same
+process. The unprivileged cleanup probe must:
+
+1. Perform its **own current** scan of the PIDs it cares about.
+2. Open `/run/paseo/process-census.json` only as a **hint**.
+3. Use a snapshot record for a PID **only when all** of the following hold:
+   - snapshot `boot_id` matches the current kernel boot id;
+   - snapshot age is **≤ 10 minutes** (`captured_at` vs now);
+   - the live process’s `pid` **and** `start_time_ticks` **both** match the snapshot
+     record.
+4. If a PID is new or reused, or any required field is unreadable on the live process,
+   treat the identity as **ambiguous and blocking** — do not delete or kill based on
+   the snapshot alone.
+
+Matching `pid + start_time_ticks` under the same `boot_id` is what closes the race
+between the five-minute timer and a PID that exited and was reused.

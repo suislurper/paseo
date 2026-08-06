@@ -1,0 +1,34 @@
+[Unit]
+Description=Paseo operator process census (read-only /proc snapshot)
+Documentation=file:///usr/local/share/doc/paseo/operator-fork.md
+# Snapshot freshness alone is not proof of process identity; see
+# docs/operator-fork.md "Process census" consumer merge rule.
+
+[Service]
+Type=oneshot
+# Must be the installed root-owned, non-group/world-writable binary.
+# Never point ExecStart at a user-writable checkout copy of process-census.py.
+ExecStart=/usr/local/libexec/paseo-process-census \
+  --root /home/user/.paseo/worktrees \
+  --root /mnt/data/paseo-runtime \
+  --output /run/paseo/process-census.json
+User=root
+# Hardening that still allows full /proc enumeration and writing /run/paseo.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute is intentionally omitted: CPython needs executable mappings.
+RestrictRealtime=yes
+# Do NOT set ProcSubset=pid or PrivateUsers=yes — those hide other processes.
+# Do NOT set ProtectProc=invisible — we need other users' /proc entries.
+ReadWritePaths=/run/paseo
+RuntimeDirectory=paseo
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

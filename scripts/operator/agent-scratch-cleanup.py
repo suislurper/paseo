@@ -813,19 +813,31 @@ def is_kernel_thread(proc_root: str, pid: int) -> bool | None:
         return False
 
 
-def live_pid_map(proc_root: str) -> dict[int, int | None]:
+def live_pid_map(
+    proc_root: str,
+    *,
+    deadline_mono: float | None = None,
+) -> tuple[dict[int, int | None], list[str]]:
     """Map of live non-kernel PID → start_time_ticks (or None if unreadable).
 
     Kernel threads are omitted (same as process-census producer). Fail closed with
     None when a non-kernel PID identity cannot be read, or when kernel-vs-userspace
     cannot be decided and the process still appears present without a readable identity.
+
+    When deadline_mono is set, the scan aborts with process_proof_timeout if the
+    absolute proof deadline is reached mid-scan (does not authorize cleanup past it).
+    Returns (map, reasons); reasons is empty on a full scan or ["process_proof_timeout"].
     """
     out: dict[int, int | None] = {}
+    if deadline_mono is not None and time.monotonic() >= deadline_mono:
+        return out, ["process_proof_timeout"]
     try:
         names = os.listdir(proc_root)
     except OSError as exc:
         raise ToolError(f"unable to list {proc_root}: {exc}") from exc
     for name in names:
+        if deadline_mono is not None and time.monotonic() >= deadline_mono:
+            return out, ["process_proof_timeout"]
         if not name.isdigit():
             continue
         pid = int(name)
@@ -845,7 +857,9 @@ def live_pid_map(proc_root: str) -> dict[int, int | None]:
             if _process_still_exists(proc_root, pid):
                 # Non-kernel (or undecidable) still present without identity → fail closed.
                 out[pid] = None
-    return out
+    if deadline_mono is not None and time.monotonic() >= deadline_mono:
+        return out, ["process_proof_timeout"]
+    return out, []
 
 
 def load_snapshot(path: str) -> dict[str, Any] | None:
@@ -857,6 +871,17 @@ def load_snapshot(path: str) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def snapshot_captured_at(snap: dict[str, Any]) -> datetime | None:
+    """Parse snapshot captured_at or return None when missing/invalid (fail closed)."""
+    captured = snap.get("captured_at")
+    if not isinstance(captured, str):
+        return None
+    try:
+        return parse_iso(captured)
+    except (TypeError, ValueError):
+        return None
 
 
 def snapshot_acceptable(
@@ -892,6 +917,26 @@ def snapshot_acceptable(
     return not reasons, reasons
 
 
+# Wait outcomes that mean "no strictly newer snapshot was observed" (retain prior
+# exclusive-transient process_proof reasons at the total deadline).
+_NO_NEWER_SNAPSHOT_REASONS = frozenset({"snapshot_not_newer", "snapshot_missing"})
+
+
+def _reasons_mean_no_newer_snapshot(reasons: list[str]) -> bool:
+    """True when wait_for_snapshot ended without observing a strictly newer snapshot."""
+    return bool(reasons) and all(r in _NO_NEWER_SNAPSHOT_REASONS for r in reasons)
+
+
+def _sleep_clamped(poll_s: float, deadline_mono: float) -> None:
+    """Sleep at most poll_s and never past the absolute proof deadline."""
+    remaining = deadline_mono - time.monotonic()
+    if remaining <= 0:
+        return
+    if poll_s <= 0:
+        return
+    time.sleep(min(poll_s, remaining))
+
+
 def wait_for_snapshot(
     census_path: str,
     *,
@@ -907,38 +952,50 @@ def wait_for_snapshot(
     When min_captured_at is set, also require captured_at strictly newer than that
     timestamp (used after a transient process-proof failure). wait_s is the bound for
     this wait only; the combined consumer helper owns the total proof window.
+
+    After a transient proof failure (min_captured_at set): if a strictly newer snapshot
+    is observed but is incomplete/malformed/stale/otherwise unacceptable, return its
+    exact validation reasons immediately (do not poll to the deadline). If the current
+    snapshot cannot establish a valid captured_at for the newer-than check, fail closed
+    with the validation tags. Sleeps are clamped to remaining wait time.
     """
     boot_id = read_boot_id(proc_root)
-    deadline = time.monotonic() + wait_s
+    deadline = time.monotonic() + max(0.0, wait_s)
     last_reasons = ["snapshot_missing"]
     while True:
+        # Always observe at least once (wait_s=0 still does a single-shot check).
         now = now_fn()
         snap = load_snapshot(census_path)
-        if snap is not None:
+        if snap is None:
+            last_reasons = ["snapshot_missing"]
+        else:
             ok, reasons = snapshot_acceptable(
                 snap, boot_id=boot_id, started_at=started_at, now=now
             )
-            if ok:
-                if min_captured_at is not None:
+            if min_captured_at is not None:
+                cap_dt = snapshot_captured_at(snap)
+                if cap_dt is None:
+                    # Fail closed: cannot decide strictly-newer vs prior transient.
+                    if reasons:
+                        return None, list(reasons)
                     captured = snap.get("captured_at")
-                    try:
-                        cap_dt = parse_iso(captured) if isinstance(captured, str) else None
-                    except (TypeError, ValueError):
-                        cap_dt = None
-                    if cap_dt is None or cap_dt <= min_captured_at:
-                        # Acceptable but not strictly newer — keep polling.
-                        last_reasons = ["snapshot_not_newer"]
-                    else:
+                    if not isinstance(captured, str):
+                        return None, ["snapshot_captured_at_missing"]
+                    return None, ["snapshot_captured_at_invalid"]
+                if cap_dt > min_captured_at:
+                    # Strictly newer snapshot observed — accept or block immediately.
+                    if ok:
                         return snap, []
-                else:
-                    return snap, []
+                    return None, list(reasons)
+                # Same or older captured_at: keep polling; do not treat as newer.
+                last_reasons = ["snapshot_not_newer"]
+            elif ok:
+                return snap, []
             else:
                 last_reasons = reasons
-        else:
-            last_reasons = ["snapshot_missing"]
         if time.monotonic() >= deadline:
             return None, last_reasons
-        time.sleep(poll_s)
+        _sleep_clamped(poll_s, deadline)
 
 
 def reasons_exclusively_transient(reasons: list[str]) -> bool:
@@ -959,19 +1016,27 @@ def wait_for_process_proof(
     """Wait for an acceptable snapshot and prove live process identity.
 
     Single bounded total window (default SNAPSHOT_WAIT_S = 75s) covering the first
-    acceptable-snapshot wait, process_proof, and any exclusive-transient retries.
+    acceptable-snapshot wait, live /proc scans inside process_proof, all sleeps, and
+    any exclusive-transient retries. Never accepts a proof that completes after the
+    absolute deadline.
 
     When process_proof fails solely for process_new, process_pid_mismatch, and/or
     live_process_race, wait for a complete same-boot acceptable snapshot whose
     captured_at is strictly newer than the rejected one, then re-run full proof.
-    Any other reason (missing/malformed/incomplete/stale snapshot, root coverage,
-    unreadable process, scope/reference errors, symlink errors, or mixed
-    transient+nontransient) blocks immediately. Persistent churn blocks at the
-    deadline with the exact final process_proof reasons.
+    If a strictly newer snapshot arrives but is incomplete/malformed/stale/root-invalid
+    or otherwise nontransient, block immediately with that snapshot's exact reasons
+    (do not keep the prior exclusive-transient tags). Any other non-retryable reason
+    blocks immediately. Persistent exclusive-transient churn with no strictly newer
+    snapshot blocks at the deadline with the exact final process_proof reasons.
 
     Returns (ok, reasons, by_pid, snap_or_None).
     """
-    deadline = time.monotonic() + wait_s
+    start_mono = time.monotonic()
+    wait_s = max(0.0, wait_s)
+    deadline = start_mono + wait_s
+    # Bound live scans whenever a positive total window is configured. wait_s=0
+    # preserves historical single-shot semantics (one full proof, no mid-scan budget).
+    scan_deadline: float | None = deadline if wait_s > 0 else None
     last_reasons: list[str] = ["snapshot_missing"]
     by_pid: dict[int, dict[str, Any]] = {}
     last_snap: dict[str, Any] | None = None
@@ -996,17 +1061,45 @@ def wait_for_process_proof(
         attempted = True
 
         if snap is None:
-            # After a transient proof failure, a missing newer snapshot at deadline
-            # keeps the exact final process_proof reasons (not snapshot_not_newer).
-            if min_captured_at is not None and reasons_exclusively_transient(last_reasons):
+            # Retain prior exclusive-transient process_proof reasons only when no
+            # strictly newer snapshot was ever observed (missing / not-newer).
+            # A newer invalid snapshot's exact validation tags must surface instead.
+            if (
+                min_captured_at is not None
+                and reasons_exclusively_transient(last_reasons)
+                and _reasons_mean_no_newer_snapshot(snap_reasons)
+            ):
                 return False, last_reasons, by_pid, last_snap
             return False, list(snap_reasons) or last_reasons, by_pid, last_snap
 
+        # Positive window only: refuse to start a scan after the absolute deadline.
+        if scan_deadline is not None and time.monotonic() >= scan_deadline:
+            return False, ["process_proof_timeout"], by_pid, snap
+
         ok, reasons, by_pid = process_proof(
-            snap, proc_root, required_root, *extra_required_roots
+            snap,
+            proc_root,
+            required_root,
+            *extra_required_roots,
+            deadline_mono=scan_deadline,
         )
         last_snap = snap
         if ok:
+            # M2: never authorize cleanup after the absolute deadline, and re-check
+            # snapshot acceptability/freshness with current now_fn before success.
+            if scan_deadline is not None and time.monotonic() >= scan_deadline:
+                return False, ["process_proof_timeout"], by_pid, snap
+            boot_id = read_boot_id(proc_root)
+            still_ok, fresh_reasons = snapshot_acceptable(
+                snap,
+                boot_id=boot_id,
+                started_at=started_at,
+                now=now_fn(),
+            )
+            if not still_ok:
+                return False, list(fresh_reasons), by_pid, snap
+            if scan_deadline is not None and time.monotonic() >= scan_deadline:
+                return False, ["process_proof_timeout"], by_pid, snap
             return True, [], by_pid, snap
 
         last_reasons = list(reasons)
@@ -1014,18 +1107,19 @@ def wait_for_process_proof(
             return False, last_reasons, by_pid, snap
 
         # Exclusive transient race: require a strictly newer acceptable snapshot.
-        captured = snap.get("captured_at")
-        try:
+        cap_dt = snapshot_captured_at(snap)
+        if cap_dt is None:
+            # Fail closed: cannot establish the exclusive-retry floor.
+            captured = snap.get("captured_at")
             if not isinstance(captured, str):
-                return False, last_reasons, by_pid, snap
-            min_captured_at = parse_iso(captured)
-        except (TypeError, ValueError):
-            return False, last_reasons, by_pid, snap
+                return False, ["snapshot_captured_at_missing"], by_pid, snap
+            return False, ["snapshot_captured_at_invalid"], by_pid, snap
+        min_captured_at = cap_dt
 
         if time.monotonic() >= deadline:
             return False, last_reasons, by_pid, last_snap
 
-        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+        _sleep_clamped(poll_s, deadline)
 
 
 def _well_formed_reference(ref: Any) -> bool:
@@ -1097,9 +1191,18 @@ def process_proof(
     proc_root: str,
     runtime_root: str,
     *extra_required_roots: str,
+    deadline_mono: float | None = None,
 ) -> tuple[bool, list[str], dict[int, dict[str, Any]]]:
-    """Every live non-kernel pid matches snapshot pid+start_time; every record complete."""
+    """Every live non-kernel pid matches snapshot pid+start_time; every record complete.
+
+    When deadline_mono is set, live /proc scans are bounded by that absolute monotonic
+    deadline and return process_proof_timeout (non-transient) instead of authorizing
+    a match after the proof window.
+    """
     reasons: list[str] = []
+    if deadline_mono is not None and time.monotonic() >= deadline_mono:
+        return False, ["process_proof_timeout"], {}
+
     roots_ok, roots_reasons = snapshot_roots_cover(
         snap, runtime_root, *extra_required_roots
     )
@@ -1131,7 +1234,20 @@ def process_proof(
             continue
         by_pid[pid] = rec
 
-    live = live_pid_map(proc_root)
+    if deadline_mono is not None and time.monotonic() >= deadline_mono:
+        return False, ["process_proof_timeout"], by_pid
+
+    live, live_timeout = live_pid_map(proc_root, deadline_mono=deadline_mono)
+    if live_timeout:
+        reasons.extend(live_timeout)
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for r in reasons:
+            if r not in seen:
+                seen.add(r)
+                uniq.append(r)
+        return False, uniq, by_pid
+
     for pid, live_st in live.items():
         if live_st is None:
             reasons.append("live_process_unreadable")
@@ -1141,9 +1257,22 @@ def process_proof(
             continue
         if by_pid[pid].get("start_time_ticks") != live_st:
             reasons.append("process_pid_mismatch")
+
+    if deadline_mono is not None and time.monotonic() >= deadline_mono:
+        reasons.append("process_proof_timeout")
+        seen = set()
+        uniq = []
+        for r in reasons:
+            if r not in seen:
+                seen.add(r)
+                uniq.append(r)
+        return False, uniq, by_pid
+
     # Re-confirm identity after live map (post-start proof is already gated by snapshot).
-    live2 = live_pid_map(proc_root)
-    if live2 != live:
+    live2, live2_timeout = live_pid_map(proc_root, deadline_mono=deadline_mono)
+    if live2_timeout:
+        reasons.extend(live2_timeout)
+    elif live2 != live:
         reasons.append("live_process_race")
     else:
         for pid, live_st in live2.items():
@@ -1156,8 +1285,12 @@ def process_proof(
                     else:
                         reasons.append("process_pid_mismatch")
 
-    seen: set[str] = set()
-    uniq: list[str] = []
+    if deadline_mono is not None and time.monotonic() >= deadline_mono:
+        if "process_proof_timeout" not in reasons:
+            reasons.append("process_proof_timeout")
+
+    seen = set()
+    uniq = []
     for r in reasons:
         if r not in seen:
             seen.add(r)

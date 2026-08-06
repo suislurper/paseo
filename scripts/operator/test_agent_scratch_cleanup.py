@@ -1224,6 +1224,128 @@ class Tests(unittest.TestCase):
         self.assertEqual(c["classification"], "blocked")
         self.assertIn("process_new", c["reasons"])
 
+    def test_newer_invalid_snapshot_blocks_immediately_not_process_new(self) -> None:
+        """M1: after exclusive transient, a newer incomplete snapshot fails closed now.
+
+        Must return snapshot_incomplete immediately — not poll to the deadline and
+        not overwrite with the prior process_new reason.
+        """
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                # Strictly newer but incomplete — non-acceptable; block immediately.
+                self.h.write_census(
+                    captured_at=iso(self.h.now + timedelta(seconds=1)),
+                    complete=False,
+                )
+
+        with mock.patch.object(M.time, "sleep", side_effect=on_sleep):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_incomplete", c["reasons"])
+        self.assertNotIn("process_new", c["reasons"])
+        # One sleep to discover the newer invalid snap; no deadline polling.
+        self.assertEqual(sleep_n["n"], 1)
+
+    def test_newer_snapshot_without_captured_at_fails_closed(self) -> None:
+        """M1: after exclusive transient, unparseable captured_at fails closed immediately."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                # Mutate census so captured_at is missing (cannot establish newer-than).
+                raw = json.loads(self.h.census.read_text(encoding="utf-8"))
+                del raw["captured_at"]
+                self.h.census.write_text(json.dumps(raw), encoding="utf-8")
+
+        with mock.patch.object(M.time, "sleep", side_effect=on_sleep):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_captured_at_missing", c["reasons"])
+        self.assertNotIn("process_new", c["reasons"])
+        self.assertEqual(sleep_n["n"], 1)
+
+    def test_process_proof_rejects_completion_after_deadline(self) -> None:
+        """M2: a proof that would complete at monotonic t=80 with wait_s=75 is rejected.
+
+        Must not authorize cleanup; surface process_proof_timeout (non-transient).
+        """
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+
+        mono = {"t": 0.0}
+
+        def fake_mono() -> float:
+            return mono["t"]
+
+        real_live = M.live_pid_map
+
+        def late_live(
+            proc_root: str, *, deadline_mono: float | None = None
+        ) -> tuple[dict[int, int | None], list[str]]:
+            # Simulate a /proc scan that only finishes after the 75s absolute deadline.
+            mono["t"] = 80.0
+            return real_live(proc_root, deadline_mono=deadline_mono)
+
+        with mock.patch.object(M.time, "monotonic", side_effect=fake_mono):
+            with mock.patch.object(M, "live_pid_map", side_effect=late_live):
+                probe = M.run_probe(
+                    config_path=str(self.h.config),
+                    census_path=str(self.h.census),
+                    proc_root=str(self.h.proc),
+                    runner=self.h.paseo,
+                    now_fn=lambda: self.h.now,
+                    wait_s=75.0,
+                    poll_s=0.05,
+                    started_at=self.h.now - timedelta(seconds=1),
+                )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("process_proof_timeout", c["reasons"])
+        self.assertIsNone(c.get("candidate_token"))
+
 
 if __name__ == "__main__":
     unittest.main()

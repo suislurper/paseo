@@ -249,14 +249,28 @@ probe, legacy `/tmp` quarantine) share one helper in `agent-scratch-cleanup.py`
    **only** for `process_new`, `process_pid_mismatch`, and/or `live_process_race`, wait
    for a complete same-boot acceptable snapshot whose `captured_at` is **strictly
    newer** than the rejected snapshot, then re-run the full process proof. Do **not**
-   create another daemon, timer, parser, or public API.
+   create another daemon, timer, parser, or public API. Newer-snapshot detection uses
+   a valid parseable `captured_at` only; if the current snapshot cannot establish one,
+   fail closed immediately (do not keep polling).
 6. **Non-retryable fail-closed (block immediately):** any other reason — including
    missing/malformed/incomplete/stale/pre-start snapshot, root coverage failures,
    unreadable live process, scope/reference errors, symlink errors, or **mixed**
    transient + non-transient reasons — blocks process proof for **all candidates**
-   with no retry. Persistent exclusive-transient churn blocks at the **75s** deadline
-   with the **exact final** process-proof reasons (existing `process_new` semantics
-   remain when no newer valid snapshot arrives).
+   with no retry. After an exclusive-transient failure, a **strictly newer** snapshot
+   that is incomplete/malformed/stale/root-invalid (or otherwise non-acceptable) also
+   blocks **immediately** with that snapshot's exact validation reasons — never keep
+   polling to the deadline and never overwrite those tags with the prior
+   `process_new` / mismatch / race reasons. Persistent exclusive-transient churn with
+   **no** strictly newer snapshot blocks at the **75s** deadline with the **exact
+   final** process-proof reasons (existing `process_new` semantics remain only when no
+   newer snapshot ever arrives).
+7. **Deadline coverage:** the **75s** total window includes snapshot waits, **all**
+   sleeps (each clamped to remaining time), and live `/proc` scans inside
+   `live_pid_map` / `process_proof`. Before success, re-check the absolute deadline
+   and snapshot acceptability/freshness with current `now_fn`. A proof that would
+   complete after the deadline returns a clear non-transient reason such as
+   `process_proof_timeout` (or `snapshot_stale` when freshness fails) and **never**
+   authorizes cleanup.
 
 This supersedes the earlier five-minute / max-10-minute consumer rule and the prior
 single-shot 45s wait. Matching `pid + start_time_ticks` under the same `boot_id`
@@ -429,8 +443,9 @@ blocks every candidate. Validates every current non-kernel PID + `start_time_tic
 `scope_complete`, well-formed absolute references, malformed/duplicate process
 records/roots, snapshot root symlinks, and live races. Exclusive-transient failures
 (`process_new` / `process_pid_mismatch` / `live_process_race` only) may re-wait for a
-strictly newer acceptable snapshot within the same **75s** total window; every other
-failure blocks immediately. Any terminal failure sets
+strictly newer acceptable snapshot within the same **75s** total window (deadline
+includes scans + sleeps; newer invalid snapshots fail closed immediately with their
+exact reasons). Every other failure blocks immediately. Any terminal failure sets
 `process_census.complete=false` / `status=blocked` and blocks all candidates.
 
 Redacted census references become **owner evidence** (no argv/env): protect a
@@ -497,7 +512,9 @@ as managed scratch cleanup:
 1. Complete post-start snapshot, same `boot_id`, age ≤ **45s**, with `roots` covering
    the exact candidate, inside the shared **75s** total proof window (exclusive-
    transient newer-snapshot retries only for `process_new` /
-   `process_pid_mismatch` / `live_process_race`).
+   `process_pid_mismatch` / `live_process_race`; scans + sleeps are inside the
+   window; a strictly newer invalid snapshot blocks immediately with its exact
+   reasons rather than retaining prior transient tags).
 2. Every live non-kernel PID + `start_time_ticks` matches a well-formed complete
    snapshot record with absolute path references.
 3. Any process reference under the candidate **protects** it.

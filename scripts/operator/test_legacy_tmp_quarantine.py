@@ -286,9 +286,9 @@ class Tests(unittest.TestCase):
             "cxc-d",
         ):
             with self.subTest(name=name):
-                self.h = H()
+                h = H()
                 try:
-                    src, result = self.h.eligible(name)
+                    src, result = h.eligible(name)
                     self.assertEqual(result["classification"], "eligible", result)
                     self.assertTrue(result["candidate_token"])
                     self.assertEqual(result["source"]["path"], str(src))
@@ -296,7 +296,7 @@ class Tests(unittest.TestCase):
                     self.assertIn("root", result["free_bytes"])
                     self.assertIn("mnt_data", result["free_bytes"])
                 finally:
-                    self.h.close()
+                    h.close()
 
     def test_unknown_root_never_eligible(self) -> None:
         src = self.h.put_candidate("random-scratch-dir")

@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -16,6 +18,9 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   AGENT_RUNTIME_ARTIFACTS_DIRNAME,
+  AGENT_RUNTIME_LOCK_DIR_SUFFIX,
+  AGENT_RUNTIME_LOCK_OWNER_FILENAME,
+  AGENT_RUNTIME_LOCKS_DIRNAME,
   AGENT_RUNTIME_MANIFEST_FILENAME,
   AGENT_RUNTIME_SCRATCH_DIRNAME,
   AgentRuntimeStorage,
@@ -37,6 +42,14 @@ function modeOf(filePath: string): number {
 
 function readJson(filePath: string): unknown {
   return JSON.parse(readFileSync(filePath, "utf8"));
+}
+
+function lockDirFor(runtimeRoot: string, agentId: string): string {
+  return path.join(
+    runtimeRoot,
+    AGENT_RUNTIME_LOCKS_DIRNAME,
+    `${agentId}${AGENT_RUNTIME_LOCK_DIR_SUFFIX}`,
+  );
 }
 
 afterEach(() => {
@@ -373,6 +386,213 @@ describe("AgentRuntimeStorage", () => {
     expect(readFileSync(scratchFile, "utf8")).toBe("scratch-data");
     expect(readFileSync(artifactFile, "utf8")).toBe("artifact-data");
   });
+
+  test("removes the agent lock after successful prepare and markReleased", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+
+    const prepared = await storage.prepare(agentId);
+    expect(existsSync(lockDirFor(runtimeRoot, agentId))).toBe(false);
+
+    await storage.markReleased({ agentId, generation: prepared.generation });
+    expect(existsSync(lockDirFor(runtimeRoot, agentId))).toBe(false);
+  });
+
+  test("releases the agent lock when prepare fails after acquisition", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const scratchDir = path.join(runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME, agentId);
+    mkdirSync(scratchDir, { recursive: true });
+    writeFileSync(path.join(scratchDir, AGENT_RUNTIME_MANIFEST_FILENAME), "{not-json");
+
+    await expect(storage.prepare(agentId)).rejects.toThrow(/malformed/);
+    expect(existsSync(lockDirFor(runtimeRoot, agentId))).toBe(false);
+  });
+
+  test("mutual exclusion: second storage instance cannot prepare while lock is held", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const first = new AgentRuntimeStorage({ runtimeRoot });
+    const second = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+
+    let secondSawLock = false;
+    await first.withAgentLock({ agentId, operation: "test-hold" }, async (context) => {
+      expect(context.agentId).toBe(agentId);
+      expect(context.operation).toBe("test-hold");
+      expect(context.scratchManifest).toBeNull();
+      expect(existsSync(lockDirFor(runtimeRoot, agentId))).toBe(true);
+
+      await expect(second.prepare(agentId)).rejects.toThrow(
+        /lock already held|operator inspection/,
+      );
+      secondSawLock = true;
+      await expect(second.markReleased({ agentId, generation: randomUUID() })).rejects.toThrow(
+        /lock already held|operator inspection/,
+      );
+    });
+
+    expect(secondSawLock).toBe(true);
+    expect(existsSync(lockDirFor(runtimeRoot, agentId))).toBe(false);
+
+    // After release, prepare succeeds.
+    const prepared = await second.prepare(agentId);
+    expect(prepared.lifecycle).toBe("active");
+  });
+
+  test("prepare and markReleased take the same agent lock", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const holder = new AgentRuntimeStorage({ runtimeRoot });
+    const peer = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const prepared = await holder.prepare(agentId);
+
+    await holder.withAgentLock({ agentId, operation: "hold-for-release" }, async () => {
+      await expect(peer.markReleased({ agentId, generation: prepared.generation })).rejects.toThrow(
+        /lock already held|operator inspection/,
+      );
+      await expect(peer.prepare(agentId)).rejects.toThrow(/lock already held|operator inspection/);
+    });
+
+    const released = await peer.markReleased({
+      agentId,
+      generation: prepared.generation,
+    });
+    expect(released.lifecycle).toBe("released");
+  });
+
+  test("stale present lock directory blocks acquisition without breaking the lock", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const lockDir = lockDirFor(runtimeRoot, agentId);
+    mkdirSync(path.join(runtimeRoot, AGENT_RUNTIME_LOCKS_DIRNAME), { recursive: true });
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(
+      path.join(lockDir, AGENT_RUNTIME_LOCK_OWNER_FILENAME),
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          agentId,
+          lockToken: randomUUID(),
+          operation: "crashed",
+          pid: 1,
+          acquiredAt: "2000-01-01T00:00:00.000Z",
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    await expect(storage.prepare(agentId)).rejects.toThrow(/lock already held|operator inspection/);
+    expect(existsSync(lockDir)).toBe(true);
+    expect(readdirSync(lockDir)).toContain(AGENT_RUNTIME_LOCK_OWNER_FILENAME);
+  });
+
+  test("malformed lock (empty directory) blocks acquisition fail-closed", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const lockDir = lockDirFor(runtimeRoot, agentId);
+    mkdirSync(path.join(runtimeRoot, AGENT_RUNTIME_LOCKS_DIRNAME), { recursive: true });
+    mkdirSync(lockDir, { recursive: true });
+
+    await expect(storage.prepare(agentId)).rejects.toThrow(/lock already held|operator inspection/);
+    expect(existsSync(lockDir)).toBe(true);
+    expect(readdirSync(lockDir)).toEqual([]);
+  });
+
+  test("symlink lock path blocks acquisition fail-closed", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const outside = path.join(runtimeRoot, "outside-lock-target");
+    const locksParent = path.join(runtimeRoot, AGENT_RUNTIME_LOCKS_DIRNAME);
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(locksParent, { recursive: true });
+    symlinkSync(
+      outside,
+      lockDirFor(runtimeRoot, agentId),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    if (
+      process.platform === "win32" &&
+      !lstatSync(lockDirFor(runtimeRoot, agentId)).isSymbolicLink()
+    ) {
+      return;
+    }
+
+    await expect(storage.prepare(agentId)).rejects.toThrow(/symlink|lock/);
+    // Symlink remains; never broken.
+    expect(lstatSync(lockDirFor(runtimeRoot, agentId)).isSymbolicLink()).toBe(true);
+  });
+
+  test("token mismatch on release leaves the lock in place", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const lockDir = lockDirFor(runtimeRoot, agentId);
+
+    await expect(
+      storage.withAgentLock({ agentId, operation: "token-test" }, async () => {
+        const ownerPath = path.join(lockDir, AGENT_RUNTIME_LOCK_OWNER_FILENAME);
+        const owner = readJson(ownerPath) as Record<string, unknown>;
+        writeFileSync(
+          ownerPath,
+          `${JSON.stringify({ ...owner, lockToken: randomUUID() }, null, 2)}\n`,
+        );
+      }),
+    ).rejects.toThrow(/token mismatch/);
+
+    expect(existsSync(lockDir)).toBe(true);
+    expect(readdirSync(lockDir)).toContain(AGENT_RUNTIME_LOCK_OWNER_FILENAME);
+  });
+
+  test("unexpected lock directory contents leave the lock on release", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const lockDir = lockDirFor(runtimeRoot, agentId);
+
+    await expect(
+      storage.withAgentLock({ agentId, operation: "extra-file" }, async () => {
+        writeFileSync(path.join(lockDir, "extra.txt"), "do-not-delete-recursively");
+      }),
+    ).rejects.toThrow(/unexpected contents/);
+
+    expect(existsSync(lockDir)).toBe(true);
+    expect(readdirSync(lockDir).sort()).toEqual(
+      [AGENT_RUNTIME_LOCK_OWNER_FILENAME, "extra.txt"].sort(),
+    );
+  });
+
+  test("withAgentLock provides validated paths and does not delete scratch or artifacts", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const prepared = await storage.prepare(agentId);
+    const scratchFile = path.join(prepared.scratchDir, "keep-scratch.txt");
+    const artifactFile = path.join(prepared.artifactsDir, "keep-artifact.bin");
+    writeFileSync(scratchFile, "scratch");
+    writeFileSync(artifactFile, "artifact");
+
+    await storage.withAgentLock({ agentId, operation: "cleanup-preview" }, async (context) => {
+      expect(context.scratchDir).toBe(prepared.scratchDir);
+      expect(context.artifactsDir).toBe(prepared.artifactsDir);
+      expect(context.scratchManifestPath).toBe(prepared.scratchManifestPath);
+      expect(context.artifactsManifestPath).toBe(prepared.artifactsManifestPath);
+      expect(context.scratchManifest?.generation).toBe(prepared.generation);
+      expect(context.scratchManifest?.lifecycle).toBe("active");
+    });
+
+    expect(readFileSync(scratchFile, "utf8")).toBe("scratch");
+    expect(readFileSync(artifactFile, "utf8")).toBe("artifact");
+    expect(statSync(prepared.scratchDir).isDirectory()).toBe(true);
+    expect(statSync(prepared.artifactsDir).isDirectory()).toBe(true);
+    expect(existsSync(lockDirFor(runtimeRoot, agentId))).toBe(false);
+  });
 });
 
 describe.skipIf(process.platform === "win32")("AgentRuntimeStorage permissions", () => {
@@ -389,5 +609,34 @@ describe.skipIf(process.platform === "win32")("AgentRuntimeStorage permissions",
 
     expect(modeOf(prepared.scratchDir)).toBe(PRIVATE_DIRECTORY_MODE);
     expect(modeOf(prepared.artifactsDir)).toBe(PRIVATE_DIRECTORY_MODE);
+  });
+
+  test("locks parent, lock directory, and owner.json use private modes", async () => {
+    const runtimeRoot = createTempRuntimeRoot();
+    const storage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = randomUUID();
+    const locksParent = path.join(runtimeRoot, AGENT_RUNTIME_LOCKS_DIRNAME);
+    const lockDir = lockDirFor(runtimeRoot, agentId);
+
+    await storage.withAgentLock({ agentId, operation: "mode-check" }, async () => {
+      expect(modeOf(locksParent)).toBe(PRIVATE_DIRECTORY_MODE);
+      expect(modeOf(lockDir)).toBe(PRIVATE_DIRECTORY_MODE);
+      expect(modeOf(path.join(lockDir, AGENT_RUNTIME_LOCK_OWNER_FILENAME))).toBe(PRIVATE_FILE_MODE);
+
+      const owner = readJson(path.join(lockDir, AGENT_RUNTIME_LOCK_OWNER_FILENAME)) as Record<
+        string,
+        unknown
+      >;
+      expect(owner).toMatchObject({
+        schemaVersion: 1,
+        agentId,
+        operation: "mode-check",
+        pid: process.pid,
+      });
+      expect(typeof owner.lockToken).toBe("string");
+      expect(typeof owner.acquiredAt).toBe("string");
+      expect(owner).not.toHaveProperty("secret");
+      expect(owner).not.toHaveProperty("password");
+    });
   });
 });

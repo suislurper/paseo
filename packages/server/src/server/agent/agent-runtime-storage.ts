@@ -8,11 +8,19 @@ import { PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../private-files.js";
 
 const AgentIdSchema = z.guid();
 const GenerationSchema = z.string().uuid();
+const LockTokenSchema = z.string().uuid();
 
 export const AGENT_RUNTIME_MANIFEST_SCHEMA_VERSION = 1 as const;
+export const AGENT_RUNTIME_LOCK_OWNER_SCHEMA_VERSION = 1 as const;
 export const AGENT_RUNTIME_SCRATCH_DIRNAME = "scratch";
 export const AGENT_RUNTIME_ARTIFACTS_DIRNAME = "artifacts";
+export const AGENT_RUNTIME_LOCKS_DIRNAME = "locks";
 export const AGENT_RUNTIME_MANIFEST_FILENAME = "manifest.json";
+export const AGENT_RUNTIME_LOCK_OWNER_FILENAME = "owner.json";
+export const AGENT_RUNTIME_LOCK_DIR_SUFFIX = ".lock";
+
+/** Linux kernel boot id; optional owner metadata when readable. Never required. */
+const LINUX_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 
 export type AgentRuntimeLifecycleState = "active" | "released";
 
@@ -37,8 +45,21 @@ const ArtifactsManifestSchema = z
   })
   .strict();
 
+const LockOwnerSchema = z
+  .object({
+    schemaVersion: z.literal(AGENT_RUNTIME_LOCK_OWNER_SCHEMA_VERSION),
+    agentId: AgentIdSchema,
+    lockToken: LockTokenSchema,
+    operation: z.string().min(1).max(64),
+    pid: z.number().int().positive(),
+    bootId: z.string().min(1).optional(),
+    acquiredAt: z.string().min(1),
+  })
+  .strict();
+
 export type AgentScratchManifest = z.infer<typeof ScratchManifestSchema>;
 export type AgentArtifactsManifest = z.infer<typeof ArtifactsManifestSchema>;
+export type AgentRuntimeLockOwner = z.infer<typeof LockOwnerSchema>;
 
 export interface AgentRuntimeLaunchPaths {
   agentId: string;
@@ -58,6 +79,21 @@ export interface AgentScratchReleaseReceipt {
   releasedAt: string;
 }
 
+/**
+ * Safe context handed to a held-lock callback. Paths are exact derived locations under
+ * the configured runtime root — not an arbitrary path API.
+ */
+export interface AgentRuntimeLockHeldContext {
+  agentId: string;
+  operation: string;
+  scratchDir: string;
+  artifactsDir: string;
+  scratchManifestPath: string;
+  artifactsManifestPath: string;
+  /** Present when a valid scratch manifest already exists; null when missing. */
+  scratchManifest: AgentScratchManifest | null;
+}
+
 export interface AgentRuntimeStorageOptions {
   runtimeRoot: string;
 }
@@ -67,6 +103,12 @@ export class AgentRuntimeStorageError extends Error {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = "AgentRuntimeStorageError";
   }
+}
+
+interface HeldAgentLock {
+  agentId: string;
+  lockDir: string;
+  lockToken: string;
 }
 
 function isAbsoluteFilesystemPath(value: string): boolean {
@@ -95,15 +137,37 @@ function validateGeneration(generation: string, source: string): string {
   return result.data;
 }
 
+function validateOperation(operation: string, source: string): string {
+  const trimmed = operation.trim();
+  if (!trimmed || trimmed.length > 64) {
+    throw new AgentRuntimeStorageError(
+      `${source}: operation must be a non-empty string of at most 64 characters`,
+    );
+  }
+  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {
+    throw new AgentRuntimeStorageError(`${source}: operation contains invalid characters`);
+  }
+  return trimmed;
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === code;
+}
+
 /**
  * Durable per-agent runtime storage under a configured absolute runtime root.
  *
  * Layout:
  *   {runtimeRoot}/scratch/{agentId}/manifest.json
  *   {runtimeRoot}/artifacts/{agentId}/manifest.json
+ *   {runtimeRoot}/locks/{agentId}.lock/owner.json   # cross-process metadata lock
  *
  * Scratch is generation-scoped launch state. Artifacts are retained and are never
- * touched by release. This primitive does not delete files or directories.
+ * touched by release. This primitive does not delete scratch/artifact files.
+ *
+ * prepare and markReleased hold the per-agent lock only for metadata work — never
+ * across provider launch/run. A crash may leave a stale lock directory; acquisition
+ * never breaks locks by age and blocks until explicit operator inspection.
  */
 export class AgentRuntimeStorage {
   private readonly runtimeRoot: string;
@@ -124,6 +188,37 @@ export class AgentRuntimeStorage {
   }
 
   /**
+   * Acquire the exact per-agent filesystem lock, run `callback` with validated paths
+   * and the current scratch manifest (if any), then release the lock in `finally`.
+   *
+   * Intended surface for prepare, release, and future cleanup. Callbacks receive only
+   * derived exact paths — not a raw arbitrary path API.
+   */
+  async withAgentLock<T>(
+    params: { agentId: string; operation: string },
+    callback: (context: AgentRuntimeLockHeldContext) => Promise<T>,
+  ): Promise<T> {
+    const validatedAgentId = validateAgentId(params.agentId, "withAgentLock");
+    const operation = validateOperation(params.operation, "withAgentLock");
+    const paths = this.derivePaths(validatedAgentId);
+    const held = await this.acquireAgentLock(validatedAgentId, operation);
+    try {
+      const scratchManifest = await this.readScratchManifestIfPresent(paths.scratchManifestPath);
+      return await callback({
+        agentId: validatedAgentId,
+        operation,
+        scratchDir: paths.scratchDir,
+        artifactsDir: paths.artifactsDir,
+        scratchManifestPath: paths.scratchManifestPath,
+        artifactsManifestPath: paths.artifactsManifestPath,
+        scratchManifest,
+      });
+    } finally {
+      await this.releaseAgentLock(held);
+    }
+  }
+
+  /**
    * Ensure scratch + artifacts directories exist for the agent, create or reuse the
    * daemon-owned scratch generation manifest, and ensure the retained artifacts marker.
    *
@@ -131,36 +226,53 @@ export class AgentRuntimeStorage {
    * - Released generation: atomically rotated to a fresh active generation. Bytes under
    *   scratch/artifacts are retained; only the scratch manifest generation + lifecycle
    *   change. This prevents a stale release receipt from authorizing cleanup after relaunch.
+   *
+   * Holds the per-agent lock only for this metadata work — not across provider launch.
    */
   async prepare(agentId: string): Promise<AgentRuntimeLaunchPaths> {
     const validatedAgentId = validateAgentId(agentId, "prepare");
-    const paths = this.derivePaths(validatedAgentId);
+    return this.withAgentLock(
+      { agentId: validatedAgentId, operation: "prepare" },
+      async (context) => {
+        const paths = {
+          scratchDir: context.scratchDir,
+          artifactsDir: context.artifactsDir,
+          scratchManifestPath: context.scratchManifestPath,
+          artifactsManifestPath: context.artifactsManifestPath,
+        };
 
-    await this.assertSafeRuntimeRoot();
-    await this.ensurePrivateDirectory(path.join(this.runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME));
-    await this.ensurePrivateDirectory(path.join(this.runtimeRoot, AGENT_RUNTIME_ARTIFACTS_DIRNAME));
-    await this.ensureAgentDirectory(paths.scratchDir);
-    await this.ensureAgentDirectory(paths.artifactsDir);
-    await this.assertNoSymlinkAlongPath(paths.scratchDir);
-    await this.assertNoSymlinkAlongPath(paths.artifactsDir);
+        await this.ensurePrivateDirectory(
+          path.join(this.runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME),
+        );
+        await this.ensurePrivateDirectory(
+          path.join(this.runtimeRoot, AGENT_RUNTIME_ARTIFACTS_DIRNAME),
+        );
+        await this.ensureAgentDirectory(paths.scratchDir);
+        await this.ensureAgentDirectory(paths.artifactsDir);
+        await this.assertNoSymlinkAlongPath(paths.scratchDir);
+        await this.assertNoSymlinkAlongPath(paths.artifactsDir);
 
-    const scratchManifest = await this.loadOrCreateScratchManifest(paths, validatedAgentId);
-    await this.ensureArtifactsManifest(paths, validatedAgentId);
+        const scratchManifest = await this.loadOrCreateScratchManifest(paths, validatedAgentId);
+        await this.ensureArtifactsManifest(paths, validatedAgentId);
 
-    return {
-      agentId: validatedAgentId,
-      generation: scratchManifest.generation,
-      scratchDir: paths.scratchDir,
-      artifactsDir: paths.artifactsDir,
-      scratchManifestPath: paths.scratchManifestPath,
-      artifactsManifestPath: paths.artifactsManifestPath,
-      lifecycle: scratchManifest.lifecycle,
-    };
+        return {
+          agentId: validatedAgentId,
+          generation: scratchManifest.generation,
+          scratchDir: paths.scratchDir,
+          artifactsDir: paths.artifactsDir,
+          scratchManifestPath: paths.scratchManifestPath,
+          artifactsManifestPath: paths.artifactsManifestPath,
+          lifecycle: scratchManifest.lifecycle,
+        };
+      },
+    );
   }
 
   /**
    * Mark a scratch generation released. Requires exact agent ID + generation.
    * Repeated exact release is idempotent. Never touches artifacts.
+   *
+   * Holds the per-agent lock only for this metadata work — not across provider run.
    */
   async markReleased(params: {
     agentId: string;
@@ -168,56 +280,66 @@ export class AgentRuntimeStorage {
   }): Promise<AgentScratchReleaseReceipt & AgentRuntimeLaunchPaths> {
     const validatedAgentId = validateAgentId(params.agentId, "markReleased");
     const validatedGeneration = validateGeneration(params.generation, "markReleased");
-    const paths = this.derivePaths(validatedAgentId);
 
-    await this.assertSafeRuntimeRoot();
-    await this.assertNoSymlinkAlongPath(paths.scratchDir);
-    await this.assertDirectoryExists(paths.scratchDir, "scratch");
+    return this.withAgentLock(
+      { agentId: validatedAgentId, operation: "release" },
+      async (context) => {
+        const paths = {
+          scratchDir: context.scratchDir,
+          artifactsDir: context.artifactsDir,
+          scratchManifestPath: context.scratchManifestPath,
+          artifactsManifestPath: context.artifactsManifestPath,
+        };
 
-    const existing = await this.readScratchManifest(paths.scratchManifestPath);
-    if (existing.agentId !== validatedAgentId) {
-      throw new AgentRuntimeStorageError(
-        `markReleased: scratch manifest agentId mismatch (expected ${validatedAgentId})`,
-      );
-    }
-    if (existing.generation !== validatedGeneration) {
-      throw new AgentRuntimeStorageError(
-        `markReleased: generation mismatch (expected ${validatedGeneration})`,
-      );
-    }
+        await this.assertNoSymlinkAlongPath(paths.scratchDir);
+        await this.assertDirectoryExists(paths.scratchDir, "scratch");
 
-    let nextManifest: AgentScratchManifest = existing;
-    if (existing.lifecycle !== "released") {
-      nextManifest = {
-        ...existing,
-        lifecycle: "released",
-        releasedAt: new Date().toISOString(),
-      };
-      await this.writeScratchManifestAtomic(paths.scratchManifestPath, nextManifest);
-    } else if (existing.releasedAt === undefined) {
-      // Defensive: a released manifest should always carry releasedAt.
-      nextManifest = {
-        ...existing,
-        releasedAt: new Date().toISOString(),
-      };
-      await this.writeScratchManifestAtomic(paths.scratchManifestPath, nextManifest);
-    }
+        const existing = await this.readScratchManifest(paths.scratchManifestPath);
+        if (existing.agentId !== validatedAgentId) {
+          throw new AgentRuntimeStorageError(
+            `markReleased: scratch manifest agentId mismatch (expected ${validatedAgentId})`,
+          );
+        }
+        if (existing.generation !== validatedGeneration) {
+          throw new AgentRuntimeStorageError(
+            `markReleased: generation mismatch (expected ${validatedGeneration})`,
+          );
+        }
 
-    const releasedAt = nextManifest.releasedAt;
-    if (!releasedAt) {
-      throw new AgentRuntimeStorageError("markReleased: released manifest missing releasedAt");
-    }
+        let nextManifest: AgentScratchManifest = existing;
+        if (existing.lifecycle !== "released") {
+          nextManifest = {
+            ...existing,
+            lifecycle: "released",
+            releasedAt: new Date().toISOString(),
+          };
+          await this.writeScratchManifestAtomic(paths.scratchManifestPath, nextManifest);
+        } else if (existing.releasedAt === undefined) {
+          // Defensive: a released manifest should always carry releasedAt.
+          nextManifest = {
+            ...existing,
+            releasedAt: new Date().toISOString(),
+          };
+          await this.writeScratchManifestAtomic(paths.scratchManifestPath, nextManifest);
+        }
 
-    return {
-      agentId: validatedAgentId,
-      generation: nextManifest.generation,
-      scratchDir: paths.scratchDir,
-      artifactsDir: paths.artifactsDir,
-      scratchManifestPath: paths.scratchManifestPath,
-      artifactsManifestPath: paths.artifactsManifestPath,
-      lifecycle: "released",
-      releasedAt,
-    };
+        const releasedAt = nextManifest.releasedAt;
+        if (!releasedAt) {
+          throw new AgentRuntimeStorageError("markReleased: released manifest missing releasedAt");
+        }
+
+        return {
+          agentId: validatedAgentId,
+          generation: nextManifest.generation,
+          scratchDir: paths.scratchDir,
+          artifactsDir: paths.artifactsDir,
+          scratchManifestPath: paths.scratchManifestPath,
+          artifactsManifestPath: paths.artifactsManifestPath,
+          lifecycle: "released" as const,
+          releasedAt,
+        };
+      },
+    );
   }
 
   private derivePaths(agentId: string): {
@@ -242,22 +364,234 @@ export class AgentRuntimeStorage {
     };
   }
 
+  private deriveLockDir(agentId: string): string {
+    const locksParent = path.join(this.runtimeRoot, AGENT_RUNTIME_LOCKS_DIRNAME);
+    const lockDirName = `${agentId}${AGENT_RUNTIME_LOCK_DIR_SUFFIX}`;
+    const lockDir = path.join(locksParent, lockDirName);
+    this.assertPathUnderParent(locksParent, lockDir, lockDirName, "lock");
+    return lockDir;
+  }
+
   private assertPathUnderParent(
     parentDir: string,
     childDir: string,
-    agentId: string,
-    kind: "scratch" | "artifacts",
+    expectedRelative: string,
+    kind: string,
   ): void {
     const relative = path.relative(parentDir, childDir);
     if (
-      relative !== agentId ||
+      relative !== expectedRelative ||
       relative === "" ||
       relative.startsWith("..") ||
       path.isAbsolute(relative)
     ) {
       throw new AgentRuntimeStorageError(
-        `agent ${kind} path escapes runtime root for agentId ${agentId}`,
+        `agent ${kind} path escapes runtime root for ${expectedRelative}`,
       );
+    }
+  }
+
+  /**
+   * Atomic cross-process lock via mkdir. A present, malformed, or symlink lock fails
+   * closed — never broken by age. Crash-left locks intentionally block until operator
+   * inspection.
+   */
+  private async acquireAgentLock(agentId: string, operation: string): Promise<HeldAgentLock> {
+    await this.assertSafeRuntimeRoot();
+
+    const locksParent = path.join(this.runtimeRoot, AGENT_RUNTIME_LOCKS_DIRNAME);
+    await this.ensurePrivateDirectory(locksParent);
+    await this.assertNoSymlinkAlongPath(locksParent);
+
+    const lockDir = this.deriveLockDir(agentId);
+    await this.assertNoSymlinkAlongPath(path.dirname(lockDir));
+
+    try {
+      const existing = await fs.lstat(lockDir);
+      if (existing.isSymbolicLink()) {
+        throw new AgentRuntimeStorageError(`agent lock path is a symlink: ${lockDir}`);
+      }
+      // Present directory, file, or anything else — fail closed; never break by age.
+      throw new AgentRuntimeStorageError(
+        `agent lock already held or present for ${agentId} (stale locks require operator inspection)`,
+      );
+    } catch (error) {
+      if (error instanceof AgentRuntimeStorageError) {
+        throw error;
+      }
+      if (!isMissingEntryError(error)) {
+        throw new AgentRuntimeStorageError(
+          `failed to inspect agent lock path ${lockDir}: ${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
+    }
+
+    try {
+      // Atomic acquisition: mkdir without recursive is exclusive on the final component.
+      await fs.mkdir(lockDir, { recursive: false, mode: PRIVATE_DIRECTORY_MODE });
+    } catch (error) {
+      if (isErrnoCode(error, "EEXIST")) {
+        throw new AgentRuntimeStorageError(
+          `agent lock already held for ${agentId} (stale locks require operator inspection)`,
+        );
+      }
+      throw new AgentRuntimeStorageError(
+        `failed to acquire agent lock for ${agentId}: ${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+
+    await this.chmodPrivateDirectory(lockDir);
+
+    const lockToken = randomUUID();
+    const bootId = await readOptionalBootId();
+    const owner: AgentRuntimeLockOwner = {
+      schemaVersion: AGENT_RUNTIME_LOCK_OWNER_SCHEMA_VERSION,
+      agentId,
+      lockToken,
+      operation,
+      pid: process.pid,
+      ...(bootId !== undefined ? { bootId } : {}),
+      acquiredAt: new Date().toISOString(),
+    };
+
+    try {
+      await this.writeLockOwnerAtomic(path.join(lockDir, AGENT_RUNTIME_LOCK_OWNER_FILENAME), owner);
+    } catch (error) {
+      // Best-effort: leave the lock directory in place if owner write fails so a
+      // partial acquire still fails closed for others (operator inspection).
+      throw new AgentRuntimeStorageError(
+        `failed to write agent lock owner for ${agentId}: ${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+
+    return { agentId, lockDir, lockToken };
+  }
+
+  /**
+   * Release only after re-reading the exact lock token. Unexpected contents or token
+   * mismatch fails closed and leaves the lock. Never recursively deletes the lock dir.
+   */
+  private async releaseAgentLock(held: HeldAgentLock): Promise<void> {
+    const ownerPath = path.join(held.lockDir, AGENT_RUNTIME_LOCK_OWNER_FILENAME);
+
+    try {
+      const stats = await fs.lstat(held.lockDir);
+      if (stats.isSymbolicLink()) {
+        throw new AgentRuntimeStorageError(
+          `cannot release agent lock: lock path is a symlink: ${held.lockDir}`,
+        );
+      }
+      if (!stats.isDirectory()) {
+        throw new AgentRuntimeStorageError(
+          `cannot release agent lock: lock path is not a directory: ${held.lockDir}`,
+        );
+      }
+    } catch (error) {
+      if (error instanceof AgentRuntimeStorageError) {
+        throw error;
+      }
+      if (isMissingEntryError(error)) {
+        throw new AgentRuntimeStorageError(
+          `cannot release agent lock: lock directory missing for ${held.agentId}`,
+        );
+      }
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: failed to inspect ${held.lockDir}: ${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+
+    let raw: string;
+    try {
+      raw = await fs.readFile(ownerPath, "utf8");
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: owner.json missing or unreadable for ${held.agentId}`,
+        { cause: error },
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: malformed owner.json for ${held.agentId}`,
+        { cause: error },
+      );
+    }
+
+    const ownerResult = LockOwnerSchema.safeParse(parsed);
+    if (!ownerResult.success) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: invalid owner.json for ${held.agentId}`,
+      );
+    }
+
+    const owner = ownerResult.data;
+    if (owner.agentId !== held.agentId || owner.lockToken !== held.lockToken) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: token mismatch for ${held.agentId}`,
+      );
+    }
+
+    let entries: string[];
+    try {
+      entries = await fs.readdir(held.lockDir);
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: failed to list lock directory for ${held.agentId}`,
+        { cause: error },
+      );
+    }
+
+    if (entries.length !== 1 || entries[0] !== AGENT_RUNTIME_LOCK_OWNER_FILENAME) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: unexpected contents in lock directory for ${held.agentId}`,
+      );
+    }
+
+    try {
+      await fs.unlink(ownerPath);
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: failed to remove owner.json for ${held.agentId}`,
+        { cause: error },
+      );
+    }
+
+    try {
+      // Non-recursive: fails closed if anything unexpected remains.
+      await fs.rmdir(held.lockDir);
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `cannot release agent lock: failed to remove lock directory for ${held.agentId}`,
+        { cause: error },
+      );
+    }
+  }
+
+  private async writeLockOwnerAtomic(
+    ownerPath: string,
+    owner: AgentRuntimeLockOwner,
+  ): Promise<void> {
+    await writeFileAtomic(ownerPath, `${JSON.stringify(owner, null, 2)}\n`);
+    await this.chmodPrivateFile(ownerPath);
+  }
+
+  private async readScratchManifestIfPresent(
+    manifestPath: string,
+  ): Promise<AgentScratchManifest | null> {
+    try {
+      return await this.readScratchManifest(manifestPath);
+    } catch (error) {
+      if (isMissingEntryError(error)) {
+        return null;
+      }
+      throw error;
     }
   }
 
@@ -582,4 +916,14 @@ export class AgentRuntimeStorage {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Best-effort Linux boot id for lock owner diagnostics. Never fails acquisition. */
+async function readOptionalBootId(): Promise<string | undefined> {
+  try {
+    const value = (await fs.readFile(LINUX_BOOT_ID_PATH, "utf8")).trim();
+    return value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }

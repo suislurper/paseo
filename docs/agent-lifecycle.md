@@ -163,5 +163,6 @@ When `agents.runtimeRoot` is configured, every launch path prepares per-agent sc
 - **Release** is an explicit receipt: `AgentManager.releaseAgentScratch` / MCP `release_agent_scratch` with exact `agentId` + `generation`. It returns `{ agentId, generation, lifecycle: "released", releasedAt }` and is idempotent for the same pair.
 - Release does **not** archive the agent, close the runtime, or delete files. Archive and tab close do **not** release scratch.
 - Wrong generation, unconfigured storage, or agent-scoped caller mismatch fail closed and change nothing.
+- **Prepare and release hold a per-agent filesystem lock** (`{runtimeRoot}/locks/{agentId}.lock`) only for manifest metadata I/O — never across provider launch or run. The same lock will cover future cleanup (revalidate + exact scratch removal). A crash-left lock fails closed and blocks that agent until operator inspection; locks are never broken by age. See [data-model.md](./data-model.md).
 
 Deletion/cleanup of released generations is a separate surface and is not part of this lifecycle gesture.

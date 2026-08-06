@@ -42,9 +42,14 @@ def wfile(path: Path, content: str | bytes = b"x") -> None:
     path.write_bytes(content if isinstance(content, bytes) else content.encode())
 
 
-def make_stat(pid: int, comm: str, ticks: int) -> str:
+def make_stat(pid: int, comm: str, ticks: int, *, kernel_thread: bool = False) -> str:
     rest = ["0"] * 20
-    rest[0], rest[1], rest[19] = "S", "1", str(ticks)
+    rest[0], rest[1], rest[6], rest[19] = (
+        "S",
+        "1",
+        str(M.PF_KTHREAD if kernel_thread else 0),
+        str(ticks),
+    )
     return f"{pid} ({comm}) " + " ".join(rest) + "\n"
 
 
@@ -146,7 +151,15 @@ class H:
         for p in self.processes:
             pdir = self.proc / str(p["pid"])
             pdir.mkdir(parents=True, exist_ok=True)
-            wfile(pdir / "stat", make_stat(p["pid"], p.get("name", "app"), p["start_time_ticks"]))
+            wfile(
+                pdir / "stat",
+                make_stat(
+                    p["pid"],
+                    p.get("name", "app"),
+                    p["start_time_ticks"],
+                    kernel_thread=bool(p.get("kernel_thread")),
+                ),
+            )
             # Non-kernel: non-empty cmdline (matches process-census population).
             if p.get("kernel_thread"):
                 wfile(pdir / "cmdline", b"")
@@ -999,6 +1012,19 @@ class Tests(unittest.TestCase):
         c = self.cand()
         self.assertEqual(c["classification"], "eligible")
         self.assertNotIn("process_new", c["reasons"])
+
+        # A kernel worker created after the snapshot is also safely outside the
+        # userspace owner population. Its PF_KTHREAD bit and start identity come
+        # from the same stat read, so no protected /proc links are needed.
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census()
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "kworker/u64:0", 1, kernel_thread=True))
+        self.assertEqual(self.cand()["classification"], "eligible")
 
         # Non-kernel with unreadable identity fails closed.
         self.tearDown()

@@ -248,7 +248,10 @@ probe, legacy `/tmp` quarantine) share one helper in `agent-scratch-cleanup.py`
    - `captured_at` **strictly after** `started_at` (post-start);
    - no older than **45s** (`captured_at` vs now — snapshot max age, unchanged).
 3. Perform its **own current** unprivileged `/proc` scan of **non-kernel** processes
-   only (same population rule as the census producer; kernel threads are skipped).
+   only. The consumer reads Linux `/proc/<pid>/stat` once and binds the process
+   start time to the `PF_KTHREAD` flag from that same record. This avoids protected
+   `/proc/<pid>/exe` links and safely skips kernel workers created after a snapshot.
+   A PID reuse between scans still produces `live_process_race` and blocks.
 4. Accept the snapshot only when its `roots` authoritatively cover the required path(s)
    for that consumer, and **every** live non-kernel process matches a snapshot record
    on **both** `pid` and `start_time_ticks`.
@@ -368,10 +371,11 @@ census merge rule above and additionally requires:
 - no duplicate snapshot PIDs.
 
 Malformed, incomplete, or duplicate process/root records block **all** candidates.
-Live PID/start-time identity uses the same non-kernel process population as
-`process-census.py` (kernel threads are omitted and must not require snapshot records)
-and is confirmed against the post-start snapshot; undecidable kernel-vs-userspace or
-unreadable non-kernel identity fails closed.
+Live PID/start-time identity uses Linux's `PF_KTHREAD` bit from the same readable
+`/proc/<pid>/stat` record as the start time. Kernel threads are omitted from the live
+owner population and do not require a matching snapshot record. Userspace identity
+is confirmed against the post-start snapshot; malformed or unreadable stat identity
+fails closed.
 
 Path components under `runtimeRoot` (`locks`, `scratch`, `artifacts`, `quarantine`)
 are validated against symlink traversal. Lock parent creation is exact and fail-closed

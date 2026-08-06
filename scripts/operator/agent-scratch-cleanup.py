@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
 import json
 import os
@@ -733,13 +732,23 @@ def read_boot_id(proc_root: str) -> str:
         raise ToolError(f"unable to read boot_id: {exc}") from exc
 
 
-def parse_stat_start(stat_text: str) -> int:
+PF_KTHREAD = 0x00200000
+
+
+def parse_stat_identity(stat_text: str) -> tuple[int, bool]:
+    """Return start ticks and kernel-thread identity from one proc stat read."""
     lparen = stat_text.find("(")
     rparen = stat_text.rfind(")")
     if lparen < 0 or rparen < 0 or rparen <= lparen:
         raise ValueError("malformed stat")
     rest = stat_text[rparen + 2 :].split()
-    return int(rest[19])
+    if len(rest) < 20:
+        raise ValueError("malformed stat")
+    return int(rest[19]), bool(int(rest[6]) & PF_KTHREAD)
+
+
+def parse_stat_start(stat_text: str) -> int:
+    return parse_stat_identity(stat_text)[0]
 
 
 def _proc_path(proc_root: str, pid: int, *parts: str) -> str:
@@ -748,69 +757,6 @@ def _proc_path(proc_root: str, pid: int, *parts: str) -> str:
 
 def _process_still_exists(proc_root: str, pid: int) -> bool:
     return os.path.isdir(_proc_path(proc_root, pid))
-
-
-def _read_cmdline_tokens(proc_root: str, pid: int) -> list[str] | None:
-    """Mirror process-census.py cmdline read. None = process gone."""
-    path = _proc_path(proc_root, pid, "cmdline")
-    try:
-        with open(path, "rb") as f:
-            raw = f.read()
-    except FileNotFoundError:
-        return None
-    except ProcessLookupError:
-        return None
-    except OSError:
-        raise
-    if not raw:
-        return []
-    parts = raw.split(b"\0")
-    tokens: list[str] = []
-    for p in parts:
-        if not p:
-            continue
-        try:
-            tokens.append(p.decode("utf-8", errors="surrogateescape"))
-        except Exception:
-            tokens.append(p.decode("latin-1", errors="replace"))
-    return tokens
-
-
-def is_kernel_thread(proc_root: str, pid: int) -> bool | None:
-    """True if kernel thread, False if userspace, None if process exited.
-
-    Same population rule as process-census.py: empty cmdline and no resolvable exe.
-    """
-    try:
-        tokens = _read_cmdline_tokens(proc_root, pid)
-    except OSError:
-        # Can't classify; treat as non-kernel so the live map fails closed if identity
-        # cannot be proven (matches process-census: not safe to drop as kernel).
-        return False
-    if tokens is None:
-        return None
-    if tokens:
-        return False
-    exe_path = _proc_path(proc_root, pid, "exe")
-    try:
-        os.readlink(exe_path)
-        return False
-    except FileNotFoundError:
-        if not _process_still_exists(proc_root, pid):
-            return None
-        return True
-    except ProcessLookupError:
-        return None
-    except OSError as exc:
-        if exc.errno in (errno.ENOENT, errno.ESRCH):
-            if not _process_still_exists(proc_root, pid):
-                return None
-            return True
-        if exc.errno in (errno.EACCES, errno.EPERM):
-            return False
-        if not _process_still_exists(proc_root, pid):
-            return None
-        return False
 
 
 def live_pid_map(
@@ -844,15 +790,12 @@ def live_pid_map(
         pdir = os.path.join(proc_root, name)
         if not os.path.isdir(pdir):
             continue
-        kthread = is_kernel_thread(proc_root, pid)
-        if kthread is None:
-            # Exited during scan — omit (producer also skips exit races).
-            continue
-        if kthread is True:
-            continue
         try:
             with open(os.path.join(pdir, "stat"), encoding="utf-8") as f:
-                out[pid] = parse_stat_start(f.read())
+                start_time_ticks, kernel_thread = parse_stat_identity(f.read())
+            if kernel_thread:
+                continue
+            out[pid] = start_time_ticks
         except (OSError, ValueError, IndexError):
             if _process_still_exists(proc_root, pid):
                 # Non-kernel (or undecidable) still present without identity → fail closed.

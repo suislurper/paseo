@@ -39,6 +39,9 @@ const UI_MARKERS = [
 const SERVER_MARKERS = [
   ["originDefaultRelation", "origin-default relation computed server side (1bf93bb7e)"],
   ["claude-opus-5", "Opus 5 Claude model manifest entries (3778a52d9)"],
+  ["PASEO_AGENT_ARTIFACT_DIR", "managed per-agent runtime storage (95c63c3c5)"],
+  ["release_agent_scratch", "explicit scratch-release receipt (95c63c3c5)"],
+  ["minimumFreeBytes", "disk-pressure worktree admission (95c63c3c5)"],
 ];
 
 // Sources whose changes must be reflected in the Expo export before packaging.

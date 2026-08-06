@@ -44,6 +44,10 @@ const requiredHistory = [
     "1b668a654a37c43d8626b34eb59cc732751a2c9a",
     "server-projected bounded schedule identity inspection",
   ],
+  [
+    "95c63c3c5b3b9cf56f66a17954a782cbbafb508e",
+    "managed agent runtime storage, fail-closed cleanup probes, and disk admission",
+  ],
 ];
 
 function isAncestor(commit, descendant) {

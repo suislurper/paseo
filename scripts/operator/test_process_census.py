@@ -15,6 +15,7 @@ from typing import Any
 
 SCRIPT = Path(__file__).resolve().parent / "process-census.py"
 SERVICE_UNIT = SCRIPT.parent / "systemd" / "paseo-process-census.service"
+TIMER_UNIT = SCRIPT.parent / "systemd" / "paseo-process-census.timer"
 
 
 def load_census():
@@ -479,6 +480,12 @@ class ProcessCensusTests(unittest.TestCase):
         unit = SERVICE_UNIT.read_text(encoding="utf-8")
         self.assertIn("RuntimeDirectory=paseo", unit)
         self.assertIn("RuntimeDirectoryPreserve=yes", unit)
+
+    def test_timer_cadence_supports_bounded_process_retry(self) -> None:
+        timer = TIMER_UNIT.read_text(encoding="utf-8")
+        self.assertIn("OnBootSec=10s", timer)
+        self.assertIn("OnUnitActiveSec=10s", timer)
+        self.assertIn("AccuracySec=1s", timer)
 
 
 if __name__ == "__main__":

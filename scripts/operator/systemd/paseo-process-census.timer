@@ -1,11 +1,11 @@
 [Unit]
-Description=Run Paseo process census every 30 seconds
+Description=Run Paseo process census every 10 seconds
 Documentation=file:///usr/local/share/doc/paseo/operator-fork.md
 
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=30s
-AccuracySec=5s
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
 Persistent=true
 Unit=paseo-process-census.service
 

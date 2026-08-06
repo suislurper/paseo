@@ -170,7 +170,8 @@ paths themselves.
 
 - Source: `scripts/operator/process-census.py`
 - Unit templates: `scripts/operator/systemd/paseo-process-census.service` and
-  `paseo-process-census.timer` (timer cadence: every **30 seconds**)
+  `paseo-process-census.timer` (timer cadence: every **10 seconds**; this gives
+  the bounded proof retry several chances on process-heavy developer machines)
 - Installed executable path: `/usr/local/libexec/paseo-process-census`
 - Fixed roots (production unit): `/home/user/.paseo/worktrees`,
   `/mnt/data/paseo-runtime`, `/mnt/data/shab/.git`, and `/tmp`

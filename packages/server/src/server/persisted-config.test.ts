@@ -127,6 +127,51 @@ describe("PersistedConfigSchema worktrees config", () => {
   });
 });
 
+describe("PersistedConfigSchema agents.runtimeRoot", () => {
+  test("leaves runtimeRoot unset by default for upstream compatibility", () => {
+    const parsed = PersistedConfigSchema.parse({
+      version: 1,
+    });
+
+    expect(parsed.agents?.runtimeRoot).toBeUndefined();
+  });
+
+  test("accepts an absolute runtime root", () => {
+    const parsed = PersistedConfigSchema.parse({
+      agents: {
+        runtimeRoot: "/var/lib/paseo/agent-runtime",
+      },
+    });
+
+    expect(parsed.agents?.runtimeRoot).toBe("/var/lib/paseo/agent-runtime");
+  });
+
+  test("rejects a relative runtime root", () => {
+    const result = PersistedConfigSchema.safeParse({
+      agents: {
+        runtimeRoot: "relative/agent-runtime",
+      },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some((issue) => issue.path.join(".") === "agents.runtimeRoot"),
+      ).toBe(true);
+    }
+  });
+
+  test("rejects an empty runtime root", () => {
+    const result = PersistedConfigSchema.safeParse({
+      agents: {
+        runtimeRoot: "",
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+});
+
 describe("PersistedConfigSchema provider credentials", () => {
   test("accepts separate OpenAI STT and TTS credentials", () => {
     const parsed = PersistedConfigSchema.parse({

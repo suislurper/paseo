@@ -80,6 +80,14 @@ const WorktreesConfigSchema = z
   })
   .strict();
 
+function isAbsoluteFilesystemPath(value: string): boolean {
+  return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
+}
+
+const AbsoluteFilesystemPathSchema = z.string().min(1).refine(isAbsoluteFilesystemPath, {
+  message: "must be an absolute filesystem path",
+});
+
 const BcryptHashSchema = z.string().regex(/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/, {
   message: "Expected a bcrypt hash",
 });
@@ -299,6 +307,9 @@ export const PersistedConfigSchema = z
       .object({
         providers: z.preprocess(normalizeAgentProviders, ProviderOverridesSchema).optional(),
         metadataGeneration: AgentMetadataGenerationSchema.optional(),
+        // Optional absolute root for durable per-agent scratch/artifacts storage.
+        // Unset keeps upstream/default behavior (no agent runtime root).
+        runtimeRoot: AbsoluteFilesystemPathSchema.optional(),
       })
       .strict()
       .optional(),

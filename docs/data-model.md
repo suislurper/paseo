@@ -61,6 +61,20 @@ $PASEO_HOME/
 └── push-tokens.json                     # Expo push notification tokens
 ```
 
+Optional durable per-agent runtime storage (not under `$PASEO_HOME` unless configured there) is rooted at `agents.runtimeRoot` in `config.json`. When unset, no agent runtime root is used. When set, it must be an absolute filesystem path:
+
+```
+{agents.runtimeRoot}/
+├── scratch/
+│   └── {agentId}/
+│       └── manifest.json   # daemon-owned: schemaVersion, agentId, generation, createdAt, lifecycle (active|released), optional releasedAt
+└── artifacts/
+    └── {agentId}/
+        └── manifest.json   # retained marker (retention: "retained"); never touched by release
+```
+
+`AgentRuntimeStorage` creates both agent directories at mode `0700`, reuses a valid matching scratch generation across daemon restarts, and fails closed on symlink roots/components, path escape, invalid agent IDs, malformed/mismatched manifests, or non-directory collisions. Release only flips the scratch lifecycle to `released` for an exact agent ID + generation (idempotent); it never deletes files and never mutates artifacts. Secrets must not be stored in either manifest.
+
 The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
 
 ---
@@ -207,7 +221,8 @@ Single file, validated with `PersistedConfigSchema`.
     providers: Record<providerId, ProviderOverride>,
     metadataGeneration: {
       providers: [{ provider, model?, thinkingOptionId? }]
-    }
+    },
+    runtimeRoot?: string  // absolute path for durable per-agent scratch/artifacts; unset = unused
   },
   features: {
     dictation: { enabled, stt: { provider, model, language, confidenceThreshold } },

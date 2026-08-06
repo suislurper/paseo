@@ -170,7 +170,7 @@ paths themselves.
 
 - Source: `scripts/operator/process-census.py`
 - Unit templates: `scripts/operator/systemd/paseo-process-census.service` and
-  `paseo-process-census.timer` (timer cadence: every five minutes)
+  `paseo-process-census.timer` (timer cadence: every **30 seconds**)
 - Installed executable path: `/usr/local/libexec/paseo-process-census`
 - Fixed roots (production unit): `/home/user/.paseo/worktrees` and
   `/mnt/data/paseo-runtime`
@@ -220,18 +220,78 @@ requests that packet.
 ### Consumer merge rule (closes the timer race)
 
 Snapshot freshness alone is **not** proof that a PID still refers to the same
-process. The unprivileged cleanup probe must:
+process, and identity alone is **not** proof that mutable cwd/fd references are still
+safe to act on. The unprivileged managed-scratch cleanup probe must:
 
-1. Perform its **own current** scan of the PIDs it cares about.
-2. Open `/run/paseo/process-census.json` only as a **hint**.
-3. Use a snapshot record for a PID **only when all** of the following hold:
-   - snapshot `boot_id` matches the current kernel boot id;
-   - snapshot age is **≤ 10 minutes** (`captured_at` vs now);
-   - the live process’s `pid` **and** `start_time_ticks` **both** match the snapshot
-     record.
-4. If a PID is new or reused, or any required field is unreadable on the live process,
-   treat the identity as **ambiguous and blocking** — do not delete or kill based on
-   the snapshot alone.
+1. Record `started_at` at the beginning of the probe.
+2. Wait/poll (at most **45s**) for a **complete** snapshot at
+   `/run/paseo/process-census.json` that is:
+   - same `boot_id` as the current kernel boot id;
+   - `captured_at` **strictly after** `started_at` (post-start);
+   - no older than **45s** (`captured_at` vs now).
+3. Perform its **own current** unprivileged `/proc` scan.
+4. Accept the snapshot only when **every** live non-kernel process matches a snapshot
+   record on **both** `pid` and `start_time_ticks`.
+5. If any process is new or reused, any required live/snapshot field is unreadable, or
+   the snapshot is incomplete/stale/pre-start, treat process proof as **blocked for all
+   candidates** — do not delete based on the snapshot alone.
 
-Matching `pid + start_time_ticks` under the same `boot_id` is what closes the race
-between the five-minute timer and a PID that exited and was reused.
+This supersedes the earlier five-minute / max-10-minute consumer rule. Matching
+`pid + start_time_ticks` under the same `boot_id` against a post-start ≤45s complete
+snapshot is what closes the race between the 30-second timer and PID reuse.
+
+## Managed agent-scratch cleanup
+
+Fail-closed operator tool for durable per-agent runtime storage when
+`agents.runtimeRoot` is configured (see [data-model.md](./data-model.md)).
+
+- Source: `scripts/operator/agent-scratch-cleanup.py`
+- Tests: `scripts/operator/test_agent_scratch_cleanup.py` (`npm run test:agent-scratch-cleanup`)
+- Config: reads `agents.runtimeRoot` from a supplied config path (production:
+  `/home/user/.paseo/config.json`)
+
+### Scope
+
+Manages **only** `{runtimeRoot}/scratch/<validated UUID>`. Never artifacts,
+quarantine, generic `/tmp`, worktrees, or arbitrary raw paths. Artifact and
+quarantine aggregate sizes are **report-only**.
+
+### Probe
+
+`probe` emits deterministic JSON with:
+
+- free bytes for `/` and the runtime root;
+- report-only artifact/quarantine totals;
+- every scratch UUID candidate classified `protected` / `blocked` / `eligible` with
+  exact reasons, a size walk capped at **60s**, and a candidate token when eligible.
+
+Strict manifest requirements for eligibility: exact UUID directory/`agentId`, schema
+version `1`, generation UUID, lifecycle `released`, and `releasedAt` valid and at
+least **24h** old. Active, malformed, symlink, or unknown agents block or protect.
+
+Read-only Paseo CLI census: exact agent inspect must prove `archivedAt` is set **or**
+`status` is `closed`; list all unarchived agents and protect the matching agent or any
+unarchived descendant; protect active schedules targeting it, pending permissions for
+it, and terminals/processes whose resolved paths fall within its scratch; protect a
+present per-agent lock. Any missing, unparseable, or page-capped census **blocks**.
+
+Process proof uses the census merge rule above.
+
+### Archive
+
+`archive --agent-id <UUID> --generation <UUID> --candidate-token <TOKEN>` takes **no
+raw path**. It acquires `{runtimeRoot}/locks/<id>.lock` with the exact documented
+`mkdir` + `owner.json` protocol (a present, symlink, or malformed lock blocks and is
+**never** broken by age). While holding the lock it re-runs the candidate probe with a
+newly captured post-start snapshot and requires `eligible` plus the same
+token/generation, then removes **only** the exact scratch directory.
+
+Deletion is non-following and symlink-safe: refuse special files, mount crossings, path
+changes, unexpected hard links, or contents that change during final verification.
+Artifacts remain byte-for-byte untouched. Lock release rechecks the token and removes
+only `owner.json` plus the empty lock directory non-recursively; unexpected contents
+leave the lock fail-closed.
+
+Archive reports exact path, measured bytes, free bytes before/after, agent/generation,
+and `artifacts_preserved=true`. One invocation archives at most one candidate; the
+operator custodian should limit sequential archive calls (recommended cap: eight).

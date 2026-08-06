@@ -172,8 +172,10 @@ paths themselves.
 - Unit templates: `scripts/operator/systemd/paseo-process-census.service` and
   `paseo-process-census.timer` (timer cadence: every **30 seconds**)
 - Installed executable path: `/usr/local/libexec/paseo-process-census`
-- Fixed roots (production unit): `/home/user/.paseo/worktrees` and
-  `/mnt/data/paseo-runtime`
+- Fixed roots (production unit): `/home/user/.paseo/worktrees`,
+  `/mnt/data/paseo-runtime`, and `/tmp` (the `/tmp` root exists so the legacy
+  `/tmp` recovery lane can require a covering `roots` entry; it still emits only
+  redacted in-root path references — never argv/env)
 - Output: `/run/paseo/process-census.json` (mode `0644`; parent `/run/paseo` mode
   `0755`)
 
@@ -352,3 +354,107 @@ Archive reports exact path, measured bytes, free bytes before/after, agent/gener
 `artifacts_preserved=true`, and optional `tombstone_path`. One invocation archives at
 most one candidate; the operator custodian should limit sequential archive calls
 (recommended cap: eight).
+
+## Legacy /tmp recovery lane
+
+Explicit operator tool for **one** absolute direct child of `/tmp` at a time. It is
+not a daemon, DB, queue, automatic generic `/tmp` cleaner, or broad recursive target
+walker. No glob expansion inside the tool.
+
+- Source: `scripts/operator/legacy-tmp-quarantine.py`
+- Tests: `scripts/operator/test_legacy_tmp_quarantine.py`
+  (`npm run test:legacy-tmp-quarantine`)
+- Durable quarantine root (production):
+  `/mnt/data/paseo-runtime/quarantine/legacy-tmp/<run-id>/` (mode `0700`; never
+  auto-deleted)
+- Process census must include a `roots` entry covering the candidate (production unit
+  adds `--root /tmp` for redacted path references only — no argv/env). Do **not** add a
+  second timer.
+
+### Recognized producer prefixes (basename allowlist)
+
+Only these basename prefixes are ever eligible (unknown roots are **reported**, never
+deleted):
+
+- `shab-stage-runner-`
+- `warm-live-api-`
+- `grok-run-`
+- `ask-expert-`
+- `expert-mcp-`
+- `cxc-`
+- `paseo-`
+
+### Candidate rules
+
+- Exact absolute path that is a **direct child** of the tmp root (default `/tmp`;
+  test-injectable).
+- Top-level symlink blocks. Support regular top-level files and directories.
+- Reject special files, mount crossings, hard-linked regular files, unreadable
+  content, sockets/devices/FIFOs, escaping symlinks, and change races.
+- Nested symlinks are preservable only when both the lexical target and the resolved
+  target stay inside the candidate; otherwise the candidate is blocked.
+
+### Process + Paseo proof
+
+Uses the same producer/consumer merge rule as managed scratch cleanup:
+
+1. Complete post-start snapshot, same `boot_id`, age ≤ **45s**, with `roots` covering
+   the exact candidate.
+2. Every live non-kernel PID + `start_time_ticks` matches a well-formed complete
+   snapshot record with absolute path references.
+3. Any process reference under the candidate **protects** it.
+4. Snapshot path symlink or malformed data blocks globally.
+
+Read-only Paseo census (fail closed on missing/ambiguous/page-capped data; never
+infer abbreviated IDs; unarchived list cap `<200`):
+
+- every unarchived agent via exact UUID inspect (`Cwd` under candidate protects);
+- active schedules via `paseo schedule inspect <id> --identity-only` then target agent
+  inspect (target cwd under candidate protects);
+- all terminals (`cwd` under candidate protects);
+- all permits (permitted agent cwd under candidate protects).
+
+### Inventory + token
+
+Bounded **60s** deterministic inventory (twice; mismatch/timeout/change blocks): type,
+relative path, mode, uid/gid, size, mtime ns, link count, SHA-256 for regular files,
+and symlink target text when preservable. File paths that change while hashing block.
+Eligible candidates carry a `candidate_token` bound to source path, producer, owner
+identity fields, and inventory fingerprint.
+
+### Commands
+
+**`probe --source <abs-path>`** (never mutates): reports exact source path, recognized
+producer (or unknown), owner evidence, size, classification/reasons, candidate token
+when eligible, and free bytes for `/` and `/mnt/data`.
+
+**`quarantine --source <abs-path> --candidate-token <token> --run-id <uuid>`**:
+
+1. Fresh second complete census + two matching inventories; require the same token.
+2. Refuse reused run-id or any existing partial/final/tombstone path.
+3. Create only `{quarantineRoot}/.partial-<run-id>/` then copy the candidate intact to
+   `payload/` without following symlinks; preserve mode/uid/gid/timestamps where
+   permitted; fsync files and dirs.
+4. Write `manifest.json` (source identity, inventory, hashes, link targets, token,
+   run-id).
+5. Independently verify destination against the manifest; atomically rename partial →
+   `{quarantineRoot}/<run-id>/` and fsync the parent.
+6. Only after durable verification: recheck source identity, atomically rename the
+   exact source to a hidden tombstone direct child of the same tmp root, then delete
+   **only** that tombstone without following symlinks.
+7. If tombstone deletion fails, the durable quarantine copy remains recovery authority
+   and the response reports `status=quarantined_pending_removal` with the exact
+   `tombstone_path`. Source changes before rename block; never touch another `/tmp`
+   entry.
+
+Quarantine copies are **never** auto-deleted by this tool.
+
+### Operator orchestration (outside the tool)
+
+This tool does **not** run a batch. The operator/custodian should:
+
+- work **sequentially**, at most **8** candidates per batch;
+- run a **fresh probe** before each quarantine;
+- re-census / re-evaluate free space between batches;
+- **stop** on any error or observed state change, or when root free space is
+  **≥ 30 GiB**.

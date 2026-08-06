@@ -147,10 +147,30 @@ class H:
             pdir = self.proc / str(p["pid"])
             pdir.mkdir(parents=True, exist_ok=True)
             wfile(pdir / "stat", make_stat(p["pid"], p.get("name", "app"), p["start_time_ticks"]))
+            # Non-kernel: non-empty cmdline (matches process-census population).
+            if p.get("kernel_thread"):
+                wfile(pdir / "cmdline", b"")
+                # no exe → kernel thread
+            else:
+                wfile(pdir / "cmdline", f"{p.get('name', 'app')}\0".encode())
+                try:
+                    os.symlink("/bin/true", pdir / "exe")
+                except FileExistsError:
+                    pass
 
-    def write_census(self, captured_at: str | None = None, complete: bool = True) -> None:
+    def write_census(
+        self,
+        captured_at: str | None = None,
+        complete: bool = True,
+        roots: list[str] | None = None,
+        processes: list[dict[str, Any]] | None = None,
+    ) -> None:
+        src = processes if processes is not None else self.processes
         recs = []
-        for p in self.processes:
+        for p in src:
+            if p.get("kernel_thread"):
+                # Producer omits kernel threads from the snapshot.
+                continue
             recs.append(
                 {
                     "pid": p["pid"],
@@ -167,7 +187,7 @@ class H:
                 "schema_version": 1,
                 "boot_id": BOOT,
                 "captured_at": captured_at or iso(self.now),
-                "roots": ["/"],
+                "roots": roots if roots is not None else [str(self.runtime)],
                 "complete": complete,
                 "errors": [],
                 "processes": recs,
@@ -514,6 +534,8 @@ class Tests(unittest.TestCase):
         pdir = self.h.proc / "77"
         pdir.mkdir()
         wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
         self.assertIn("process_new", self.cand()["reasons"])
 
     def test_malformed_process_refs_block_all(self) -> None:
@@ -536,41 +558,43 @@ class Tests(unittest.TestCase):
         self.h.put_scratch()
         self.h.mark_archived()
         self.h.write_census()
-        real, n = time.monotonic, {"n": 0}
+        real_ds = M.dir_size_capped
 
-        def fake() -> float:
-            n["n"] += 1
-            return real() + (10_000 if n["n"] > 2 else 0)
+        def fake_ds(path: str, deadline: float) -> tuple[int | None, str | None]:
+            # Only the per-candidate scratch walk times out; aggregates stay ok.
+            if str(self.h.runtime / "scratch" / A) in path or path.endswith(f"/scratch/{A}"):
+                return None, "size_walk_timeout"
+            return real_ds(path, deadline)
 
-        time.monotonic = fake  # type: ignore[assignment]
-        try:
+        with mock.patch.object(M, "dir_size_capped", side_effect=fake_ds):
             self.assertIn("size_walk_timeout", self.cand()["reasons"])
-        finally:
-            time.monotonic = real  # type: ignore[assignment]
 
     def test_aggregate_timeout_unknown_not_zero(self) -> None:
         self.h.eligible_setup()
         wfile(self.h.runtime / "artifacts" / "x.bin", b"abc")
-        real = time.monotonic
-        # Force timeout on every size walk after a few ticks.
-        n = {"n": 0}
+        real_ds = M.dir_size_capped
 
-        def fake() -> float:
-            n["n"] += 1
-            return real() + (10_000 if n["n"] > 1 else 0)
+        def fake_ds(path: str, deadline: float) -> tuple[int | None, str | None]:
+            if path.rstrip("/").endswith("/artifacts") or path.rstrip("/").endswith(
+                str(self.h.runtime / "artifacts")
+            ):
+                return None, "size_walk_timeout"
+            return real_ds(path, deadline)
 
-        time.monotonic = fake  # type: ignore[assignment]
-        try:
+        with mock.patch.object(M, "dir_size_capped", side_effect=fake_ds):
             probe = self.h.probe()
-        finally:
-            time.monotonic = real  # type: ignore[assignment]
         rep = probe["report_only"]
         self.assertIsNone(rep["artifacts_bytes"])
         self.assertEqual(rep["artifacts_status"], "unknown")
-        self.assertIsNotNone(rep["artifacts_error"])
-        self.assertTrue(rep["errors"])
+        self.assertEqual(rep["artifacts_error"], "size_walk_timeout")
+        self.assertTrue(any("report_artifacts" in e for e in rep["errors"]))
         # Must never report a numeric 0 for a timed-out aggregate.
         self.assertNotEqual(rep["artifacts_bytes"], 0)
+        # Aggregate failure blocks every scratch candidate for the wake.
+        self.assertTrue(probe["candidates"])
+        for c in probe["candidates"]:
+            self.assertEqual(c["classification"], "blocked")
+            self.assertTrue(any("report_artifacts" in r for r in c["reasons"]), c["reasons"])
 
     def test_token_changes_with_tree(self) -> None:
         self.h.eligible_setup()
@@ -863,6 +887,175 @@ class Tests(unittest.TestCase):
             with self.assertRaises(M.ToolError) as ctx:
                 self.h.archive(token)
             self.assertIn("chmod", str(ctx.exception).lower())
+
+    def test_snapshot_roots_must_cover_runtime(self) -> None:
+        self.h.put_scratch()
+        self.h.mark_archived()
+        # Complete snapshot for unrelated roots must block.
+        self.h.write_census(roots=["/var/unrelated-census-root"])
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_roots_unrelated", c["reasons"])
+
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(roots=[])
+        self.assertIn("snapshot_roots_empty", self.cand()["reasons"])
+
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(roots=["relative/not/abs", str(self.h.runtime)])
+        self.assertIn("snapshot_roots_malformed", self.cand()["reasons"])
+
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        # Duplicate roots fail closed.
+        self.h.write_census(roots=[str(self.h.runtime), str(self.h.runtime)])
+        self.assertIn("snapshot_roots_duplicate", self.cand()["reasons"])
+
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        # Symlinked root path is rejected.
+        target = self.h.root / "real-root"
+        target.mkdir()
+        link = self.h.root / "link-root"
+        os.symlink(target, link)
+        self.h.write_census(roots=[str(link)])
+        self.assertIn("snapshot_roots_symlink", self.cand()["reasons"])
+
+    def test_live_pid_map_skips_kernel_threads(self) -> None:
+        """Kernel threads omitted by the producer must not require snapshot records."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        # Live kthread present in fake /proc but absent from snapshot (producer omits).
+        self.h.processes.append(
+            {
+                "pid": 2,
+                "start_time_ticks": 1,
+                "name": "kthreadd",
+                "kernel_thread": True,
+            }
+        )
+        self.h.write_census()
+        c = self.cand()
+        self.assertEqual(c["classification"], "eligible")
+        self.assertNotIn("process_new", c["reasons"])
+
+        # Non-kernel with unreadable identity fails closed.
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census()
+        pdir = self.h.proc / "88"
+        pdir.mkdir()
+        wfile(pdir / "cmdline", b"mystery\0")
+        # No readable stat → non-kernel unreadable identity.
+        self.assertIn("live_process_unreadable", self.cand()["reasons"])
+
+    def test_plain_list_page_cap_blocks(self) -> None:
+        """Plain JSON lists of length >= 200 match the worktree probe page-cap rule."""
+        for which in ("ls", "schedule", "permit", "terminal"):
+            with self.subTest(which=which):
+                self.tearDown()
+                self.setUp()
+                self.h.put_scratch()
+                self.h.mark_archived()
+                self.h.write_census()
+                if which == "ls":
+                    self.h.paseo.unarchived = [
+                        {"id": str(uuid.uuid4()), "status": "idle"} for _ in range(200)
+                    ]
+                    # Inspect must succeed for ancestry walk; provide stubs.
+                    for item in self.h.paseo.unarchived:
+                        self.h.paseo.inspect[item["id"]] = {
+                            "Id": item["id"],
+                            "Status": "idle",
+                            "Archived": False,
+                            "ArchivedAt": None,
+                            "ParentAgentId": None,
+                        }
+                elif which == "schedule":
+                    self.h.paseo.schedules = [
+                        {"id": f"s{i}", "status": "idle"} for i in range(200)
+                    ]
+                elif which == "permit":
+                    self.h.paseo.permits = [
+                        {"id": f"p{i}", "agentId": A} for i in range(200)
+                    ]
+                else:
+                    self.h.paseo.terminals = [
+                        {
+                            "id": f"t{i}",
+                            "cwd": str(self.h.runtime / "other"),
+                        }
+                        for i in range(200)
+                    ]
+                c = self.cand()
+                self.assertEqual(c["classification"], "blocked")
+                self.assertTrue(
+                    any("page_capped" in r or "paseo_census" in r for r in c["reasons"]),
+                    c["reasons"],
+                )
+
+    def test_duplicate_snapshot_pid_and_ancestry_cycle(self) -> None:
+        self.h.put_scratch()
+        self.h.mark_archived()
+        # Duplicate PIDs in snapshot processes.
+        self.h.processes = [
+            {
+                "pid": 1,
+                "start_time_ticks": 10,
+                "name": "init",
+                "scope_complete": True,
+                "references": [],
+            },
+            {
+                "pid": 1,
+                "start_time_ticks": 10,
+                "name": "init-dup",
+                "scope_complete": True,
+                "references": [],
+            },
+        ]
+        self.h.write_census()
+        self.assertIn("snapshot_process_duplicate", self.cand()["reasons"])
+
+        # ParentAgentId cycle among unarchived agents blocks.
+        self.tearDown()
+        self.setUp()
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.paseo.unarchived = [
+            {"id": B, "status": "idle"},
+            {"id": C, "status": "idle"},
+        ]
+        self.h.paseo.inspect[B] = {
+            "Id": B,
+            "Status": "idle",
+            "Archived": False,
+            "ArchivedAt": None,
+            "ParentAgentId": C,
+        }
+        self.h.paseo.inspect[C] = {
+            "Id": C,
+            "Status": "idle",
+            "Archived": False,
+            "ArchivedAt": None,
+            "ParentAgentId": B,
+        }
+        self.h.write_census()
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertTrue(any("paseo_census" in r and "cycle" in r for r in c["reasons"]), c["reasons"])
 
 
 if __name__ == "__main__":

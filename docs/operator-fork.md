@@ -229,10 +229,13 @@ safe to act on. The unprivileged managed-scratch cleanup probe must:
    - same `boot_id` as the current kernel boot id;
    - `captured_at` **strictly after** `started_at` (post-start);
    - no older than **45s** (`captured_at` vs now).
-3. Perform its **own current** unprivileged `/proc` scan.
-4. Accept the snapshot only when **every** live non-kernel process matches a snapshot
-   record on **both** `pid` and `start_time_ticks`.
-5. If any process is new or reused, any required live/snapshot field is unreadable, or
+3. Perform its **own current** unprivileged `/proc` scan of **non-kernel** processes
+   only (same population rule as the census producer; kernel threads are skipped).
+4. Accept the snapshot only when its `roots` authoritatively cover the configured
+   `runtimeRoot`, and **every** live non-kernel process matches a snapshot record on
+   **both** `pid` and `start_time_ticks`.
+5. If any process is new or reused, any required live/snapshot field is unreadable,
+   kernel-vs-userspace cannot be decided, roots are missing/unrelated/malformed, or
    the snapshot is incomplete/stale/pre-start, treat process proof as **blocked for all
    candidates** — do not delete based on the snapshot alone.
 
@@ -254,15 +257,18 @@ Fail-closed operator tool for durable per-agent runtime storage when
 
 Manages **only** `{runtimeRoot}/scratch/<validated UUID>`. Never artifacts,
 quarantine, generic `/tmp`, worktrees, or arbitrary raw paths. Artifact and
-quarantine aggregate sizes are **report-only**.
+quarantine aggregate sizes are reported for observability; a timeout or unreadable
+aggregate walk still **blocks every scratch candidate** for that wake while reporting
+`bytes=null` and the exact error (never a silent `0`).
 
 ### Probe
 
 `probe` emits deterministic JSON with:
 
 - free bytes for `/` and the runtime root;
-- report-only artifact/quarantine totals (`bytes` + `status`; timeouts/unreadable walks
-  report `status=unknown`, `bytes=null`, and an error — **never** a silent `0`);
+- artifact/quarantine totals (`bytes` + `status`; timeouts/unreadable walks report
+  `status=unknown`, `bytes=null`, and an error — **never** a silent `0` — and block
+  all candidates);
 - scratch inventory completeness (non-UUID entries under `scratch/` are reported and
   make the inventory incomplete, blocking all candidates);
 - every scratch UUID candidate classified `protected` / `blocked` / `eligible` with
@@ -284,7 +290,8 @@ IDs, page-limit ambiguity, terminal cwd ambiguity, permits, or active schedules)
 - exact agent inspect must prove `archivedAt` is set **or** `status` is `closed`;
 - list all unarchived agents and protect the matching agent;
 - unarchived **descendants** are proven via authoritative `inspect` `ParentAgentId`
-  chains (not an assumed `--label` filter); malformed/unknown ancestry **blocks**;
+  chains (not an assumed `--label` filter); malformed/unknown ancestry, cycles, or
+  unresolved unarchived nodes **block**;
 - every **active** schedule target is resolved with
   `paseo schedule inspect <id> --identity-only` (never trust abbreviated display
   targets from `schedule ls`); protect any schedule whose identity target resolves to
@@ -292,11 +299,23 @@ IDs, page-limit ambiguity, terminal cwd ambiguity, permits, or active schedules)
 - protect pending permissions for the candidate and terminals/processes whose absolute
   paths fall within its scratch; protect a present per-agent lock.
 
-Any missing, unparseable, or page-capped census **blocks**. Process proof uses the
-census merge rule above and additionally requires every snapshot record used for proof
-to have `scope_complete=true` and a well-formed `references` list of absolute-path
-records; malformed or incomplete process records block **all** candidates. Live
-PID/start-time identity is confirmed against the post-start snapshot.
+Any missing, unparseable, or page-capped census **blocks**. A plain JSON list of length
+`>= 200` from global agent listing, schedules, permits, or terminals is treated as
+page-cap ambiguity (same rule as the worktree cleanup probe). Process proof uses the
+census merge rule above and additionally requires:
+
+- a well-formed absolute `roots` array whose normalized roots **cover** the configured
+  `runtimeRoot` (empty, unrelated, duplicate, relative, or symlinked root paths block;
+  a complete snapshot generated for other/no roots must not authorize cleanup);
+- every snapshot process record used for proof to have `scope_complete=true` and a
+  well-formed `references` list of absolute-path records;
+- no duplicate snapshot PIDs.
+
+Malformed, incomplete, or duplicate process/root records block **all** candidates.
+Live PID/start-time identity uses the same non-kernel process population as
+`process-census.py` (kernel threads are omitted and must not require snapshot records)
+and is confirmed against the post-start snapshot; undecidable kernel-vs-userspace or
+unreadable non-kernel identity fails closed.
 
 Path components under `runtimeRoot` (`locks`, `scratch`, `artifacts`, `quarantine`)
 are validated against symlink traversal. Lock parent creation is exact and fail-closed

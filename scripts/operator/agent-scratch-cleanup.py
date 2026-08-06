@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ SIZE_WALK_TIMEOUT_S = 60
 INVENTORY_TIMEOUT_S = 60
 SNAPSHOT_MAX_AGE_S = 45
 SNAPSHOT_WAIT_S = 45
+# Plain JSON list length at/above this matches the worktree probe page-cap ambiguity.
+CLI_PAGE_CAP = 200
 DEFAULT_CENSUS = "/run/paseo/process-census.json"
 LOCK_OP = "archive_scratch"
 MANIFEST_NAME = "manifest.json"
@@ -75,6 +78,9 @@ def norm(path: str) -> str:
 
 def under(path: str, root: str) -> bool:
     p, r = norm(path), norm(root)
+    # os.path.normpath("/") + sep becomes "//"; treat filesystem root specially.
+    if r == os.sep:
+        return p == os.sep or p.startswith(os.sep)
     return p == r or p.startswith(r + os.sep)
 
 
@@ -451,6 +457,9 @@ def parse_cli_json(stdout: str, label: str) -> Any:
             raise ToolError(f"{label}: page_capped")
         if data.get("error"):
             raise ToolError(f"{label}: {data.get('error')}")
+    if isinstance(data, list) and len(data) >= CLI_PAGE_CAP:
+        # Canonical worktree probe: plain list at the CLI page size is ambiguous.
+        raise ToolError(f"{label}: page_capped")
     return data
 
 
@@ -576,6 +585,8 @@ def collect_paseo_census(
             raise ToolError(f"descendant ancestry: non-uuid ParentAgentId for {aid}")
         parent_of[aid] = parent
 
+    validate_unarchived_ancestry(parent_of, unarchived_ids)
+
     return {
         "unarchived_ids": unarchived_ids,
         "unarchived": unarchived,
@@ -585,6 +596,35 @@ def collect_paseo_census(
         "protected_schedule_agents": protected_schedule_agents,
         "parent_of": parent_of,
     }
+
+
+def validate_unarchived_ancestry(
+    parent_of: dict[str, str | None], unarchived_ids: set[str]
+) -> None:
+    """Fail closed on cycles or unresolved unarchived ParentAgentId nodes."""
+    for aid in sorted(unarchived_ids):
+        if aid not in parent_of:
+            raise ToolError(f"descendant ancestry: unresolved node {aid}")
+        seen: set[str] = set()
+        cur: str | None = aid
+        while cur is not None:
+            if cur in seen:
+                raise ToolError(f"descendant ancestry: cycle involving {aid}")
+            seen.add(cur)
+            if cur not in parent_of:
+                # Left the inspected unarchived set only via a non-unarchived parent.
+                if cur in unarchived_ids:
+                    raise ToolError(f"descendant ancestry: unresolved node {cur}")
+                break
+            parent = parent_of[cur]
+            if parent is None:
+                break
+            if parent in unarchived_ids and parent not in parent_of:
+                raise ToolError(f"descendant ancestry: unresolved node {parent}")
+            if parent not in parent_of and parent not in unarchived_ids:
+                # Archived/external parent terminates the unarchived subgraph.
+                break
+            cur = parent
 
 
 def agent_is_archived_or_closed(info: dict[str, Any]) -> tuple[bool, list[str]]:
@@ -602,7 +642,11 @@ def agent_is_archived_or_closed(info: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 def has_unarchived_descendant(agent_id: str, parent_of: dict[str, str | None], unarchived_ids: set[str]) -> bool:
-    """True if any unarchived agent has agent_id in its parent chain."""
+    """True if any unarchived agent has agent_id in its parent chain.
+
+    Cycles and unresolved unarchived nodes are rejected at census time; this walk
+    still fails closed if it encounters them rather than assuming safe.
+    """
     for aid in unarchived_ids:
         if aid == agent_id:
             continue
@@ -610,14 +654,21 @@ def has_unarchived_descendant(agent_id: str, parent_of: dict[str, str | None], u
         cur: str | None = aid
         while cur is not None:
             if cur in seen:
-                break  # cycle; treat as non-descendant of agent_id unless matched
+                raise ToolError(f"descendant ancestry: cycle involving {aid}")
             seen.add(cur)
-            parent = parent_of.get(cur)
-            if parent is None and cur not in parent_of:
-                # unknown ancestry for an unarchived agent → handled at census time
+            if cur not in parent_of:
+                if cur in unarchived_ids:
+                    raise ToolError(f"descendant ancestry: unresolved node {cur}")
                 break
+            parent = parent_of[cur]
             if parent == agent_id:
                 return True
+            if parent is None:
+                break
+            if parent in unarchived_ids and parent not in parent_of:
+                raise ToolError(f"descendant ancestry: unresolved node {parent}")
+            if parent not in parent_of and parent not in unarchived_ids:
+                break
             cur = parent
     return False
 
@@ -658,7 +709,84 @@ def parse_stat_start(stat_text: str) -> int:
     return int(rest[19])
 
 
+def _proc_path(proc_root: str, pid: int, *parts: str) -> str:
+    return os.path.join(proc_root, str(pid), *parts)
+
+
+def _process_still_exists(proc_root: str, pid: int) -> bool:
+    return os.path.isdir(_proc_path(proc_root, pid))
+
+
+def _read_cmdline_tokens(proc_root: str, pid: int) -> list[str] | None:
+    """Mirror process-census.py cmdline read. None = process gone."""
+    path = _proc_path(proc_root, pid, "cmdline")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None
+    except ProcessLookupError:
+        return None
+    except OSError:
+        raise
+    if not raw:
+        return []
+    parts = raw.split(b"\0")
+    tokens: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            tokens.append(p.decode("utf-8", errors="surrogateescape"))
+        except Exception:
+            tokens.append(p.decode("latin-1", errors="replace"))
+    return tokens
+
+
+def is_kernel_thread(proc_root: str, pid: int) -> bool | None:
+    """True if kernel thread, False if userspace, None if process exited.
+
+    Same population rule as process-census.py: empty cmdline and no resolvable exe.
+    """
+    try:
+        tokens = _read_cmdline_tokens(proc_root, pid)
+    except OSError:
+        # Can't classify; treat as non-kernel so the live map fails closed if identity
+        # cannot be proven (matches process-census: not safe to drop as kernel).
+        return False
+    if tokens is None:
+        return None
+    if tokens:
+        return False
+    exe_path = _proc_path(proc_root, pid, "exe")
+    try:
+        os.readlink(exe_path)
+        return False
+    except FileNotFoundError:
+        if not _process_still_exists(proc_root, pid):
+            return None
+        return True
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            if not _process_still_exists(proc_root, pid):
+                return None
+            return True
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return False
+        if not _process_still_exists(proc_root, pid):
+            return None
+        return False
+
+
 def live_pid_map(proc_root: str) -> dict[int, int | None]:
+    """Map of live non-kernel PID → start_time_ticks (or None if unreadable).
+
+    Kernel threads are omitted (same as process-census producer). Fail closed with
+    None when a non-kernel PID identity cannot be read, or when kernel-vs-userspace
+    cannot be decided and the process still appears present without a readable identity.
+    """
     out: dict[int, int | None] = {}
     try:
         names = os.listdir(proc_root)
@@ -671,11 +799,18 @@ def live_pid_map(proc_root: str) -> dict[int, int | None]:
         pdir = os.path.join(proc_root, name)
         if not os.path.isdir(pdir):
             continue
+        kthread = is_kernel_thread(proc_root, pid)
+        if kthread is None:
+            # Exited during scan — omit (producer also skips exit races).
+            continue
+        if kthread is True:
+            continue
         try:
             with open(os.path.join(pdir, "stat"), encoding="utf-8") as f:
                 out[pid] = parse_stat_start(f.read())
         except (OSError, ValueError, IndexError):
-            if os.path.isdir(pdir):
+            if _process_still_exists(proc_root, pid):
+                # Non-kernel (or undecidable) still present without identity → fail closed.
                 out[pid] = None
     return out
 
@@ -765,12 +900,66 @@ def _well_formed_reference(ref: Any) -> bool:
     return True
 
 
+def snapshot_roots_cover(
+    snap: dict[str, Any], runtime_root: str
+) -> tuple[bool, list[str]]:
+    """Require well-formed absolute roots that cover configured runtimeRoot."""
+    reasons: list[str] = []
+    roots = snap.get("roots")
+    if not isinstance(roots, list):
+        return False, ["snapshot_roots_missing"]
+    if not roots:
+        return False, ["snapshot_roots_empty"]
+    seen: set[str] = set()
+    norm_roots: list[str] = []
+    for raw in roots:
+        if not isinstance(raw, str) or not raw.strip():
+            reasons.append("snapshot_roots_malformed")
+            continue
+        root = raw.strip()
+        if not os.path.isabs(root):
+            reasons.append("snapshot_roots_malformed")
+            continue
+        root_n = norm(root)
+        if root_n in seen:
+            reasons.append("snapshot_roots_duplicate")
+            continue
+        seen.add(root_n)
+        # Reject symlinked census root paths when they exist on disk.
+        try:
+            ensure_no_symlink_components(root_n, "snapshot root")
+        except ToolError:
+            reasons.append("snapshot_roots_symlink")
+            continue
+        norm_roots.append(root_n)
+    if reasons:
+        # Deduplicate reason tags while preserving order.
+        out: list[str] = []
+        seen_r: set[str] = set()
+        for r in reasons:
+            if r not in seen_r:
+                seen_r.add(r)
+                out.append(r)
+        return False, out
+    if not norm_roots:
+        return False, ["snapshot_roots_empty"]
+    rr = norm(runtime_root)
+    if not any(under(rr, r) for r in norm_roots):
+        return False, ["snapshot_roots_unrelated"]
+    return True, []
+
+
 def process_proof(
     snap: dict[str, Any],
     proc_root: str,
+    runtime_root: str,
 ) -> tuple[bool, list[str], dict[int, dict[str, Any]]]:
-    """Every live pid matches snapshot pid+start_time; every record complete."""
+    """Every live non-kernel pid matches snapshot pid+start_time; every record complete."""
     reasons: list[str] = []
+    roots_ok, roots_reasons = snapshot_roots_cover(snap, runtime_root)
+    if not roots_ok:
+        reasons.extend(roots_reasons)
+
     by_pid: dict[int, dict[str, Any]] = {}
     for rec in snap.get("processes") or []:
         if not isinstance(rec, dict):
@@ -780,6 +969,9 @@ def process_proof(
         st = rec.get("start_time_ticks")
         if not isinstance(pid, int) or not isinstance(st, int):
             reasons.append("snapshot_process_fields")
+            continue
+        if pid in by_pid:
+            reasons.append("snapshot_process_duplicate")
             continue
         if rec.get("scope_complete") is not True:
             reasons.append("snapshot_scope_incomplete")
@@ -1208,7 +1400,9 @@ def run_probe(
     process_reasons = list(snap_reasons)
     by_pid: dict[int, dict[str, Any]] = {}
     if snap is not None:
-        process_ok, process_reasons, by_pid = process_proof(snap, proc_root)
+        process_ok, process_reasons, by_pid = process_proof(
+            snap, proc_root, runtime_root
+        )
 
     paseo_ok = True
     paseo_reasons: list[str] = []
@@ -1232,9 +1426,10 @@ def run_probe(
         process_reasons = process_reasons + paseo_reasons
 
     if report_blockers:
-        # Report-only aggregates must never claim 0 on failure; surface as probe blockers
-        # so callers never treat the report as complete.
-        pass
+        # Aggregate timeout/unreadable: bytes null + exact error, and block every
+        # scratch candidate for this wake (no silent pass-through).
+        process_ok = False
+        process_reasons = process_reasons + report_blockers
 
     uuid_ids, unknown_names = list_scratch_entries(runtime_root)
     inventory_incomplete = bool(unknown_names)

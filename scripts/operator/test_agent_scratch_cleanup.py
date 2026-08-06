@@ -169,7 +169,19 @@ class H:
         recs = []
         for p in src:
             if p.get("kernel_thread"):
-                # Producer omits kernel threads from the snapshot.
+                # Root producer emits identity-only kernel-thread records so the
+                # unprivileged consumer need not classify protected /proc links.
+                recs.append(
+                    {
+                        "pid": p["pid"],
+                        "start_time_ticks": p["start_time_ticks"],
+                        "uid": 0,
+                        "name": p.get("name", "kthread"),
+                        "scope_complete": True,
+                        "references": [],
+                        "kernel_thread": True,
+                    }
+                )
                 continue
             recs.append(
                 {
@@ -971,10 +983,10 @@ class Tests(unittest.TestCase):
         self.assertIn("snapshot_roots_symlink", self.cand()["reasons"])
 
     def test_live_pid_map_skips_kernel_threads(self) -> None:
-        """Kernel threads omitted by the producer must not require snapshot records."""
+        """Identity-only kernel-thread records reconcile protected live PIDs."""
         self.h.put_scratch()
         self.h.mark_archived()
-        # Live kthread present in fake /proc but absent from snapshot (producer omits).
+        # Live kernel thread is emitted identity-only by the root producer.
         self.h.processes.append(
             {
                 "pid": 2,

@@ -2,8 +2,9 @@
 """Root-owned read-only process census for Paseo operator cleanup.
 
 Scans /proc without mutating processes. Emits a redacted JSON snapshot of
-current non-kernel processes and only those path references that fall under
-configured roots (cwd, exe, interpreter script, open fds).
+current processes and only those path references that fall under configured
+roots (cwd, exe, interpreter script, open fds). Kernel threads are emitted as
+identity-only records so unprivileged consumers can reconcile protected PIDs.
 
 Security contract (see docs/operator-fork.md):
 - Install as root-owned, not group/world-writable, typically at
@@ -474,14 +475,44 @@ def scan_process(
     """Scan one pid.
 
     Returns (record_or_None, error_or_None, incomplete).
-    None record means process exited / kernel thread (skip silently).
+    None record means the process exited (skip silently).
     incomplete True means still-existing process had a read/permission failure.
     """
     kthread = is_kernel_thread(proc_root, pid)
     if kthread is None:
         return None, None, False
     if kthread:
-        return None, None, False
+        try:
+            identity = read_stat_identity(proc_root, pid)
+        except (OSError, ValueError) as exc:
+            if not process_still_exists(proc_root, pid):
+                return None, None, False
+            error_class = (
+                error_class_for_oserror(exc)
+                if isinstance(exc, OSError)
+                else "read_error"
+            )
+            return (
+                {"pid": pid, "start_time_ticks": None, "error": error_class},
+                {"pid": pid, "start_time_ticks": None, "class": error_class},
+                True,
+            )
+        if identity is None:
+            return None, None, False
+        start_time_ticks, name = identity
+        return (
+            {
+                "pid": pid,
+                "start_time_ticks": start_time_ticks,
+                "uid": 0,
+                "name": name,
+                "scope_complete": True,
+                "references": [],
+                "kernel_thread": True,
+            },
+            None,
+            False,
+        )
 
     start_time_ticks: int | None = None
     name: str | None = None

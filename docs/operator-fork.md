@@ -187,8 +187,12 @@ immediately after every successful capture and consumers never see the snapshot.
 
 The helper walks `/proc` **without changing processes**. The snapshot includes
 `schema_version`, `boot_id`, `captured_at`, `roots`, `complete`, `errors`, and one
-record per current non-kernel process. Successful records carry `pid`, Linux
-`start_time_ticks`, `uid`, `name`, `scope_complete`, and `references`.
+record per current process. Successful userspace records carry `pid`, Linux
+`start_time_ticks`, `uid`, `name`, `scope_complete`, and `references`. Kernel
+threads are root-classified and emitted only as identity records with
+`kernel_thread=true`, `uid=0`, and an empty `references` list. This lets the
+unprivileged consumer match PID reuse without trying to read protected kernel
+thread links; it adds no path, argv, environment, or file-content disclosure.
 
 ### Redaction and path scope
 

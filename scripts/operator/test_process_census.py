@@ -270,7 +270,7 @@ class ProcessCensusTests(unittest.TestCase):
 
     # --- kernel threads ---
 
-    def test_kernel_threads_skipped(self) -> None:
+    def test_kernel_threads_are_identity_only(self) -> None:
         add_process(self.proc, 2, comm="kthreadd", start_time_ticks=1, kernel_thread=True)
         add_process(
             self.proc,
@@ -280,9 +280,21 @@ class ProcessCensusTests(unittest.TestCase):
             cwd=self.roots[0],
         )
         snap = self.snapshot()
-        pids = [p["pid"] for p in snap["processes"]]
-        self.assertEqual(pids, [400])
-        self.assertNotIn(2, pids)
+        by_pid = {p["pid"]: p for p in snap["processes"]}
+        self.assertEqual(sorted(by_pid), [2, 400])
+        self.assertEqual(
+            by_pid[2],
+            {
+                "pid": 2,
+                "start_time_ticks": 1,
+                "uid": 0,
+                "name": "kthreadd",
+                "scope_complete": True,
+                "references": [],
+                "kernel_thread": True,
+            },
+        )
+        self.assertNotIn("kernel_thread", by_pid[400])
 
     # --- exit races ---
 

@@ -2063,6 +2063,9 @@ test.each([
 
       const expectedScratch = join(runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME, agentId);
       const expectedArtifacts = join(runtimeRoot, AGENT_RUNTIME_ARTIFACTS_DIRNAME, agentId);
+      const scratchManifest = JSON.parse(
+        readFileSync(join(expectedScratch, AGENT_RUNTIME_MANIFEST_FILENAME), "utf8"),
+      ) as { generation: string; lifecycle: string };
 
       expect(client.createSessionCalls).toBe(1);
       expect(client.lastLaunchContext).toEqual({
@@ -2073,13 +2076,12 @@ test.each([
           TMP: expectedScratch,
           TEMP: expectedScratch,
           PASEO_AGENT_SCRATCH_DIR: expectedScratch,
+          PASEO_AGENT_SCRATCH_GENERATION: scratchManifest.generation,
           PASEO_AGENT_ARTIFACT_DIR: expectedArtifacts,
           PASEO_AGENT_ID: agentId,
         },
       });
-      expect(readFileSync(join(expectedScratch, AGENT_RUNTIME_MANIFEST_FILENAME), "utf8")).toMatch(
-        /"lifecycle": "active"/,
-      );
+      expect(scratchManifest.lifecycle).toBe("active");
       expect(
         readFileSync(join(expectedArtifacts, AGENT_RUNTIME_MANIFEST_FILENAME), "utf8"),
       ).toMatch(/"retention": "retained"/);
@@ -2194,11 +2196,13 @@ test("runtime storage preserves artifacts across relaunch generation rotation", 
 
     const first = client.lastLaunchContext?.env;
     expect(first?.PASEO_AGENT_SCRATCH_DIR).toBeTruthy();
+    expect(first?.PASEO_AGENT_SCRATCH_GENERATION).toBeTruthy();
     const artifactPath = join(first!.PASEO_AGENT_ARTIFACT_DIR!, "kept.bin");
     writeFileSync(artifactPath, "retain-me");
 
     const preparedFirst = await agentRuntimeStorage.prepare(agentId);
     expect(preparedFirst.lifecycle).toBe("active");
+    expect(first?.PASEO_AGENT_SCRATCH_GENERATION).toBe(preparedFirst.generation);
     await agentRuntimeStorage.markReleased({
       agentId,
       generation: preparedFirst.generation,
@@ -2213,11 +2217,136 @@ test("runtime storage preserves artifacts across relaunch generation rotation", 
     expect(second?.PASEO_AGENT_ARTIFACT_DIR).toBe(first?.PASEO_AGENT_ARTIFACT_DIR);
     expect(second?.PASEO_AGENT_SCRATCH_DIR).toBe(first?.PASEO_AGENT_SCRATCH_DIR);
     expect(second?.PASEO_AGENT_ID).toBe(agentId);
+    expect(second?.PASEO_AGENT_SCRATCH_GENERATION).toBeTruthy();
+    expect(second?.PASEO_AGENT_SCRATCH_GENERATION).not.toBe(first?.PASEO_AGENT_SCRATCH_GENERATION);
     expect(readFileSync(artifactPath, "utf8")).toBe("retain-me");
 
     const afterReload = await agentRuntimeStorage.prepare(agentId);
     expect(afterReload.lifecycle).toBe("active");
     expect(afterReload.generation).not.toBe(preparedFirst.generation);
+    expect(second?.PASEO_AGENT_SCRATCH_GENERATION).toBe(afterReload.generation);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+test("releaseAgentScratch is idempotent and does not archive or delete", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-release-scratch-"));
+  const runtimeRoot = mkdtempSync(join(tmpdir(), "agent-runtime-release-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const agentRuntimeStorage = new AgentRuntimeStorage({ runtimeRoot });
+  const agentId = "00000000-0000-4000-8000-000000000a05";
+  const client = new LaunchContextCaptureClient("codex");
+
+  try {
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      agentRuntimeStorage,
+      logger,
+      idFactory: () => agentId,
+    });
+
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const generation = client.lastLaunchContext?.env?.PASEO_AGENT_SCRATCH_GENERATION;
+    expect(generation).toBeTruthy();
+
+    const scratchDir = client.lastLaunchContext!.env!.PASEO_AGENT_SCRATCH_DIR!;
+    const artifactsDir = client.lastLaunchContext!.env!.PASEO_AGENT_ARTIFACT_DIR!;
+    const scratchMarker = join(scratchDir, "work.tmp");
+    const artifactMarker = join(artifactsDir, "kept.bin");
+    writeFileSync(scratchMarker, "scratch-bytes");
+    writeFileSync(artifactMarker, "artifact-bytes");
+
+    const first = await manager.releaseAgentScratch({ agentId, generation: generation! });
+    expect(first).toEqual({
+      agentId,
+      generation,
+      lifecycle: "released",
+      releasedAt: first.releasedAt,
+    });
+    expect(typeof first.releasedAt).toBe("string");
+
+    const second = await manager.releaseAgentScratch({ agentId, generation: generation! });
+    expect(second).toEqual(first);
+
+    // Wrong generation fails and leaves the released state unchanged.
+    await expect(
+      manager.releaseAgentScratch({ agentId, generation: randomUUID() }),
+    ).rejects.toThrow(/generation mismatch/);
+
+    // Malformed agent id fails.
+    await expect(
+      manager.releaseAgentScratch({ agentId: "not-a-uuid", generation: generation! }),
+    ).rejects.toThrow(/agentId must be a UUID/);
+
+    // No archive/close/delete side effects.
+    expect(snapshot.archivedAt).toBeUndefined();
+    expect(manager.getAgent(agentId)?.archivedAt).toBeUndefined();
+    expect(manager.getAgent(agentId)?.lastStatus).not.toBe("closed");
+    expect(readFileSync(scratchMarker, "utf8")).toBe("scratch-bytes");
+    expect(readFileSync(artifactMarker, "utf8")).toBe("artifact-bytes");
+    expect(readFileSync(join(scratchDir, AGENT_RUNTIME_MANIFEST_FILENAME), "utf8")).toMatch(
+      /"lifecycle": "released"/,
+    );
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+test("releaseAgentScratch fails when runtime storage is unconfigured", async () => {
+  const manager = new AgentManager({
+    clients: { codex: new LaunchContextCaptureClient("codex") },
+    logger,
+  });
+
+  await expect(
+    manager.releaseAgentScratch({
+      agentId: "00000000-0000-4000-8000-000000000a06",
+      generation: randomUUID(),
+    }),
+  ).rejects.toThrow(/Agent runtime storage is not configured/);
+});
+
+test("archiveAgent does not release agent scratch", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-no-release-"));
+  const runtimeRoot = mkdtempSync(join(tmpdir(), "agent-runtime-archive-no-release-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const agentRuntimeStorage = new AgentRuntimeStorage({ runtimeRoot });
+  const agentId = "00000000-0000-4000-8000-000000000a07";
+  const client = new LaunchContextCaptureClient("codex");
+
+  try {
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      agentRuntimeStorage,
+      logger,
+      idFactory: () => agentId,
+    });
+
+    await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const generation = client.lastLaunchContext?.env?.PASEO_AGENT_SCRATCH_GENERATION;
+    expect(generation).toBeTruthy();
+
+    await manager.archiveAgent(agentId);
+
+    const scratchManifest = JSON.parse(
+      readFileSync(
+        join(runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME, agentId, AGENT_RUNTIME_MANIFEST_FILENAME),
+        "utf8",
+      ),
+    ) as { lifecycle: string; generation: string };
+    expect(scratchManifest.lifecycle).toBe("active");
+    expect(scratchManifest.generation).toBe(generation);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
     rmSync(runtimeRoot, { recursive: true, force: true });

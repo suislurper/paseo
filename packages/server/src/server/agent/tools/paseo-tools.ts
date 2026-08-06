@@ -1660,6 +1660,46 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   );
 
   registerTool(
+    "release_agent_scratch",
+    {
+      title: "Release agent scratch",
+      description:
+        "Mark a prepared agent scratch generation released (receipt only). Requires exact agentId + generation. Does not archive the agent, close the runtime, or delete files. In an agent-scoped session you may only release your own agent ID.",
+      inputSchema: {
+        agentId: z.string().describe("Exact agent ID whose scratch generation to release."),
+        generation: z
+          .string()
+          .describe("Exact scratch generation UUID (from PASEO_AGENT_SCRATCH_GENERATION)."),
+      },
+      outputSchema: {
+        agentId: z.string(),
+        generation: z.string(),
+        lifecycle: z.literal("released"),
+        releasedAt: z.string(),
+      },
+    },
+    async ({ agentId, generation }) => {
+      // Agent-scoped sessions may only release their own agent. Global/operator
+      // sessions (no callerAgentId) pass the explicit agentId — do not invent an owner.
+      if (callerAgentId !== undefined && agentId !== callerAgentId) {
+        throw new Error(
+          `release_agent_scratch: agent-scoped session may only release its own agent (caller ${callerAgentId}, requested ${agentId})`,
+        );
+      }
+      const receipt = await agentManager.releaseAgentScratch({ agentId, generation });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          agentId: receipt.agentId,
+          generation: receipt.generation,
+          lifecycle: receipt.lifecycle,
+          releasedAt: receipt.releasedAt,
+        }),
+      };
+    },
+  );
+
+  registerTool(
     "kill_agent",
     {
       title: "Kill agent",

@@ -50,6 +50,14 @@ export interface AgentRuntimeLaunchPaths {
   lifecycle: AgentRuntimeLifecycleState;
 }
 
+/** Exact-generation scratch release receipt. Never implies deletion or archive. */
+export interface AgentScratchReleaseReceipt {
+  agentId: string;
+  generation: string;
+  lifecycle: "released";
+  releasedAt: string;
+}
+
 export interface AgentRuntimeStorageOptions {
   runtimeRoot: string;
 }
@@ -157,7 +165,7 @@ export class AgentRuntimeStorage {
   async markReleased(params: {
     agentId: string;
     generation: string;
-  }): Promise<AgentRuntimeLaunchPaths> {
+  }): Promise<AgentScratchReleaseReceipt & AgentRuntimeLaunchPaths> {
     const validatedAgentId = validateAgentId(params.agentId, "markReleased");
     const validatedGeneration = validateGeneration(params.generation, "markReleased");
     const paths = this.derivePaths(validatedAgentId);
@@ -195,6 +203,11 @@ export class AgentRuntimeStorage {
       await this.writeScratchManifestAtomic(paths.scratchManifestPath, nextManifest);
     }
 
+    const releasedAt = nextManifest.releasedAt;
+    if (!releasedAt) {
+      throw new AgentRuntimeStorageError("markReleased: released manifest missing releasedAt");
+    }
+
     return {
       agentId: validatedAgentId,
       generation: nextManifest.generation,
@@ -203,6 +216,7 @@ export class AgentRuntimeStorage {
       scratchManifestPath: paths.scratchManifestPath,
       artifactsManifestPath: paths.artifactsManifestPath,
       lifecycle: "released",
+      releasedAt,
     };
   }
 

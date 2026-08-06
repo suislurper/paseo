@@ -155,3 +155,13 @@ Each agent is a single JSON file. Fields relevant to this doc:
 | `lastStatus`                      | `AgentStatus` | `initializing` / `idle` / `running` / `error` / `closed`                                     |
 
 See [`docs/data-model.md`](./data-model.md) for the full agent record.
+
+## Runtime scratch release
+
+When `agents.runtimeRoot` is configured, every launch path prepares per-agent scratch/artifacts and injects `PASEO_AGENT_SCRATCH_DIR`, `PASEO_AGENT_SCRATCH_GENERATION`, and related env from the common launch context (caller overrides lose). Scratch lifecycle is independent of agent archive:
+
+- **Release** is an explicit receipt: `AgentManager.releaseAgentScratch` / MCP `release_agent_scratch` with exact `agentId` + `generation`. It returns `{ agentId, generation, lifecycle: "released", releasedAt }` and is idempotent for the same pair.
+- Release does **not** archive the agent, close the runtime, or delete files. Archive and tab close do **not** release scratch.
+- Wrong generation, unconfigured storage, or agent-scoped caller mismatch fail closed and change nothing.
+
+Deletion/cleanup of released generations is a separate surface and is not part of this lifecycle gesture.

@@ -262,6 +262,9 @@ describe("AgentRuntimeStorage", () => {
       generation: prepared.generation,
     });
     expect(released.lifecycle).toBe("released");
+    expect(typeof released.releasedAt).toBe("string");
+    expect(released.agentId).toBe(agentId);
+    expect(released.generation).toBe(prepared.generation);
 
     const scratchAfterFirst = readJson(prepared.scratchManifestPath) as {
       lifecycle: string;
@@ -269,14 +272,14 @@ describe("AgentRuntimeStorage", () => {
       generation: string;
     };
     expect(scratchAfterFirst.lifecycle).toBe("released");
-    expect(typeof scratchAfterFirst.releasedAt).toBe("string");
-    const firstReleasedAt = scratchAfterFirst.releasedAt;
+    expect(scratchAfterFirst.releasedAt).toBe(released.releasedAt);
+    const firstReleasedAt = released.releasedAt;
 
     const releasedAgain = await storage.markReleased({
       agentId,
       generation: prepared.generation,
     });
-    expect(releasedAgain.lifecycle).toBe("released");
+    expect(releasedAgain).toEqual(released);
 
     const scratchAfterSecond = readJson(prepared.scratchManifestPath) as {
       lifecycle: string;

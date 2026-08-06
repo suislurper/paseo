@@ -44,7 +44,7 @@ import {
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
-import type { AgentRuntimeStorage } from "./agent-runtime-storage.js";
+import type { AgentRuntimeStorage, AgentScratchReleaseReceipt } from "./agent-runtime-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -1417,6 +1417,30 @@ export class AgentManager {
     } finally {
       this.endAgentSessionTransition(agentId, transition);
     }
+  }
+
+  /**
+   * Mark a prepared scratch generation released. Requires exact agent ID + generation.
+   * Idempotent for the same pair. Never archives the agent, closes a runtime, or deletes files.
+   * Archive/tab close alone do not call this — release is always explicit.
+   */
+  async releaseAgentScratch(params: {
+    agentId: string;
+    generation: string;
+  }): Promise<AgentScratchReleaseReceipt> {
+    if (!this.agentRuntimeStorage) {
+      throw new Error("Agent runtime storage is not configured");
+    }
+    const released = await this.agentRuntimeStorage.markReleased({
+      agentId: params.agentId,
+      generation: params.generation,
+    });
+    return {
+      agentId: released.agentId,
+      generation: released.generation,
+      lifecycle: "released",
+      releasedAt: released.releasedAt,
+    };
   }
 
   // Children created via the MCP `create_agent` tool carry the parent-agent-id
@@ -4158,6 +4182,7 @@ export class AgentManager {
       launchEnv.TMP = runtimePaths.scratchDir;
       launchEnv.TEMP = runtimePaths.scratchDir;
       launchEnv.PASEO_AGENT_SCRATCH_DIR = runtimePaths.scratchDir;
+      launchEnv.PASEO_AGENT_SCRATCH_GENERATION = runtimePaths.generation;
       launchEnv.PASEO_AGENT_ARTIFACT_DIR = runtimePaths.artifactsDir;
       launchEnv.PASEO_AGENT_ID = agentId;
     }

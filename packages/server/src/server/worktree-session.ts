@@ -77,6 +77,7 @@ type AgentWorktreeSetupTimelineWriter = (input: {
 interface BuildAgentSessionConfigDependencies {
   paseoHome?: string;
   worktreesRoot?: string;
+  worktreesMinimumFreeBytes?: number;
   sessionLogger: Logger;
   workspaceGitService?: WorkspaceGitService;
   createPaseoWorktree: (
@@ -97,6 +98,7 @@ interface BuildAgentSessionConfigDependencies {
 interface CreatePaseoWorktreeInBackgroundDependencies {
   paseoHome?: string;
   worktreesRoot?: string;
+  worktreesMinimumFreeBytes?: number;
   emitWorkspaceUpdateForWorkspaceId: (workspaceId: string) => Promise<void>;
   cacheWorkspaceSetupSnapshot: (workspaceId: string, snapshot: WorkspaceSetupSnapshot) => void;
   emit: EmitSessionMessage;
@@ -162,6 +164,7 @@ interface HandleWorkspaceSetupStatusRequestDependencies {
 interface HandleCreatePaseoWorktreeRequestDependencies {
   paseoHome?: string;
   worktreesRoot?: string;
+  worktreesMinimumFreeBytes?: number;
   describeWorkspaceRecord: (
     result: CreatePaseoWorktreeResult,
   ) => Promise<WorkspaceDescriptorPayload>;
@@ -232,6 +235,7 @@ export async function buildAgentSessionConfig(
         runSetup: false,
         paseoHome: dependencies.paseoHome,
         worktreesRoot: dependencies.worktreesRoot,
+        minimumFreeBytes: dependencies.worktreesMinimumFreeBytes,
       },
       {
         resolveDefaultBranch: normalized.baseBranch
@@ -513,6 +517,7 @@ export async function handleCreatePaseoWorktreeRequest(
       {
         paseoHome: dependencies.paseoHome,
         worktreesRoot: dependencies.worktreesRoot,
+        worktreesMinimumFreeBytes: dependencies.worktreesMinimumFreeBytes,
         createPaseoWorktreeWorkflow: dependencies.createPaseoWorktreeWorkflow,
       },
       {
@@ -596,6 +601,7 @@ export async function createPaseoWorktreeWorkflow(
       runSetup: false,
       paseoHome: input.paseoHome ?? dependencies.paseoHome,
       worktreesRoot: input.worktreesRoot ?? dependencies.worktreesRoot,
+      minimumFreeBytes: input.minimumFreeBytes ?? dependencies.worktreesMinimumFreeBytes,
     },
     options?.resolveDefaultBranch
       ? { resolveDefaultBranch: options.resolveDefaultBranch }

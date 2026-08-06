@@ -16,6 +16,41 @@ The fork carries required behavior that is not optional during upstream updates:
 - Paseo-owned worktree archive cleanup and live chat synchronization
 - workspace-sidebar landed-to-default status, refreshed against the remote default branch
 - fail-closed archive checks that distinguish landed work from unpushed or unknown work
+- optional fail-closed free-space admission for **new** Paseo worktree creation only
+
+## Worktree free-space admission
+
+New worktree creation can require a minimum free-space floor so the host does not fill a
+disk by admitting another worktree. This is operator-config only; there is no hardcoded
+product default.
+
+Config (`$PASEO_HOME/config.json`):
+
+```json
+{
+  "worktrees": {
+    "root": "/mnt/data/paseo-runtime/worktrees",
+    "minimumFreeBytes": 68719476736
+  }
+}
+```
+
+- `minimumFreeBytes` is an optional nonnegative safe integer (bytes). Unset keeps upstream
+  behavior (no free-space check).
+- The guard runs only at the shared `createWorktreeCore` boundary used by explicit new
+  worktree creation (`create_paseo_worktree`, create-agent-with-worktree, MCP
+  `create_worktree`, schedules that create worktrees). It does **not** gate restore,
+  recovery, archive, stop/close, or reuse of an already-registered worktree.
+- Before any directory/Git/registry mutation for a **new** create, the daemon `statfs`s the
+  filesystem that will hold the resolved Paseo worktrees root. If that root does not exist
+  yet, it walks only to the nearest existing ancestor (nothing is created for the probe).
+- Available bytes **≥** `minimumFreeBytes` pass (equality passes). Below the floor throws a
+  typed error carrying available bytes, required bytes, and the checked path.
+- If the guard is configured and the path cannot be resolved or `statfs` fails, creation
+  fails closed before mutation.
+
+Example operator floor for this machine: `68719476736` (64 GiB). Set it in config when
+ready; do not bake it into product code.
 
 ## Build invariant
 

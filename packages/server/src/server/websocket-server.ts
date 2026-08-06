@@ -468,6 +468,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly downloadTokenStore: DownloadTokenStore;
   private readonly paseoHome: string;
   private readonly worktreesRoot: string | undefined;
+  private readonly worktreesMinimumFreeBytes: number | undefined;
   private readonly daemonConfigStore: DaemonConfigStore;
   private readonly pushTokenStore: PushTokenStore;
   private readonly pushNotificationSender: PushNotificationSender;
@@ -579,6 +580,7 @@ export class VoiceAssistantWebSocketServer {
     this.downloadTokenStore = downloadTokenStore;
     this.paseoHome = paseoHome;
     this.worktreesRoot = daemonRuntimeConfig?.worktreesRoot;
+    this.worktreesMinimumFreeBytes = daemonRuntimeConfig?.worktreesMinimumFreeBytes;
     this.daemonConfigStore = daemonConfigStore;
     this.mcpBaseUrl = mcpBaseUrl;
     this.assignOptionalServices({
@@ -1161,6 +1163,7 @@ export class VoiceAssistantWebSocketServer {
       pushTokenStore: this.pushTokenStore,
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
+      worktreesMinimumFreeBytes: this.worktreesMinimumFreeBytes,
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
       projectRegistry: this.projectRegistry,

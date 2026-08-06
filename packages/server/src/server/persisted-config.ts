@@ -74,9 +74,23 @@ const ProvidersSchema = z
   })
   .strict();
 
+const NonNegativeSafeIntegerSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .refine((value) => Number.isSafeInteger(value), {
+    message: "must be a nonnegative safe integer",
+  });
+
 const WorktreesConfigSchema = z
   .object({
     root: z.string().min(1).optional(),
+    /**
+     * Optional fail-closed free-space floor for new Paseo worktree creation only.
+     * Unset preserves upstream behavior (no free-space admission check).
+     * Does not affect existing worktrees, recovery, archive, or non-create paths.
+     */
+    minimumFreeBytes: NonNegativeSafeIntegerSchema.optional(),
   })
   .strict();
 

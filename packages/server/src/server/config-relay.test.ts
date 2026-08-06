@@ -224,4 +224,18 @@ describe("daemon worktree root config", () => {
       path.join(os.tmpdir(), "paseo-custom-worktrees"),
     );
   });
+
+  test("leaves worktreesMinimumFreeBytes unset by default", async () => {
+    const home = await createPaseoHome({ version: 1 });
+    expect(loadConfig(home, { env: {} }).worktreesMinimumFreeBytes).toBeUndefined();
+  });
+
+  test("loads worktrees.minimumFreeBytes into daemon config", async () => {
+    const home = await createPaseoHome({
+      version: 1,
+      worktrees: { minimumFreeBytes: 68_719_476_736 },
+    });
+
+    expect(loadConfig(home, { env: {} }).worktreesMinimumFreeBytes).toBe(68_719_476_736);
+  });
 });

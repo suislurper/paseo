@@ -411,6 +411,13 @@ function resolveWorktreesRoot(
     : path.resolve(paseoHome, expandedRoot);
 }
 
+function resolveWorktreesMinimumFreeBytes(
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): number | undefined {
+  // Optional; unset means no free-space admission guard (upstream behavior).
+  return persisted.worktrees?.minimumFreeBytes;
+}
+
 function resolveAppendSystemPrompt(persisted: ReturnType<typeof loadPersistedConfig>): string {
   return persisted.daemon?.appendSystemPrompt ?? "";
 }
@@ -490,6 +497,8 @@ export function loadConfig(
     paseoHome,
     desktopManaged: env.PASEO_DESKTOP_MANAGED === "1",
     worktreesRoot: resolveWorktreesRoot(paseoHome, persisted),
+    // Optional; unset means no free-space admission guard on new worktree create.
+    worktreesMinimumFreeBytes: resolveWorktreesMinimumFreeBytes(persisted),
     // Optional; unset means no AgentRuntimeStorage construction in bootstrap.
     agentRuntimeRoot: persisted.agents?.runtimeRoot,
     corsAllowedOrigins: resolveCorsAllowedOrigins(env, persisted),

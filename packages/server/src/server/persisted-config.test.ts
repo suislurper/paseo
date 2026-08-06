@@ -125,6 +125,69 @@ describe("PersistedConfigSchema worktrees config", () => {
 
     expect(parsed.worktrees?.root).toBe("/mnt/fast/paseo-worktrees");
   });
+
+  test("leaves minimumFreeBytes unset by default for upstream compatibility", () => {
+    const parsed = PersistedConfigSchema.parse({
+      version: 1,
+    });
+
+    expect(parsed.worktrees?.minimumFreeBytes).toBeUndefined();
+  });
+
+  test("accepts optional nonnegative minimumFreeBytes", () => {
+    const parsed = PersistedConfigSchema.parse({
+      worktrees: {
+        minimumFreeBytes: 68_719_476_736,
+      },
+    });
+
+    expect(parsed.worktrees?.minimumFreeBytes).toBe(68_719_476_736);
+  });
+
+  test("accepts zero minimumFreeBytes", () => {
+    const parsed = PersistedConfigSchema.parse({
+      worktrees: {
+        minimumFreeBytes: 0,
+      },
+    });
+
+    expect(parsed.worktrees?.minimumFreeBytes).toBe(0);
+  });
+
+  test("rejects negative minimumFreeBytes", () => {
+    const result = PersistedConfigSchema.safeParse({
+      worktrees: {
+        minimumFreeBytes: -1,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some((issue) => issue.path.join(".") === "worktrees.minimumFreeBytes"),
+      ).toBe(true);
+    }
+  });
+
+  test("rejects non-integer minimumFreeBytes", () => {
+    const result = PersistedConfigSchema.safeParse({
+      worktrees: {
+        minimumFreeBytes: 1.5,
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  test("rejects non-safe-integer minimumFreeBytes", () => {
+    const result = PersistedConfigSchema.safeParse({
+      worktrees: {
+        minimumFreeBytes: Number.MAX_SAFE_INTEGER + 1,
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
 });
 
 describe("PersistedConfigSchema agents.runtimeRoot", () => {

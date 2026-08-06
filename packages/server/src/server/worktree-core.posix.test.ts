@@ -25,8 +25,15 @@ import {
   readPaseoWorktreeMetadata,
 } from "../utils/worktree-metadata.js";
 import { UnknownBranchError } from "../utils/worktree.js";
-import { createWorktreeCore as createCoreWorktree } from "./worktree-core.js";
+import {
+  assertWorktreeCreateFreeSpace,
+  createWorktreeCore as createCoreWorktree,
+  InsufficientWorktreeFreeSpaceError,
+  resolveNearestExistingAncestorPath,
+  WorktreeFreeSpaceProbeError,
+} from "./worktree-core.js";
 import { isPlatform } from "../test-utils/platform.js";
+import { resolvePaseoWorktreesBaseRoot } from "../utils/worktree.js";
 
 function createGitHubServiceStub(): ForgeService {
   return {
@@ -1476,6 +1483,258 @@ describe.skipIf(isPlatform("win32"))("worktree-core POSIX-only", () => {
         trackOriginHead: true,
       });
       expect(result.worktree.branchName).toBe("feature/from-service");
+    });
+
+    test("unset minimumFreeBytes preserves createWorktreeCore creation", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+
+      const result = await createCoreWorktree(
+        {
+          cwd: repoDir,
+          worktreeSlug: "no-free-space-guard",
+          paseoHome,
+          runSetup: false,
+        },
+        createCoreDeps(),
+      );
+
+      expect(result.created).toBe(true);
+      expect(existsSync(result.worktree.worktreePath)).toBe(true);
+    });
+
+    test("refuses create when free space is below minimumFreeBytes and does not mutate", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+      const worktreesRoot = path.join(tempDir, "worktrees");
+      const createCalls: unknown[] = [];
+      const checkedPaths: string[] = [];
+
+      await expect(
+        createCoreWorktree(
+          {
+            cwd: repoDir,
+            worktreeSlug: "below-free-space",
+            paseoHome,
+            worktreesRoot,
+            minimumFreeBytes: 10_000,
+            runSetup: false,
+          },
+          {
+            ...createCoreDeps(),
+            getAvailableBytes: async (checkedPath) => {
+              checkedPaths.push(checkedPath);
+              return 9_999;
+            },
+            createWorktree: async (args) => {
+              createCalls.push(args);
+              throw new Error(
+                "createWorktree must not be called when free-space admission refuses",
+              );
+            },
+          },
+        ),
+      ).rejects.toBeInstanceOf(InsufficientWorktreeFreeSpaceError);
+
+      expect(createCalls).toEqual([]);
+      expect(checkedPaths).toEqual([tempDir]);
+      expect(existsSync(path.join(worktreesRoot))).toBe(false);
+    });
+
+    test("allows create when free space equals minimumFreeBytes", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+
+      const result = await createCoreWorktree(
+        {
+          cwd: repoDir,
+          worktreeSlug: "equal-free-space",
+          paseoHome,
+          minimumFreeBytes: 4_096,
+          runSetup: false,
+        },
+        {
+          ...createCoreDeps(),
+          getAvailableBytes: async () => 4_096,
+        },
+      );
+
+      expect(result.created).toBe(true);
+      expect(existsSync(result.worktree.worktreePath)).toBe(true);
+    });
+
+    test("allows create when free space is above minimumFreeBytes", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+
+      const result = await createCoreWorktree(
+        {
+          cwd: repoDir,
+          worktreeSlug: "above-free-space",
+          paseoHome,
+          minimumFreeBytes: 4_096,
+          runSetup: false,
+        },
+        {
+          ...createCoreDeps(),
+          getAvailableBytes: async () => 8_192,
+        },
+      );
+
+      expect(result.created).toBe(true);
+      expect(existsSync(result.worktree.worktreePath)).toBe(true);
+    });
+
+    test("stats nearest existing ancestor when worktrees root does not exist", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+      const worktreesRoot = path.join(tempDir, "missing", "nested", "worktrees");
+      const checkedPaths: string[] = [];
+
+      await expect(
+        createCoreWorktree(
+          {
+            cwd: repoDir,
+            worktreeSlug: "ancestor-check",
+            paseoHome,
+            worktreesRoot,
+            minimumFreeBytes: 100,
+            runSetup: false,
+          },
+          {
+            ...createCoreDeps(),
+            getAvailableBytes: async (checkedPath) => {
+              checkedPaths.push(checkedPath);
+              return 50;
+            },
+            createWorktree: async () => {
+              throw new Error("createWorktree must not run after free-space refusal");
+            },
+          },
+        ),
+      ).rejects.toMatchObject({
+        name: "InsufficientWorktreeFreeSpaceError",
+        availableBytes: 50,
+        requiredBytes: 100,
+        checkedPath: tempDir,
+      });
+
+      expect(checkedPaths).toEqual([tempDir]);
+      expect(existsSync(path.join(tempDir, "missing"))).toBe(false);
+    });
+
+    test("fails closed when free-space probe throws while configured", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+      const createCalls: unknown[] = [];
+
+      await expect(
+        createCoreWorktree(
+          {
+            cwd: repoDir,
+            worktreeSlug: "stat-failure",
+            paseoHome,
+            minimumFreeBytes: 1,
+            runSetup: false,
+          },
+          {
+            ...createCoreDeps(),
+            getAvailableBytes: async () => {
+              throw new Error("statfs unavailable");
+            },
+            createWorktree: async (args) => {
+              createCalls.push(args);
+              throw new Error("createWorktree must not be called on probe failure");
+            },
+          },
+        ),
+      ).rejects.toBeInstanceOf(WorktreeFreeSpaceProbeError);
+
+      expect(createCalls).toEqual([]);
+    });
+
+    test("does not apply free-space guard when reusing an existing worktree", async () => {
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      cleanupPaths.push(tempDir);
+      const deps = createCoreDeps();
+      const first = await createCoreWorktree(
+        { cwd: repoDir, worktreeSlug: "reuse-free-space", paseoHome, runSetup: false },
+        deps,
+      );
+
+      const probeCalls: string[] = [];
+      const second = await createCoreWorktree(
+        {
+          cwd: repoDir,
+          worktreeSlug: "reuse-free-space",
+          paseoHome,
+          minimumFreeBytes: Number.MAX_SAFE_INTEGER,
+          runSetup: false,
+        },
+        {
+          ...deps,
+          getAvailableBytes: async (checkedPath) => {
+            probeCalls.push(checkedPath);
+            return 0;
+          },
+          createWorktree: async () => {
+            throw new Error("createWorktree must not run on reuse");
+          },
+        },
+      );
+
+      expect(first.created).toBe(true);
+      expect(second.created).toBe(false);
+      expect(second.worktree).toEqual(first.worktree);
+      expect(probeCalls).toEqual([]);
+    });
+  });
+
+  describe("assertWorktreeCreateFreeSpace", () => {
+    test("no-ops when minimumFreeBytes is unset", async () => {
+      await expect(
+        assertWorktreeCreateFreeSpace({
+          getAvailableBytes: async () => {
+            throw new Error("probe must not run when guard is unset");
+          },
+        }),
+      ).resolves.toBeUndefined();
+    });
+
+    test("includes available, required, and checked path on refusal", async () => {
+      const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "worktree-free-space-")));
+      try {
+        const worktreesRoot = path.join(tempDir, "worktrees");
+        await expect(
+          assertWorktreeCreateFreeSpace({
+            minimumFreeBytes: 1_000,
+            worktreesRoot,
+            getAvailableBytes: async () => 500,
+          }),
+        ).rejects.toEqual(
+          expect.objectContaining({
+            name: "InsufficientWorktreeFreeSpaceError",
+            availableBytes: 500,
+            requiredBytes: 1_000,
+            checkedPath: tempDir,
+          }),
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    test("resolveNearestExistingAncestorPath walks only existing ancestors", () => {
+      const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "worktree-ancestor-")));
+      try {
+        const missing = path.join(tempDir, "a", "b", "c");
+        expect(resolveNearestExistingAncestorPath(missing)).toBe(tempDir);
+        expect(existsSync(path.join(tempDir, "a"))).toBe(false);
+        expect(resolveNearestExistingAncestorPath(tempDir)).toBe(tempDir);
+        expect(resolvePaseoWorktreesBaseRoot({ worktreesRoot: missing })).toBe(missing);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     });
   });
 });

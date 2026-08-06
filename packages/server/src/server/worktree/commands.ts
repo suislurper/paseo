@@ -42,6 +42,7 @@ export interface CreatePaseoWorktreeCommandDependencies<
 > {
   paseoHome?: string;
   worktreesRoot?: string;
+  worktreesMinimumFreeBytes?: number;
   createPaseoWorktreeWorkflow?: CreatePaseoWorktreeWorkflow<Result>;
 }
 
@@ -51,6 +52,7 @@ export type CreatePaseoWorktreeCommandInput = Omit<
 > & {
   paseoHome?: string;
   worktreesRoot?: string;
+  minimumFreeBytes?: number;
 };
 
 export type CreatePaseoWorktreeCommandResult<Result extends CreatePaseoWorktreeResult> =
@@ -78,6 +80,7 @@ export async function createPaseoWorktreeCommand<Result extends CreatePaseoWorkt
       runSetup: false,
       paseoHome: input.paseoHome ?? dependencies.paseoHome,
       worktreesRoot: input.worktreesRoot ?? dependencies.worktreesRoot,
+      minimumFreeBytes: input.minimumFreeBytes ?? dependencies.worktreesMinimumFreeBytes,
     });
     return { ok: true, createdWorktree };
   } catch (error) {

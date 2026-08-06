@@ -386,6 +386,11 @@ export interface PaseoDaemonConfig {
   daemonVersion?: string;
   desktopManaged?: boolean;
   worktreesRoot?: string;
+  /**
+   * Optional free-space floor (bytes) for new Paseo worktree creation only.
+   * Unset keeps upstream behavior (no admission check).
+   */
+  worktreesMinimumFreeBytes?: number;
   corsAllowedOrigins: string[];
   allowedHosts?: HostnamesConfig;
   hostnames?: HostnamesConfig;
@@ -1003,6 +1008,7 @@ export async function createPaseoDaemon(
       {
         paseoHome: config.paseoHome,
         worktreesRoot: config.worktreesRoot,
+        worktreesMinimumFreeBytes: config.worktreesMinimumFreeBytes,
         createPaseoWorktree: async (workflowInput, workflowOptions) => {
           return createRegisteredPaseoWorktree(workflowInput, {
             github,
@@ -1488,6 +1494,7 @@ export async function createPaseoDaemon(
               {
                 listen: formatListenTarget(boundListenTarget ?? listenTarget),
                 worktreesRoot: config.worktreesRoot,
+                worktreesMinimumFreeBytes: config.worktreesMinimumFreeBytes,
                 appBaseUrl: config.appBaseUrl,
                 desktopManaged: config.desktopManaged === true,
                 relay: {

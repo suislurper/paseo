@@ -15,6 +15,8 @@ import type { HubRelationshipManagement } from "../../hub/relationship-controlle
 export interface DaemonRuntimeConfig {
   listen: string | null;
   worktreesRoot?: string;
+  /** Optional free-space floor for new worktree creation only. */
+  worktreesMinimumFreeBytes?: number;
   appBaseUrl?: string;
   desktopManaged?: boolean;
   relay: {

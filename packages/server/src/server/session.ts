@@ -399,6 +399,7 @@ export interface SessionOptions {
   pushTokenStore: PushTokenStore;
   paseoHome: string;
   worktreesRoot?: string;
+  worktreesMinimumFreeBytes?: number;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
   projectRegistry: ProjectRegistry;
@@ -562,6 +563,7 @@ export class Session {
   private readonly sessionLogger: pino.Logger;
   private readonly paseoHome: string;
   private readonly worktreesRoot: string | undefined;
+  private readonly worktreesMinimumFreeBytes: number | undefined;
 
   private agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
@@ -636,6 +638,7 @@ export class Session {
       pushTokenStore,
       paseoHome,
       worktreesRoot,
+      worktreesMinimumFreeBytes,
       agentManager,
       agentStorage,
       projectRegistry,
@@ -686,6 +689,7 @@ export class Session {
     this.pushTokenStore = pushTokenStore;
     this.paseoHome = paseoHome;
     this.worktreesRoot = worktreesRoot;
+    this.worktreesMinimumFreeBytes = worktreesMinimumFreeBytes;
     this.sessionLogger = logger.child({
       module: "session",
       clientId: this.clientId,
@@ -3249,6 +3253,7 @@ export class Session {
       {
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
+        worktreesMinimumFreeBytes: this.worktreesMinimumFreeBytes,
         sessionLogger: this.sessionLogger,
         workspaceGitService: this.workspaceGitService,
         createPaseoWorktree: (input, serviceOptions) =>
@@ -5344,6 +5349,7 @@ export class Session {
       {
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
+        worktreesMinimumFreeBytes: this.worktreesMinimumFreeBytes,
         describeWorkspaceRecord: (result) => this.describeCreatedWorktreeWorkspace(result),
         emit: (message) => this.emit(message),
         sessionLogger: this.sessionLogger,
@@ -5364,6 +5370,7 @@ export class Session {
       {
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
+        worktreesMinimumFreeBytes: this.worktreesMinimumFreeBytes,
         createPaseoWorktree: (workflowInput, serviceOptions) =>
           this.createPaseoWorktree(workflowInput, serviceOptions),
         warmWorkspaceGitData: (workspace) => this.warmWorkspaceGitDataForWorkspace(workspace),

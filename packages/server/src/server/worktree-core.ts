@@ -1,9 +1,13 @@
+import { existsSync } from "node:fs";
+import { statfs } from "node:fs/promises";
+import path from "node:path";
 import { createNameId } from "mnemonic-id";
 
 import type { ForgeService } from "../services/forge-service.js";
 import {
   createWorktree,
   resolveExistingWorktreeForSlug,
+  resolvePaseoWorktreesBaseRoot,
   slugify,
   validateBranchSlug,
   type WorktreeConfig,
@@ -28,6 +32,11 @@ export interface CreateWorktreeCoreInput {
   firstAgentContext?: FirstAgentContext;
   paseoHome?: string;
   worktreesRoot?: string;
+  /**
+   * Optional free-space floor for new worktree creation only.
+   * Unset skips the admission guard (upstream behavior). Equality passes.
+   */
+  minimumFreeBytes?: number;
   runSetup?: boolean;
 }
 
@@ -38,6 +47,16 @@ export interface CreateWorktreeCoreDeps {
     "resolveRepoRoot" | "resolveDefaultBranch" | "resolveForge"
   >;
   resolveDefaultBranch?: (repoRoot: string) => Promise<string>;
+  /**
+   * Optional free-space probe (bytes available on the checked path).
+   * Tests inject this; production uses Node `statfs`.
+   */
+  getAvailableBytes?: (checkedPath: string) => Promise<number>;
+  /**
+   * Optional create primitive override for tests that assert no mutation on refusal.
+   * Defaults to the real `createWorktree` helper.
+   */
+  createWorktree?: typeof createWorktree;
 }
 
 export interface CreateWorktreeCoreResult {
@@ -45,6 +64,139 @@ export interface CreateWorktreeCoreResult {
   intent: WorktreeCreationIntent;
   repoRoot: string;
   created: boolean;
+}
+
+/**
+ * Fail-closed free-space admission failure for new worktree creation.
+ * Includes measured available bytes, the configured floor, and the path that was checked
+ * (worktrees root or its nearest existing ancestor).
+ */
+export class InsufficientWorktreeFreeSpaceError extends Error {
+  readonly availableBytes: number;
+  readonly requiredBytes: number;
+  readonly checkedPath: string;
+
+  constructor(params: { availableBytes: number; requiredBytes: number; checkedPath: string }) {
+    super(
+      `Refusing to create worktree: only ${params.availableBytes} free bytes at ${params.checkedPath}; need at least ${params.requiredBytes} free bytes`,
+    );
+    this.name = "InsufficientWorktreeFreeSpaceError";
+    this.availableBytes = params.availableBytes;
+    this.requiredBytes = params.requiredBytes;
+    this.checkedPath = params.checkedPath;
+  }
+}
+
+/**
+ * Fail-closed probe failure: filesystem root could not be resolved or `statfs` failed
+ * while a free-space floor was configured.
+ */
+export class WorktreeFreeSpaceProbeError extends Error {
+  readonly checkedPath: string;
+
+  constructor(params: { checkedPath: string; cause?: unknown }) {
+    let reason = "unknown error";
+    if (params.cause instanceof Error) {
+      reason = params.cause.message;
+    } else if (params.cause !== undefined) {
+      reason = String(params.cause);
+    }
+    super(
+      `Refusing to create worktree: could not determine free space at ${params.checkedPath}: ${reason}`,
+    );
+    this.name = "WorktreeFreeSpaceProbeError";
+    this.checkedPath = params.checkedPath;
+    if (params.cause instanceof Error) {
+      this.cause = params.cause;
+    }
+  }
+}
+
+/**
+ * Walk to the nearest existing ancestor of `targetPath` without creating anything.
+ * Used so a not-yet-created worktrees root still admits against the filesystem that
+ * will hold it.
+ */
+export function resolveNearestExistingAncestorPath(targetPath: string): string {
+  let current = path.resolve(targetPath);
+  while (!existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      throw new WorktreeFreeSpaceProbeError({
+        checkedPath: current,
+        cause: new Error("no existing ancestor path"),
+      });
+    }
+    current = parent;
+  }
+  return current;
+}
+
+export async function probeAvailableBytes(checkedPath: string): Promise<number> {
+  try {
+    const stats = await statfs(checkedPath);
+    const availableBytes = Number(stats.bavail) * Number(stats.bsize);
+    if (!Number.isFinite(availableBytes) || availableBytes < 0) {
+      throw new Error("invalid free-space measurement");
+    }
+    return availableBytes;
+  } catch (error) {
+    if (error instanceof WorktreeFreeSpaceProbeError) {
+      throw error;
+    }
+    throw new WorktreeFreeSpaceProbeError({ checkedPath, cause: error });
+  }
+}
+
+/**
+ * Fail-closed free-space admission for new worktree creation.
+ * No-op when `minimumFreeBytes` is unset. Equality (`available === required`) passes.
+ * Does not create directories or mutate worktrees.
+ */
+export async function assertWorktreeCreateFreeSpace(options: {
+  minimumFreeBytes?: number;
+  paseoHome?: string;
+  worktreesRoot?: string;
+  getAvailableBytes?: (checkedPath: string) => Promise<number>;
+}): Promise<void> {
+  const minimumFreeBytes = options.minimumFreeBytes;
+  if (minimumFreeBytes === undefined) {
+    return;
+  }
+
+  const worktreesBaseRoot = resolvePaseoWorktreesBaseRoot({
+    paseoHome: options.paseoHome,
+    worktreesRoot: options.worktreesRoot,
+  });
+
+  let checkedPath: string;
+  try {
+    checkedPath = resolveNearestExistingAncestorPath(worktreesBaseRoot);
+  } catch (error) {
+    if (error instanceof WorktreeFreeSpaceProbeError) {
+      throw error;
+    }
+    throw new WorktreeFreeSpaceProbeError({ checkedPath: worktreesBaseRoot, cause: error });
+  }
+
+  const getAvailableBytes = options.getAvailableBytes ?? probeAvailableBytes;
+  let availableBytes: number;
+  try {
+    availableBytes = await getAvailableBytes(checkedPath);
+  } catch (error) {
+    if (error instanceof WorktreeFreeSpaceProbeError) {
+      throw error;
+    }
+    throw new WorktreeFreeSpaceProbeError({ checkedPath, cause: error });
+  }
+
+  if (availableBytes < minimumFreeBytes) {
+    throw new InsufficientWorktreeFreeSpaceError({
+      availableBytes,
+      requiredBytes: minimumFreeBytes,
+      checkedPath,
+    });
+  }
 }
 
 export async function createWorktreeCore(
@@ -120,8 +272,17 @@ export async function createWorktreeCore(
     return { worktree: existingWorktree, intent, repoRoot, created: false };
   }
 
+  // New creation only: admit against free space before any worktree/git mutation.
+  await assertWorktreeCreateFreeSpace({
+    minimumFreeBytes: input.minimumFreeBytes,
+    paseoHome: input.paseoHome,
+    worktreesRoot: input.worktreesRoot,
+    getAvailableBytes: deps.getAvailableBytes,
+  });
+
+  const createWorktreeFn = deps.createWorktree ?? createWorktree;
   return {
-    worktree: await createWorktree({
+    worktree: await createWorktreeFn({
       cwd: repoRoot,
       worktreeSlug: normalizedSlug,
       source: intent,

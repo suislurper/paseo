@@ -193,6 +193,9 @@ threads are root-classified and emitted only as identity records with
 `kernel_thread=true`, `uid=0`, and an empty `references` list. This lets the
 unprivileged consumer match PID reuse without trying to read protected kernel
 thread links; it adds no path, argv, environment, or file-content disclosure.
+The producer reads PID/start-time identity both before and after kernel-thread
+classification; any change marks the snapshot incomplete, so a reused userspace
+PID can never inherit an identity-only kernel record.
 
 ### Redaction and path scope
 

@@ -478,28 +478,49 @@ def scan_process(
     None record means the process exited (skip silently).
     incomplete True means still-existing process had a read/permission failure.
     """
+    def identity_error(exc: OSError | ValueError) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        error_class = (
+            error_class_for_oserror(exc) if isinstance(exc, OSError) else "read_error"
+        )
+        return (
+            {"pid": pid, "start_time_ticks": None, "error": error_class},
+            {"pid": pid, "start_time_ticks": None, "class": error_class},
+            True,
+        )
+
+    # Bind kernel/userspace classification to one PID identity. A PID reused while
+    # cmdline/exe are inspected must never inherit an identity-only kernel record.
+    try:
+        identity_before = read_stat_identity(proc_root, pid)
+    except (OSError, ValueError) as exc:
+        if not process_still_exists(proc_root, pid):
+            return None, None, False
+        return identity_error(exc)
+    if identity_before is None:
+        return None, None, False
+
     kthread = is_kernel_thread(proc_root, pid)
     if kthread is None:
         return None, None, False
-    if kthread:
-        try:
-            identity = read_stat_identity(proc_root, pid)
-        except (OSError, ValueError) as exc:
-            if not process_still_exists(proc_root, pid):
-                return None, None, False
-            error_class = (
-                error_class_for_oserror(exc)
-                if isinstance(exc, OSError)
-                else "read_error"
-            )
-            return (
-                {"pid": pid, "start_time_ticks": None, "error": error_class},
-                {"pid": pid, "start_time_ticks": None, "class": error_class},
-                True,
-            )
-        if identity is None:
+
+    try:
+        identity_after = read_stat_identity(proc_root, pid)
+    except (OSError, ValueError) as exc:
+        if not process_still_exists(proc_root, pid):
             return None, None, False
-        start_time_ticks, name = identity
+        return identity_error(exc)
+    if identity_after is None:
+        return None, None, False
+    if identity_after != identity_before:
+        start_time_ticks, _name = identity_after
+        return (
+            {"pid": pid, "start_time_ticks": start_time_ticks, "error": "identity_changed"},
+            {"pid": pid, "start_time_ticks": start_time_ticks, "class": "identity_changed"},
+            True,
+        )
+
+    start_time_ticks, name = identity_after
+    if kthread:
         return (
             {
                 "pid": pid,
@@ -513,36 +534,6 @@ def scan_process(
             None,
             False,
         )
-
-    start_time_ticks: int | None = None
-    name: str | None = None
-    try:
-        identity = read_stat_identity(proc_root, pid)
-    except OSError as exc:
-        if not process_still_exists(proc_root, pid):
-            return None, None, False
-        # Without start time we still record what we can for blocking consumers.
-        err = {
-            "pid": pid,
-            "start_time_ticks": None,
-            "class": error_class_for_oserror(exc),
-        }
-        rec = {
-            "pid": pid,
-            "start_time_ticks": None,
-            "error": error_class_for_oserror(exc),
-        }
-        return rec, err, True
-    except ValueError:
-        if not process_still_exists(proc_root, pid):
-            return None, None, False
-        err = {"pid": pid, "start_time_ticks": None, "class": "read_error"}
-        rec = {"pid": pid, "start_time_ticks": None, "error": "read_error"}
-        return rec, err, True
-
-    if identity is None:
-        return None, None, False
-    start_time_ticks, name = identity
 
     try:
         uid = read_status_uid(proc_root, pid)

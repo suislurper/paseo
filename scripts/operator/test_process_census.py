@@ -296,6 +296,37 @@ class ProcessCensusTests(unittest.TestCase):
         )
         self.assertNotIn("kernel_thread", by_pid[400])
 
+    def test_kernel_classification_is_bound_to_pid_identity(self) -> None:
+        """PID reuse during classification makes the whole snapshot incomplete."""
+        add_process(self.proc, 2, comm="kthreadd", start_time_ticks=1, kernel_thread=True)
+        real_read_identity = census.read_stat_identity
+        calls = {2: 0}
+
+        def reused_identity(proc_root: str, pid: int):
+            if pid != 2:
+                return real_read_identity(proc_root, pid)
+            calls[2] += 1
+            if calls[2] == 1:
+                return 1, "kthreadd"
+            return 99, "reused-userspace"
+
+        original = census.read_stat_identity
+        try:
+            census.read_stat_identity = reused_identity  # type: ignore[assignment]
+            snap = self.snapshot()
+        finally:
+            census.read_stat_identity = original  # type: ignore[assignment]
+
+        self.assertFalse(snap["complete"])
+        self.assertEqual(
+            snap["errors"],
+            [{"pid": 2, "start_time_ticks": 99, "class": "identity_changed"}],
+        )
+        self.assertEqual(
+            snap["processes"],
+            [{"pid": 2, "start_time_ticks": 99, "error": "identity_changed"}],
+        )
+
     # --- exit races ---
 
     def test_exit_race_does_not_mark_incomplete(self) -> None:

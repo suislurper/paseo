@@ -459,6 +459,24 @@ class CensusConsumerTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("snapshot_roots_symlink", reasons)
 
+    def test_snapshot_file_symlink_blocks(self) -> None:
+        real = self.h.root / "real-census.json"
+        self.h.write_census()
+        self.h.census.replace(real)
+        link = self.h.root / "census-link.json"
+        os.symlink(real, link)
+        ok, reasons, _, _ = M.collect_process_census(
+            census_path=str(link),
+            proc_root=str(self.h.proc),
+            managed_root=str(self.h.managed),
+            started_at=self.h.started,
+            now_fn=lambda: self.h.now,
+            wait_s=0.0,
+            poll_s=0.0,
+        )
+        self.assertFalse(ok)
+        self.assertTrue(any("symlink" in reason for reason in reasons))
+
     def test_scope_incomplete_blocks(self) -> None:
         self.h.processes = [
             {

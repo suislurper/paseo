@@ -40,6 +40,7 @@ _spec.loader.exec_module(_asc)
 ToolError = _asc.ToolError
 wait_for_snapshot = _asc.wait_for_snapshot
 process_proof = _asc.process_proof
+ensure_no_symlink_components = _asc.ensure_no_symlink_components
 DEFAULT_CENSUS = _asc.DEFAULT_CENSUS
 SNAPSHOT_WAIT_S = _asc.SNAPSHOT_WAIT_S
 REF_KINDS = _asc.REF_KINDS
@@ -355,6 +356,9 @@ def collect_process_census(
         "boot_id": None,
     }
     try:
+        ensure_no_symlink_components(census_path, "process census path")
+        if os.path.islink(census_path):
+            raise ToolError(f"process census path is a symlink: {census_path}")
         snap, snap_reasons = wait_for_snapshot(
             census_path,
             proc_root=proc_root,
@@ -430,6 +434,8 @@ def paseo_census(manual_pins: list[str]) -> dict[str, Any]:
         listed = json_command(["paseo", "schedule", "ls", "--json"], timeout=30)
         if not isinstance(listed, list):
             raise ProbeError("schedules:not-array")
+        if len(listed) >= 200:
+            raise ProbeError("schedules:page-cap-reached")
         for item in listed:
             if not isinstance(item, dict) or item.get("status") != "active":
                 continue
@@ -464,12 +470,16 @@ def paseo_census(manual_pins: list[str]) -> dict[str, Any]:
         terminals = json_command(["paseo", "terminal", "ls", "--all", "--json"], timeout=30)
         if not isinstance(terminals, list):
             raise ProbeError("terminals:not-array")
+        if len(terminals) >= 200:
+            raise ProbeError("terminals:page-cap-reached")
     except ProbeError as exc:
         errors.append(str(exc))
     try:
         permissions = json_command(["paseo", "permit", "ls", "--json"], timeout=30)
         if not isinstance(permissions, list):
             raise ProbeError("permissions:not-array")
+        if len(permissions) >= 200:
+            raise ProbeError("permissions:page-cap-reached")
     except ProbeError as exc:
         errors.append(str(exc))
 

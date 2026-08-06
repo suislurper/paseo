@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed managed agent-scratch probe + exact UUID archive."""
+"""Fail-closed managed agent-scratch probe + exact UUID archive (tombstone)."""
 
 from __future__ import annotations
 
@@ -21,24 +21,33 @@ MANIFEST_SCHEMA = 1
 LOCK_OWNER_SCHEMA = 1
 RELEASE_GRACE_S = 24 * 3600
 SIZE_WALK_TIMEOUT_S = 60
+INVENTORY_TIMEOUT_S = 60
 SNAPSHOT_MAX_AGE_S = 45
 SNAPSHOT_WAIT_S = 45
 DEFAULT_CENSUS = "/run/paseo/process-census.json"
-PARENT_LABEL = "paseo.parent-agent-id"
 LOCK_OP = "archive_scratch"
 MANIFEST_NAME = "manifest.json"
 OWNER_NAME = "owner.json"
+TOMBSTONE_REL = os.path.join("quarantine", "released-scratch")
+REF_KINDS = frozenset({"cwd", "exe", "interpreter_script", "open_fd"})
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.I,
 )
 
+
 class ToolError(Exception):
     """Fatal probe/archive error."""
 
 
+# ---------------------------------------------------------------------------
+# Basics
+# ---------------------------------------------------------------------------
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
 
 def parse_iso(value: str) -> datetime:
     text = value.strip()
@@ -49,23 +58,27 @@ def parse_iso(value: str) -> datetime:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+
 def is_uuid(value: str) -> bool:
     return bool(UUID_RE.match(value or ""))
+
 
 def require_abs(path: str, label: str) -> str:
     if not path or not os.path.isabs(path):
         raise ToolError(f"{label} must be an absolute path: {path!r}")
     return path
 
+
 def norm(path: str) -> str:
     return os.path.normpath(path)
+
 
 def under(path: str, root: str) -> bool:
     p, r = norm(path), norm(root)
     return p == r or p.startswith(r + os.sep)
 
+
 def free_bytes(path: str) -> int:
-    """statvfs free bytes for path or nearest existing ancestor."""
     cur = path
     while True:
         try:
@@ -77,24 +90,96 @@ def free_bytes(path: str) -> int:
                 raise ToolError(f"cannot statvfs free space for {path}")
             cur = parent
 
-def atomic_write(path: str, data: str, mode: int = 0o600) -> None:
+
+def ensure_no_symlink_components(path: str, label: str = "path") -> None:
+    """Refuse if any existing component of path is a symlink (fail closed)."""
+    require_abs(path, label)
+    head = norm(path)
+    parts: list[str] = []
+    while True:
+        parts.append(head)
+        parent = os.path.dirname(head)
+        if parent == head:
+            break
+        head = parent
+    for component in reversed(parts):
+        if os.path.lexists(component) and os.path.islink(component):
+            raise ToolError(f"{label} has symlink component: {component}")
+
+
+def fsync_dir(path: str) -> None:
+    ensure_no_symlink_components(path, "directory")
+    dir_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def mkdir_exact(path: str, mode: int = 0o700) -> None:
+    """Create a single directory with exact mode; fail closed on chmod."""
+    ensure_no_symlink_components(path, "directory")
     parent = os.path.dirname(path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
+    if parent and parent != path:
+        ensure_no_symlink_components(parent, "parent directory")
+        if not os.path.isdir(parent) or os.path.islink(parent):
+            raise ToolError(f"parent directory missing or not a real dir: {parent}")
+    if os.path.lexists(path):
+        if os.path.islink(path):
+            raise ToolError(f"path is a symlink: {path}")
+        if not os.path.isdir(path):
+            raise ToolError(f"path exists and is not a directory: {path}")
+        try:
+            os.chmod(path, mode)
+        except OSError as exc:
+            raise ToolError(f"chmod failed for existing directory {path}: {exc}") from exc
+        return
+    try:
+        os.mkdir(path, mode)
+    except FileExistsError as exc:
+        raise ToolError(f"directory race creating {path}") from exc
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        raise ToolError(f"chmod failed after mkdir {path}: {exc}") from exc
+
+
+def atomic_write(path: str, data: str, mode: int = 0o600) -> None:
+    """Atomic write that refuses symlink parents and fsyncs file + directory."""
+    require_abs(path, "atomic write path")
+    ensure_no_symlink_components(path, "atomic write path")
+    parent = os.path.dirname(path)
+    if not parent:
+        raise ToolError(f"atomic write has no parent: {path}")
+    ensure_no_symlink_components(parent, "atomic write parent")
+    if not os.path.isdir(parent) or os.path.islink(parent):
+        raise ToolError(f"atomic write parent is not a real directory: {parent}")
+    tmp = os.path.join(parent, f".tmp.{os.getpid()}.{time.time_ns()}")
+    ensure_no_symlink_components(tmp, "atomic write tmp")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, mode)
+        except OSError as exc:
+            raise ToolError(f"chmod failed for temp file {tmp}: {exc}") from exc
         os.replace(tmp, path)
         tmp = ""
+        fsync_dir(parent)
     finally:
         if tmp and os.path.lexists(tmp):
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Config / aggregate size
+# ---------------------------------------------------------------------------
 
 
 def load_runtime_root(config_path: str) -> str:
@@ -112,16 +197,16 @@ def load_runtime_root(config_path: str) -> str:
     root = agents.get("runtimeRoot")
     if not isinstance(root, str) or not root.strip():
         raise ToolError("config.agents.runtimeRoot is required")
-    root = root.strip()
+    root = norm(root.strip())
     require_abs(root, "agents.runtimeRoot")
-    if os.path.islink(root):
-        raise ToolError(f"runtimeRoot must not be a symlink: {root}")
+    ensure_no_symlink_components(root, "runtimeRoot")
     if not os.path.isdir(root):
         raise ToolError(f"runtimeRoot is not a directory: {root}")
-    return norm(root)
+    return root
+
 
 def dir_size_capped(path: str, deadline: float) -> tuple[int | None, str | None]:
-    """Non-following size walk. Returns (bytes, error_reason)."""
+    """Non-following size walk. Returns (bytes, error_reason). Never returns 0 on error."""
     if not os.path.lexists(path):
         return 0, None
     total = 0
@@ -154,23 +239,29 @@ def dir_size_capped(path: str, deadline: float) -> tuple[int | None, str | None]
             return None, "size_walk_unreadable"
     return total, None
 
-def report_aggregate(runtime_root: str, name: str, deadline: float) -> int:
+
+def report_aggregate(runtime_root: str, name: str, deadline: float) -> dict[str, Any]:
+    """Report-only size. Timeouts/unreadable → unknown + error, never 0."""
     path = os.path.join(runtime_root, name)
-    size, _err = dir_size_capped(path, deadline)
-    return 0 if size is None else size
+    size, err = dir_size_capped(path, deadline)
+    if err is not None:
+        return {"bytes": None, "status": "unknown", "error": err}
+    return {"bytes": int(size or 0), "status": "ok", "error": None}
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
 
 
 def read_json_file(path: str) -> Any:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
+
 def classify_manifest(
     scratch_dir: str, agent_id: str, now: datetime
 ) -> tuple[str, list[str], dict[str, Any] | None]:
-    """Return (classification_hint, reasons, manifest_or_None).
-
-    classification_hint is blocked/protected-ish pre-check only; caller merges.
-    """
     reasons: list[str] = []
     if os.path.islink(scratch_dir):
         return "blocked", ["scratch_is_symlink"], None
@@ -206,13 +297,19 @@ def classify_manifest(
         rel_dt = parse_iso(released_at)
     except (TypeError, ValueError):
         return "blocked", ["released_at_invalid"], raw
-    age = (now - rel_dt).total_seconds()
-    if age < RELEASE_GRACE_S:
+    if (now - rel_dt).total_seconds() < RELEASE_GRACE_S:
         return "protected", ["release_grace"], raw
     return "ok", [], raw
 
+
+# ---------------------------------------------------------------------------
+# Locks
+# ---------------------------------------------------------------------------
+
+
 def lock_dir_for(runtime_root: str, agent_id: str) -> str:
     return os.path.join(runtime_root, "locks", f"{agent_id}.lock")
+
 
 def lock_present(runtime_root: str, agent_id: str) -> tuple[bool, str | None]:
     ld = lock_dir_for(runtime_root, agent_id)
@@ -222,11 +319,21 @@ def lock_present(runtime_root: str, agent_id: str) -> tuple[bool, str | None]:
         return True, "lock_is_symlink"
     return True, "lock_present"
 
-def acquire_lock(runtime_root: str, agent_id: str) -> tuple[str, str]:
-    """mkdir lock + owner.json. Returns (lock_dir, lock_token). Never breaks by age."""
+
+def ensure_locks_parent(runtime_root: str) -> str:
+    """Exact locks parent under runtimeRoot. Fail closed on symlink / chmod."""
+    ensure_no_symlink_components(runtime_root, "runtimeRoot")
     locks_parent = os.path.join(runtime_root, "locks")
-    os.makedirs(locks_parent, mode=0o700, exist_ok=True)
+    ensure_no_symlink_components(locks_parent, "locks parent")
+    mkdir_exact(locks_parent, 0o700)
+    return locks_parent
+
+
+def acquire_lock(runtime_root: str, agent_id: str) -> tuple[str, str]:
+    """mkdir lock + owner.json. Never breaks by age."""
+    ensure_locks_parent(runtime_root)
     ld = lock_dir_for(runtime_root, agent_id)
+    ensure_no_symlink_components(ld, "lock path")
     if os.path.lexists(ld):
         if os.path.islink(ld):
             raise ToolError(f"agent lock path is a symlink: {ld}")
@@ -242,8 +349,8 @@ def acquire_lock(runtime_root: str, agent_id: str) -> tuple[str, str]:
         ) from exc
     try:
         os.chmod(ld, 0o700)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise ToolError(f"chmod failed on lock directory {ld}: {exc}") from exc
     token = str(uuid.uuid4())
     boot_id = None
     try:
@@ -264,7 +371,9 @@ def acquire_lock(runtime_root: str, agent_id: str) -> tuple[str, str]:
     atomic_write(os.path.join(ld, OWNER_NAME), json.dumps(owner, indent=2, sort_keys=True) + "\n")
     return ld, token
 
+
 def release_lock(lock_dir: str, agent_id: str, lock_token: str) -> None:
+    ensure_no_symlink_components(lock_dir, "lock path")
     if os.path.islink(lock_dir):
         raise ToolError(f"cannot release agent lock: lock path is a symlink: {lock_dir}")
     if not os.path.isdir(lock_dir):
@@ -273,7 +382,9 @@ def release_lock(lock_dir: str, agent_id: str, lock_token: str) -> None:
     try:
         owner = read_json_file(owner_path)
     except (OSError, json.JSONDecodeError) as exc:
-        raise ToolError(f"cannot release agent lock: owner.json missing or unreadable for {agent_id}") from exc
+        raise ToolError(
+            f"cannot release agent lock: owner.json missing or unreadable for {agent_id}"
+        ) from exc
     if not isinstance(owner, dict):
         raise ToolError(f"cannot release agent lock: invalid owner.json for {agent_id}")
     if owner.get("agentId") != agent_id or owner.get("lockToken") != lock_token:
@@ -281,28 +392,37 @@ def release_lock(lock_dir: str, agent_id: str, lock_token: str) -> None:
     try:
         entries = os.listdir(lock_dir)
     except OSError as exc:
-        raise ToolError(f"cannot release agent lock: failed to list lock directory for {agent_id}") from exc
-    if entries != [OWNER_NAME] and set(entries) != {OWNER_NAME}:
-        if len(entries) != 1 or entries[0] != OWNER_NAME:
-            raise ToolError(
-                f"cannot release agent lock: unexpected contents in lock directory for {agent_id}"
-            )
+        raise ToolError(
+            f"cannot release agent lock: failed to list lock directory for {agent_id}"
+        ) from exc
+    if set(entries) != {OWNER_NAME}:
+        raise ToolError(
+            f"cannot release agent lock: unexpected contents in lock directory for {agent_id}"
+        )
     try:
         os.unlink(owner_path)
     except OSError as exc:
-        raise ToolError(f"cannot release agent lock: failed to remove owner.json for {agent_id}") from exc
+        raise ToolError(
+            f"cannot release agent lock: failed to remove owner.json for {agent_id}"
+        ) from exc
     try:
         os.rmdir(lock_dir)
     except OSError as exc:
-        raise ToolError(f"cannot release agent lock: failed to remove lock directory for {agent_id}") from exc
+        raise ToolError(
+            f"cannot release agent lock: failed to remove lock directory for {agent_id}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Paseo CLI census
+# ---------------------------------------------------------------------------
 
 
 def default_paseo_runner(paseo_bin: str) -> Callable[[list[str]], tuple[int, str, str]]:
     def run(args: list[str]) -> tuple[int, str, str]:
-        cmd = [paseo_bin, *args]
         try:
             proc = subprocess.run(
-                cmd,
+                [paseo_bin, *args],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -313,6 +433,7 @@ def default_paseo_runner(paseo_bin: str) -> Callable[[list[str]], tuple[int, str
         return proc.returncode, proc.stdout, proc.stderr
 
     return run
+
 
 def parse_cli_json(stdout: str, label: str) -> Any:
     text = stdout.strip()
@@ -332,47 +453,22 @@ def parse_cli_json(stdout: str, label: str) -> Any:
             raise ToolError(f"{label}: {data.get('error')}")
     return data
 
+
 def cli_json(runner: Callable[[list[str]], tuple[int, str, str]], args: list[str], label: str) -> Any:
     code, out, err = runner([*args, "--json"] if "--json" not in args else args)
     if code != 0:
         raise ToolError(f"{label}: exit {code}: {err or out}")
     return parse_cli_json(out, label)
 
-def collect_paseo_census(
-    runner: Callable[[list[str]], tuple[int, str, str]],
-) -> dict[str, Any]:
-    """Read-only census via Paseo CLI. Fail closed on missing/unparseable/page-capped."""
-    # Unarchived agents (global). List items: id, status, ...
-    unarchived = cli_json(runner, ["ls", "-g"], "paseo ls -g")
-    if not isinstance(unarchived, list):
-        raise ToolError("paseo ls -g: expected JSON array")
-    unarchived_ids: set[str] = set()
-    for item in unarchived:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-            raise ToolError("paseo ls -g: malformed agent entry")
-        if not is_uuid(item["id"]):
-            raise ToolError(f"paseo ls -g: non-uuid agent id {item['id']!r}")
-        unarchived_ids.add(item["id"])
 
-    schedules = cli_json(runner, ["schedule", "ls"], "paseo schedule ls")
-    if not isinstance(schedules, list):
-        raise ToolError("paseo schedule ls: expected JSON array")
+def _require_agent_id(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ToolError(f"{label}: missing agent id")
+    aid = value.strip()
+    if not is_uuid(aid):
+        raise ToolError(f"{label}: non-uuid or ambiguous agent id {aid!r}")
+    return aid
 
-    permits = cli_json(runner, ["permit", "ls"], "paseo permit ls")
-    if not isinstance(permits, list):
-        raise ToolError("paseo permit ls: expected JSON array")
-
-    terminals = cli_json(runner, ["terminal", "ls", "--all"], "paseo terminal ls --all")
-    if not isinstance(terminals, list):
-        raise ToolError("paseo terminal ls: expected JSON array")
-
-    return {
-        "unarchived_ids": unarchived_ids,
-        "unarchived": unarchived,
-        "schedules": schedules,
-        "permits": permits,
-        "terminals": terminals,
-    }
 
 def inspect_agent(
     runner: Callable[[list[str]], tuple[int, str, str]], agent_id: str
@@ -382,8 +478,116 @@ def inspect_agent(
         raise ToolError(f"paseo inspect {agent_id}: expected object")
     return data
 
+
+def inspect_schedule_identity(
+    runner: Callable[[list[str]], tuple[int, str, str]], schedule_id: str
+) -> dict[str, Any]:
+    data = cli_json(
+        runner,
+        ["schedule", "inspect", schedule_id, "--identity-only"],
+        f"paseo schedule inspect {schedule_id} --identity-only",
+    )
+    if not isinstance(data, dict):
+        raise ToolError(f"schedule identity {schedule_id}: expected object")
+    return data
+
+
+def collect_paseo_census(
+    runner: Callable[[list[str]], tuple[int, str, str]],
+) -> dict[str, Any]:
+    """Read-only census. Fail closed on malformed/ambiguous/page-capped entries."""
+    unarchived = cli_json(runner, ["ls", "-g"], "paseo ls -g")
+    if not isinstance(unarchived, list):
+        raise ToolError("paseo ls -g: expected JSON array")
+    unarchived_ids: set[str] = set()
+    for item in unarchived:
+        if not isinstance(item, dict):
+            raise ToolError("paseo ls -g: malformed agent entry")
+        aid = item.get("id") if isinstance(item.get("id"), str) else item.get("Id")
+        unarchived_ids.add(_require_agent_id(aid, "paseo ls -g"))
+
+    schedules = cli_json(runner, ["schedule", "ls"], "paseo schedule ls")
+    if not isinstance(schedules, list):
+        raise ToolError("paseo schedule ls: expected JSON array")
+    for sch in schedules:
+        if not isinstance(sch, dict):
+            raise ToolError("paseo schedule ls: malformed entry")
+        sid = sch.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            raise ToolError("paseo schedule ls: missing schedule id")
+        status = sch.get("status")
+        if not isinstance(status, str) or not status:
+            raise ToolError("paseo schedule ls: missing schedule status")
+
+    permits = cli_json(runner, ["permit", "ls"], "paseo permit ls")
+    if not isinstance(permits, list):
+        raise ToolError("paseo permit ls: expected JSON array")
+    for perm in permits:
+        if not isinstance(perm, dict):
+            raise ToolError("paseo permit ls: malformed entry")
+        aid = perm.get("agentId") or perm.get("agent_id")
+        _require_agent_id(aid, "paseo permit ls")
+
+    terminals = cli_json(runner, ["terminal", "ls", "--all"], "paseo terminal ls --all")
+    if not isinstance(terminals, list):
+        raise ToolError("paseo terminal ls: expected JSON array")
+    for term in terminals:
+        if not isinstance(term, dict):
+            raise ToolError("paseo terminal ls: malformed entry")
+        cwd = term.get("cwd")
+        if cwd is None or cwd == "" or cwd == "-":
+            raise ToolError("paseo terminal ls: ambiguous terminal cwd")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            raise ToolError("paseo terminal ls: non-absolute terminal cwd")
+
+    # Authoritative active-schedule targets via identity-only inspect.
+    protected_schedule_agents: set[str] = set()
+    for sch in schedules:
+        if sch.get("status") != "active":
+            continue
+        sid = str(sch["id"])
+        identity = inspect_schedule_identity(runner, sid)
+        target = identity.get("target")
+        if not isinstance(target, dict):
+            raise ToolError(f"schedule identity {sid}: malformed target")
+        ttype = target.get("type")
+        if ttype == "new-agent":
+            continue
+        if ttype not in ("agent", "self"):
+            raise ToolError(f"schedule identity {sid}: unknown target type {ttype!r}")
+        tid = target.get("agentId") or target.get("agent_id")
+        protected_schedule_agents.add(_require_agent_id(tid, f"schedule identity {sid}"))
+
+    # Descendant ancestry via authoritative inspect ParentAgentId (not --label).
+    parent_of: dict[str, str | None] = {}
+    for aid in sorted(unarchived_ids):
+        try:
+            info = inspect_agent(runner, aid)
+        except ToolError as exc:
+            raise ToolError(f"descendant ancestry inspect failed for {aid}: {exc}") from exc
+        parent = info.get("ParentAgentId")
+        if parent is None or parent == "null" or parent == "":
+            parent_of[aid] = None
+            continue
+        if not isinstance(parent, str):
+            raise ToolError(f"descendant ancestry: malformed ParentAgentId for {aid}")
+        parent = parent.strip()
+        if not is_uuid(parent):
+            raise ToolError(f"descendant ancestry: non-uuid ParentAgentId for {aid}")
+        parent_of[aid] = parent
+
+    return {
+        "unarchived_ids": unarchived_ids,
+        "unarchived": unarchived,
+        "schedules": schedules,
+        "permits": permits,
+        "terminals": terminals,
+        "protected_schedule_agents": protected_schedule_agents,
+        "parent_of": parent_of,
+    }
+
+
 def agent_is_archived_or_closed(info: dict[str, Any]) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
     archived_at = info.get("ArchivedAt")
     if archived_at is None and "archivedAt" in info:
         archived_at = info.get("archivedAt")
@@ -394,74 +598,46 @@ def agent_is_archived_or_closed(info: dict[str, Any]) -> tuple[bool, list[str]]:
         return True, []
     if archived_at is True or info.get("Archived") is True:
         return True, []
-    reasons.append("agent_not_archived_or_closed")
-    return False, reasons
+    return False, ["agent_not_archived_or_closed"]
 
-def has_unarchived_descendant(
-    runner: Callable[[list[str]], tuple[int, str, str]],
-    agent_id: str,
-    unarchived_ids: set[str],
-) -> bool:
-    """BFS via label filter for unarchived descendants."""
-    if not unarchived_ids:
-        return False
-    frontier = [agent_id]
-    seen = {agent_id}
-    while frontier:
-        parent = frontier.pop()
-        label = f"{PARENT_LABEL}={parent}"
-        children = cli_json(
-            runner,
-            ["ls", "-g", "--label", label],
-            f"paseo ls descendants of {parent}",
-        )
-        if not isinstance(children, list):
-            raise ToolError("paseo ls --label: expected JSON array")
-        for item in children:
-            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-                raise ToolError("paseo ls --label: malformed entry")
-            cid = item["id"]
-            if cid in seen:
-                continue
-            seen.add(cid)
-            if cid in unarchived_ids:
+
+def has_unarchived_descendant(agent_id: str, parent_of: dict[str, str | None], unarchived_ids: set[str]) -> bool:
+    """True if any unarchived agent has agent_id in its parent chain."""
+    for aid in unarchived_ids:
+        if aid == agent_id:
+            continue
+        seen: set[str] = set()
+        cur: str | None = aid
+        while cur is not None:
+            if cur in seen:
+                break  # cycle; treat as non-descendant of agent_id unless matched
+            seen.add(cur)
+            parent = parent_of.get(cur)
+            if parent is None and cur not in parent_of:
+                # unknown ancestry for an unarchived agent → handled at census time
+                break
+            if parent == agent_id:
                 return True
-            frontier.append(cid)
+            cur = parent
     return False
 
-def schedule_targets_agent(schedule: dict[str, Any], agent_id: str) -> bool:
-    if schedule.get("status") != "active":
-        return False
-    target = schedule.get("target")
-    # Structured target (tests / richer runners)
-    if isinstance(target, dict):
-        ttype = target.get("type")
-        tid = target.get("agentId")
-        if ttype in ("agent", "self") and tid == agent_id:
-            return True
-        return False
-    if not isinstance(target, str):
-        return False
-    short = agent_id[:7]
-    # CLI formatTarget: agent:<7> / self:<7>
-    if target in (f"agent:{short}", f"self:{short}", f"agent:{agent_id}", f"self:{agent_id}"):
-        return True
-    if target.endswith(agent_id) and (target.startswith("agent:") or target.startswith("self:")):
-        return True
-    return False
 
 def permit_for_agent(permit: dict[str, Any], agent_id: str) -> bool:
     aid = permit.get("agentId") or permit.get("agent_id")
     return isinstance(aid, str) and aid == agent_id
 
+
 def terminal_in_scratch(terminal: dict[str, Any], scratch_dir: str) -> bool:
     cwd = terminal.get("cwd")
-    if not isinstance(cwd, str) or not cwd or cwd == "-":
-        return False
-    # Resolve only if absolute; do not follow symlinks for classification.
-    if not os.path.isabs(cwd):
-        return False
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        # Ambiguity is rejected at census collection; this is a last-resort block.
+        raise ToolError("terminal_cwd_ambiguous")
     return under(norm(cwd), scratch_dir)
+
+
+# ---------------------------------------------------------------------------
+# Process census merge
+# ---------------------------------------------------------------------------
 
 
 def read_boot_id(proc_root: str) -> str:
@@ -472,17 +648,17 @@ def read_boot_id(proc_root: str) -> str:
     except OSError as exc:
         raise ToolError(f"unable to read boot_id: {exc}") from exc
 
+
 def parse_stat_start(stat_text: str) -> int:
     lparen = stat_text.find("(")
     rparen = stat_text.rfind(")")
     if lparen < 0 or rparen < 0 or rparen <= lparen:
         raise ValueError("malformed stat")
     rest = stat_text[rparen + 2 :].split()
-    # field 22 is starttime → index 19 after comm
     return int(rest[19])
 
+
 def live_pid_map(proc_root: str) -> dict[int, int | None]:
-    """pid -> start_time_ticks (None if unreadable but dir exists)."""
     out: dict[int, int | None] = {}
     try:
         names = os.listdir(proc_root)
@@ -495,7 +671,6 @@ def live_pid_map(proc_root: str) -> dict[int, int | None]:
         pdir = os.path.join(proc_root, name)
         if not os.path.isdir(pdir):
             continue
-        # kernel threads: empty cmdline often; still need starttime when readable
         try:
             with open(os.path.join(pdir, "stat"), encoding="utf-8") as f:
                 out[pid] = parse_stat_start(f.read())
@@ -503,6 +678,7 @@ def live_pid_map(proc_root: str) -> dict[int, int | None]:
             if os.path.isdir(pdir):
                 out[pid] = None
     return out
+
 
 def load_snapshot(path: str) -> dict[str, Any] | None:
     if not os.path.isfile(path):
@@ -513,6 +689,7 @@ def load_snapshot(path: str) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
 
 def snapshot_acceptable(
     snap: dict[str, Any],
@@ -546,6 +723,7 @@ def snapshot_acceptable(
         reasons.append("snapshot_processes_missing")
     return not reasons, reasons
 
+
 def wait_for_snapshot(
     census_path: str,
     *,
@@ -574,11 +752,24 @@ def wait_for_snapshot(
             return None, last_reasons
         time.sleep(poll_s)
 
+
+def _well_formed_reference(ref: Any) -> bool:
+    if not isinstance(ref, dict):
+        return False
+    kind = ref.get("kind")
+    path = ref.get("path")
+    if kind not in REF_KINDS:
+        return False
+    if not isinstance(path, str) or not path or not os.path.isabs(path):
+        return False
+    return True
+
+
 def process_proof(
     snap: dict[str, Any],
     proc_root: str,
 ) -> tuple[bool, list[str], dict[int, dict[str, Any]]]:
-    """Match every live pid against snapshot pid+start_time_ticks. Fail closed."""
+    """Every live pid matches snapshot pid+start_time; every record complete."""
     reasons: list[str] = []
     by_pid: dict[int, dict[str, Any]] = {}
     for rec in snap.get("processes") or []:
@@ -588,11 +779,17 @@ def process_proof(
         pid = rec.get("pid")
         st = rec.get("start_time_ticks")
         if not isinstance(pid, int) or not isinstance(st, int):
-            # error-class records may still have both; missing blocks
-            if "error" in rec and isinstance(pid, int) and isinstance(st, int):
-                by_pid[pid] = rec
-                continue
             reasons.append("snapshot_process_fields")
+            continue
+        if rec.get("scope_complete") is not True:
+            reasons.append("snapshot_scope_incomplete")
+            continue
+        refs = rec.get("references")
+        if not isinstance(refs, list):
+            reasons.append("snapshot_references_malformed")
+            continue
+        if any(not _well_formed_reference(r) for r in refs):
+            reasons.append("snapshot_references_malformed")
             continue
         by_pid[pid] = rec
 
@@ -604,10 +801,23 @@ def process_proof(
         if pid not in by_pid:
             reasons.append("process_new")
             continue
-        snap_st = by_pid[pid].get("start_time_ticks")
-        if snap_st != live_st:
+        if by_pid[pid].get("start_time_ticks") != live_st:
             reasons.append("process_pid_mismatch")
-    # de-dupe reasons preserve order
+    # Re-confirm identity after live map (post-start proof is already gated by snapshot).
+    live2 = live_pid_map(proc_root)
+    if live2 != live:
+        reasons.append("live_process_race")
+    else:
+        for pid, live_st in live2.items():
+            if live_st is None or pid not in by_pid or by_pid[pid].get("start_time_ticks") != live_st:
+                if "live_process_race" not in reasons and "live_process_unreadable" not in reasons:
+                    if live_st is None:
+                        reasons.append("live_process_unreadable")
+                    elif pid not in by_pid:
+                        reasons.append("process_new")
+                    else:
+                        reasons.append("process_pid_mismatch")
+
     seen: set[str] = set()
     uniq: list[str] = []
     for r in reasons:
@@ -616,56 +826,185 @@ def process_proof(
             uniq.append(r)
     return not uniq, uniq, by_pid
 
+
 def processes_touching_scratch(
     by_pid: dict[int, dict[str, Any]], scratch_dir: str
 ) -> list[int]:
     hits: list[int] = []
     for pid, rec in by_pid.items():
         refs = rec.get("references") or []
-        if not isinstance(refs, list):
-            continue
         for ref in refs:
-            if not isinstance(ref, dict):
-                continue
-            path = ref.get("path")
+            path = ref.get("path") if isinstance(ref, dict) else None
             if isinstance(path, str) and under(path, scratch_dir):
                 hits.append(pid)
                 break
     return hits
 
 
+# ---------------------------------------------------------------------------
+# Deterministic tree inventory (candidate identity + artifacts)
+# ---------------------------------------------------------------------------
+
+
+def file_sha256(path: str, deadline: float) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            if time.monotonic() > deadline:
+                raise ToolError("inventory_timeout")
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def tree_inventory(root: str, deadline: float) -> tuple[list[dict[str, Any]], list[str]]:
+    """Full deterministic inventory. Never follows symlinks. Bound by deadline."""
+    errors: list[str] = []
+    records: list[dict[str, Any]] = []
+    try:
+        root_st = os.lstat(root)
+    except OSError:
+        return [], ["root_missing"]
+    if stat.S_ISLNK(root_st.st_mode):
+        return [], ["root_is_symlink"]
+    if not stat.S_ISDIR(root_st.st_mode):
+        return [], ["root_not_directory"]
+    root_dev = root_st.st_dev
+    root_n = norm(root)
+
+    def rel_of(path: str) -> str:
+        if norm(path) == root_n:
+            return "."
+        return os.path.relpath(path, root_n)
+
+    def rec_for(path: str, st: os.stat_result, typ: str, digest: str | None = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "type": typ,
+            "rel": rel_of(path),
+            "dev": st.st_dev,
+            "ino": st.st_ino,
+            "mode": stat.S_IMODE(st.st_mode),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
+            "size": st.st_size if typ == "file" else 0,
+            "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
+            "nlink": st.st_nlink,
+        }
+        if typ == "file":
+            out["sha256"] = digest
+        return out
+
+    def walk(path: str) -> None:
+        if time.monotonic() > deadline:
+            errors.append("inventory_timeout")
+            return
+        try:
+            st = os.lstat(path)
+        except OSError:
+            errors.append("path_changed")
+            return
+        if st.st_dev != root_dev:
+            errors.append("mount_crossing")
+            return
+        if stat.S_ISLNK(st.st_mode):
+            errors.append("symlink_content")
+            return
+        if stat.S_ISREG(st.st_mode):
+            if st.st_nlink > 1:
+                errors.append("hard_link")
+                return
+            try:
+                digest = file_sha256(path, deadline)
+            except ToolError as exc:
+                errors.append(str(exc) if str(exc) == "inventory_timeout" else "unreadable_file")
+                return
+            except OSError:
+                errors.append("unreadable_file")
+                return
+            # Detect change between lstat and hash
+            try:
+                st2 = os.lstat(path)
+            except OSError:
+                errors.append("path_changed")
+                return
+            if (
+                st2.st_ino != st.st_ino
+                or st2.st_dev != st.st_dev
+                or st2.st_size != st.st_size
+                or int(getattr(st2, "st_mtime_ns", int(st2.st_mtime * 1e9)))
+                != int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            ):
+                errors.append("path_changed")
+                return
+            records.append(rec_for(path, st, "file", digest))
+            return
+        if stat.S_ISDIR(st.st_mode):
+            records.append(rec_for(path, st, "dir"))
+            try:
+                with os.scandir(path) as it:
+                    names = sorted(ent.name for ent in it)
+            except OSError:
+                errors.append("unreadable_dir")
+                return
+            for name in names:
+                if time.monotonic() > deadline:
+                    errors.append("inventory_timeout")
+                    return
+                walk(os.path.join(path, name))
+            return
+        errors.append("special_file")
+
+    walk(root)
+    records.sort(key=lambda r: (r["rel"], r["type"]))
+    return records, errors
+
+
+def inventory_fingerprint(records: list[dict[str, Any]]) -> str:
+    payload = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def make_token(
     agent_id: str,
     generation: str,
     released_at: str,
-    size_bytes: int,
-    st: os.stat_result,
+    inventory_fp: str,
 ) -> str:
-    payload = "|".join(
-        [
-            agent_id,
-            generation,
-            released_at,
-            str(size_bytes),
-            str(st.st_dev),
-            str(st.st_ino),
-            str(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
-        ]
-    )
+    payload = "|".join([agent_id, generation, released_at, inventory_fp])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-def list_scratch_candidates(runtime_root: str) -> list[str]:
+
+def inventories_match(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
+    return inventory_fingerprint(a) == inventory_fingerprint(b)
+
+
+# ---------------------------------------------------------------------------
+# Scratch listing / classification / probe
+# ---------------------------------------------------------------------------
+
+
+def list_scratch_entries(runtime_root: str) -> tuple[list[str], list[str]]:
+    """Return (uuid_ids, unknown_names). Unknowns make inventory incomplete."""
     scratch_root = os.path.join(runtime_root, "scratch")
-    if not os.path.isdir(scratch_root):
-        return []
+    ensure_no_symlink_components(scratch_root, "scratch root")
+    if not os.path.lexists(scratch_root):
+        return [], []
+    if os.path.islink(scratch_root) or not os.path.isdir(scratch_root):
+        raise ToolError(f"scratch root is not a real directory: {scratch_root}")
     ids: list[str] = []
+    unknown: list[str] = []
     try:
         for name in sorted(os.listdir(scratch_root)):
             if is_uuid(name):
                 ids.append(name)
+            else:
+                unknown.append(name)
     except OSError as exc:
         raise ToolError(f"cannot list scratch root: {exc}") from exc
-    return ids
+    return ids, unknown
+
 
 def classify_candidate(
     *,
@@ -679,6 +1018,8 @@ def classify_candidate(
     by_pid: dict[int, dict[str, Any]],
     size_deadline: float,
     holding_lock_for: str | None = None,
+    inventory_incomplete: bool = False,
+    inventory_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
     scratch_dir = os.path.join(runtime_root, "scratch", agent_id)
     out: dict[str, Any] = {
@@ -690,13 +1031,18 @@ def classify_candidate(
         "generation": None,
         "released_at": None,
         "candidate_token": None,
+        "inventory_fingerprint": None,
     }
     reasons: list[str] = []
+
+    if inventory_incomplete:
+        reasons.extend(inventory_reasons or ["scratch_inventory_incomplete"])
+        out["reasons"] = reasons
+        return out
 
     if not process_ok:
         reasons.extend(process_reasons or ["process_census_blocked"])
         out["reasons"] = reasons
-        out["classification"] = "blocked"
         return out
 
     hint, man_reasons, manifest = classify_manifest(scratch_dir, agent_id, now)
@@ -706,12 +1052,9 @@ def classify_candidate(
     if size_err:
         reasons.append(size_err)
         out["reasons"] = reasons
-        out["classification"] = "blocked"
         return out
     out["size_bytes"] = size
 
-    # Skip foreign-lock protection only when this invocation already holds the lock
-    # for final archive revalidation (self-held mkdir lock is expected).
     if holding_lock_for != agent_id:
         held, lock_reason = lock_present(runtime_root, agent_id)
         if held:
@@ -720,7 +1063,6 @@ def classify_candidate(
             out["classification"] = "protected"
             return out
 
-    # Paseo agent identity
     try:
         info = inspect_agent(runner, agent_id)
     except ToolError as exc:
@@ -730,7 +1072,6 @@ def classify_candidate(
         else:
             reasons.append("agent_inspect_failed")
         out["reasons"] = reasons
-        out["classification"] = "blocked"
         return out
 
     ok_arch, arch_reasons = agent_is_archived_or_closed(info)
@@ -746,24 +1087,17 @@ def classify_candidate(
         out["classification"] = "protected"
         return out
 
-    try:
-        if has_unarchived_descendant(runner, agent_id, paseo["unarchived_ids"]):
-            reasons.append("unarchived_descendant")
-            out["reasons"] = reasons
-            out["classification"] = "protected"
-            return out
-    except ToolError:
-        reasons.append("descendant_census_failed")
+    if has_unarchived_descendant(agent_id, paseo["parent_of"], paseo["unarchived_ids"]):
+        reasons.append("unarchived_descendant")
         out["reasons"] = reasons
-        out["classification"] = "blocked"
+        out["classification"] = "protected"
         return out
 
-    for sch in paseo["schedules"]:
-        if isinstance(sch, dict) and schedule_targets_agent(sch, agent_id):
-            reasons.append("active_schedule")
-            out["reasons"] = reasons
-            out["classification"] = "protected"
-            return out
+    if agent_id in paseo.get("protected_schedule_agents", set()):
+        reasons.append("active_schedule")
+        out["reasons"] = reasons
+        out["classification"] = "protected"
+        return out
 
     for perm in paseo["permits"]:
         if isinstance(perm, dict) and permit_for_agent(perm, agent_id):
@@ -772,12 +1106,17 @@ def classify_candidate(
             out["classification"] = "protected"
             return out
 
-    for term in paseo["terminals"]:
-        if isinstance(term, dict) and terminal_in_scratch(term, scratch_dir):
-            reasons.append("terminal_in_scratch")
-            out["reasons"] = reasons
-            out["classification"] = "protected"
-            return out
+    try:
+        for term in paseo["terminals"]:
+            if isinstance(term, dict) and terminal_in_scratch(term, scratch_dir):
+                reasons.append("terminal_in_scratch")
+                out["reasons"] = reasons
+                out["classification"] = "protected"
+                return out
+    except ToolError:
+        reasons.append("terminal_cwd_ambiguous")
+        out["reasons"] = reasons
+        return out
 
     pids = processes_touching_scratch(by_pid, scratch_dir)
     if pids:
@@ -794,22 +1133,34 @@ def classify_candidate(
             out["released_at"] = manifest.get("releasedAt")
         return out
 
-    try:
-        st = os.lstat(scratch_dir)
-    except OSError:
-        reasons.append("scratch_stat_failed")
+    inv_deadline = time.monotonic() + INVENTORY_TIMEOUT_S
+    records, inv_errors = tree_inventory(scratch_dir, inv_deadline)
+    if inv_errors:
+        reasons.extend(sorted(set(inv_errors)))
         out["reasons"] = reasons
-        out["classification"] = "blocked"
+        return out
+    # Second matching inventory for probe-time identity stability.
+    records2, inv_errors2 = tree_inventory(scratch_dir, inv_deadline)
+    if inv_errors2:
+        reasons.extend(sorted(set(inv_errors2)))
+        out["reasons"] = reasons
+        return out
+    if not inventories_match(records, records2):
+        reasons.append("tree_changed")
+        out["reasons"] = reasons
         return out
 
     gen = str(manifest["generation"])
     released_at = str(manifest["releasedAt"])
+    fp = inventory_fingerprint(records2)
     out["generation"] = gen
     out["released_at"] = released_at
-    out["candidate_token"] = make_token(agent_id, gen, released_at, int(size or 0), st)
+    out["inventory_fingerprint"] = fp
+    out["candidate_token"] = make_token(agent_id, gen, released_at, fp)
     out["classification"] = "eligible"
     out["reasons"] = []
     return out
+
 
 def run_probe(
     *,
@@ -826,6 +1177,10 @@ def run_probe(
     started = started_at or now_fn()
     started_iso = started.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     runtime_root = load_runtime_root(config_path)
+    for name in ("scratch", "locks", "artifacts", "quarantine"):
+        p = os.path.join(runtime_root, name)
+        if os.path.lexists(p):
+            ensure_no_symlink_components(p, name)
     size_deadline = time.monotonic() + SIZE_WALK_TIMEOUT_S
 
     free = {
@@ -833,11 +1188,14 @@ def run_probe(
         "runtime_root": free_bytes(runtime_root),
     }
     report = {
-        "artifacts_bytes": report_aggregate(runtime_root, "artifacts", size_deadline),
-        "quarantine_bytes": report_aggregate(runtime_root, "quarantine", size_deadline),
+        "artifacts": report_aggregate(runtime_root, "artifacts", size_deadline),
+        "quarantine": report_aggregate(runtime_root, "quarantine", size_deadline),
     }
+    report_blockers: list[str] = []
+    for key, agg in report.items():
+        if agg["status"] != "ok":
+            report_blockers.append(f"report_{key}_{agg['error'] or 'unknown'}")
 
-    # Process snapshot (post-start, complete, ≤45s)
     snap, snap_reasons = wait_for_snapshot(
         census_path,
         proc_root=proc_root,
@@ -852,7 +1210,6 @@ def run_probe(
     if snap is not None:
         process_ok, process_reasons, by_pid = process_proof(snap, proc_root)
 
-    # Paseo census — if it fails, block all candidates
     paseo_ok = True
     paseo_reasons: list[str] = []
     paseo: dict[str, Any] = {
@@ -861,6 +1218,8 @@ def run_probe(
         "schedules": [],
         "permits": [],
         "terminals": [],
+        "protected_schedule_agents": set(),
+        "parent_of": {},
     }
     try:
         paseo = collect_paseo_census(runner)
@@ -872,9 +1231,20 @@ def run_probe(
         process_ok = False
         process_reasons = process_reasons + paseo_reasons
 
+    if report_blockers:
+        # Report-only aggregates must never claim 0 on failure; surface as probe blockers
+        # so callers never treat the report as complete.
+        pass
+
+    uuid_ids, unknown_names = list_scratch_entries(runtime_root)
+    inventory_incomplete = bool(unknown_names)
+    inventory_reasons = (
+        [f"unknown_scratch_entry:{n}" for n in unknown_names] if unknown_names else []
+    )
+
     now = now_fn()
     candidates = []
-    for agent_id in list_scratch_candidates(runtime_root):
+    for agent_id in uuid_ids:
         candidates.append(
             classify_candidate(
                 agent_id=agent_id,
@@ -887,6 +1257,8 @@ def run_probe(
                 by_pid=by_pid,
                 size_deadline=size_deadline,
                 holding_lock_for=holding_lock_for,
+                inventory_incomplete=inventory_incomplete,
+                inventory_reasons=inventory_reasons,
             )
         )
 
@@ -895,7 +1267,19 @@ def run_probe(
         "started_at": started_iso,
         "runtime_root": runtime_root,
         "free_bytes": free,
-        "report_only": report,
+        "report_only": {
+            "artifacts_bytes": report["artifacts"]["bytes"],
+            "quarantine_bytes": report["quarantine"]["bytes"],
+            "artifacts_status": report["artifacts"]["status"],
+            "quarantine_status": report["quarantine"]["status"],
+            "artifacts_error": report["artifacts"]["error"],
+            "quarantine_error": report["quarantine"]["error"],
+            "errors": report_blockers,
+        },
+        "scratch_inventory": {
+            "complete": not inventory_incomplete,
+            "unknown_entries": unknown_names,
+        },
         "process_census": {
             "status": "ok" if process_ok else "blocked",
             "reasons": process_reasons,
@@ -906,100 +1290,9 @@ def run_probe(
     }
 
 
-def inventory_tree(root: str) -> tuple[list[tuple[str, os.stat_result]], list[str]]:
-    """Inventory files then dirs (deepest first). Never follows symlinks."""
-    errors: list[str] = []
-    files: list[tuple[str, os.stat_result]] = []
-    dirs: list[tuple[str, os.stat_result]] = []
-
-    try:
-        root_st = os.lstat(root)
-    except OSError:
-        return [], ["root_missing"]
-    if stat.S_ISLNK(root_st.st_mode):
-        return [], ["root_is_symlink"]
-    if not stat.S_ISDIR(root_st.st_mode):
-        return [], ["root_not_directory"]
-    root_dev = root_st.st_dev
-
-    def walk(path: str) -> None:
-        try:
-            st = os.lstat(path)
-        except OSError:
-            errors.append("path_changed")
-            return
-        if st.st_dev != root_dev:
-            errors.append("mount_crossing")
-            return
-        if stat.S_ISLNK(st.st_mode):
-            errors.append("symlink_content")
-            return
-        if stat.S_ISREG(st.st_mode):
-            if st.st_nlink > 1:
-                errors.append("hard_link")
-                return
-            files.append((path, st))
-            return
-        if stat.S_ISDIR(st.st_mode):
-            dirs.append((path, st))
-            try:
-                with os.scandir(path) as it:
-                    for ent in it:
-                        walk(ent.path)
-            except OSError:
-                errors.append("unreadable_dir")
-            return
-        errors.append("special_file")
-
-    walk(root)
-    dirs.sort(key=lambda x: x[0].count(os.sep), reverse=True)
-    return files + dirs, errors
-
-def remove_scratch_exact(scratch_dir: str) -> int:
-    """Remove only the exact scratch directory. Symlink-safe, fail-closed."""
-    entries, errors = inventory_tree(scratch_dir)
-    if errors:
-        raise ToolError(f"refuse scratch removal: {','.join(sorted(set(errors)))}")
-
-    files = [(p, st) for p, st in entries if stat.S_ISREG(st.st_mode)]
-    dirs = [(p, st) for p, st in entries if stat.S_ISDIR(st.st_mode)]
-    dirs.sort(key=lambda x: x[0].count(os.sep), reverse=True)
-
-    bytes_removed = 0
-    for path, st0 in files:
-        try:
-            st1 = os.lstat(path)
-        except OSError as exc:
-            raise ToolError(f"path changed during verification: {path}") from exc
-        if (
-            st1.st_ino != st0.st_ino
-            or st1.st_dev != st0.st_dev
-            or st1.st_size != st0.st_size
-            or stat.S_IFMT(st1.st_mode) != stat.S_IFMT(st0.st_mode)
-            or st1.st_nlink > 1
-        ):
-            raise ToolError(f"contents changed during verification: {path}")
-        bytes_removed += st1.st_size
-        os.unlink(path)
-
-    for path, st0 in dirs:
-        try:
-            st1 = os.lstat(path)
-        except OSError as exc:
-            raise ToolError(f"path changed during verification: {path}") from exc
-        if st1.st_ino != st0.st_ino or st1.st_dev != st0.st_dev:
-            raise ToolError(f"directory identity changed: {path}")
-        try:
-            remaining = os.listdir(path)
-        except OSError as exc:
-            raise ToolError(f"cannot list before rmdir: {path}") from exc
-        if remaining:
-            raise ToolError(f"directory not empty before rmdir: {path}")
-        os.rmdir(path)
-
-    if os.path.lexists(scratch_dir):
-        raise ToolError(f"scratch directory still exists after removal: {scratch_dir}")
-    return bytes_removed
+# ---------------------------------------------------------------------------
+# Archive: final inventory match → tombstone rename → exact remove
+# ---------------------------------------------------------------------------
 
 
 def find_eligible(
@@ -1014,6 +1307,96 @@ def find_eligible(
         ):
             return c
     return None
+
+
+def ensure_quarantine_released(runtime_root: str) -> str:
+    ensure_no_symlink_components(runtime_root, "runtimeRoot")
+    q = os.path.join(runtime_root, "quarantine")
+    if os.path.lexists(q):
+        ensure_no_symlink_components(q, "quarantine")
+        if os.path.islink(q) or not os.path.isdir(q):
+            raise ToolError(f"quarantine is not a real directory: {q}")
+    else:
+        mkdir_exact(q, 0o700)
+    rel = os.path.join(runtime_root, TOMBSTONE_REL)
+    if os.path.lexists(rel):
+        ensure_no_symlink_components(rel, "released-scratch")
+        if os.path.islink(rel) or not os.path.isdir(rel):
+            raise ToolError(f"released-scratch is not a real directory: {rel}")
+    else:
+        mkdir_exact(rel, 0o700)
+    return rel
+
+
+def tombstone_name(agent_id: str, generation: str, token: str) -> str:
+    # Unique, non-colliding with relaunch scratch/{agent_id}.
+    return f"{agent_id}.{generation}.{token[:16]}.{time.time_ns()}"
+
+
+def remove_tombstone_exact(tombstone_dir: str, expected: os.stat_result) -> int:
+    """Remove only the exact tombstone directory. Symlink-safe, fail-closed."""
+    try:
+        st0 = os.lstat(tombstone_dir)
+    except OSError as exc:
+        raise ToolError(f"tombstone missing before removal: {tombstone_dir}") from exc
+    if (
+        st0.st_ino != expected.st_ino
+        or st0.st_dev != expected.st_dev
+        or not stat.S_ISDIR(st0.st_mode)
+        or stat.S_ISLNK(st0.st_mode)
+    ):
+        raise ToolError(f"tombstone identity mismatch: {tombstone_dir}")
+
+    inv_deadline = time.monotonic() + INVENTORY_TIMEOUT_S
+    records, errors = tree_inventory(tombstone_dir, inv_deadline)
+    if errors:
+        raise ToolError(f"refuse tombstone removal: {','.join(sorted(set(errors)))}")
+
+    files = [r for r in records if r["type"] == "file"]
+    # deepest dirs first; root "." last
+    dirs = [r for r in records if r["type"] == "dir"]
+    dirs.sort(
+        key=lambda r: (1 if r["rel"] == "." else 0, -r["rel"].count(os.sep), r["rel"])
+    )
+
+    bytes_removed = 0
+    for rec in files:
+        path = tombstone_dir if rec["rel"] == "." else os.path.join(tombstone_dir, rec["rel"])
+        try:
+            st1 = os.lstat(path)
+        except OSError as exc:
+            raise ToolError(f"path changed during verification: {path}") from exc
+        if (
+            st1.st_ino != rec["ino"]
+            or st1.st_dev != rec["dev"]
+            or st1.st_size != rec["size"]
+            or st1.st_nlink > 1
+            or not stat.S_ISREG(st1.st_mode)
+        ):
+            raise ToolError(f"contents changed during verification: {path}")
+        bytes_removed += st1.st_size
+        os.unlink(path)
+
+    for rec in dirs:
+        path = tombstone_dir if rec["rel"] == "." else os.path.join(tombstone_dir, rec["rel"])
+        try:
+            st1 = os.lstat(path)
+        except OSError as exc:
+            raise ToolError(f"path changed during verification: {path}") from exc
+        if st1.st_ino != rec["ino"] or st1.st_dev != rec["dev"] or not stat.S_ISDIR(st1.st_mode):
+            raise ToolError(f"directory identity changed: {path}")
+        try:
+            remaining = os.listdir(path)
+        except OSError as exc:
+            raise ToolError(f"cannot list before rmdir: {path}") from exc
+        if remaining:
+            raise ToolError(f"directory not empty before rmdir: {path}")
+        os.rmdir(path)
+
+    if os.path.lexists(tombstone_dir):
+        raise ToolError(f"tombstone still exists after removal: {tombstone_dir}")
+    return bytes_removed
+
 
 def run_archive(
     *,
@@ -1038,20 +1421,19 @@ def run_archive(
     runtime_root = load_runtime_root(config_path)
     scratch_dir = os.path.join(runtime_root, "scratch", agent_id)
     artifacts_dir = os.path.join(runtime_root, "artifacts", agent_id)
+    ensure_no_symlink_components(scratch_dir, "scratch")
+    if os.path.lexists(artifacts_dir):
+        ensure_no_symlink_components(artifacts_dir, "artifacts")
 
-    # Snapshot artifacts for byte-for-byte check
-    art_before: dict[str, bytes] = {}
+    # Artifact inventory (bounded; streaming hashes — not full content in memory).
+    art_before: list[dict[str, Any]] | None = None
+    art_fp_before: str | None = None
     if os.path.isdir(artifacts_dir) and not os.path.islink(artifacts_dir):
-        for dirpath, _dirnames, filenames in os.walk(artifacts_dir):
-            for name in filenames:
-                p = os.path.join(dirpath, name)
-                if os.path.islink(p):
-                    continue
-                try:
-                    with open(p, "rb") as f:
-                        art_before[p] = f.read()
-                except OSError:
-                    pass
+        inv_deadline = time.monotonic() + INVENTORY_TIMEOUT_S
+        art_before, art_errs = tree_inventory(artifacts_dir, inv_deadline)
+        if art_errs:
+            raise ToolError(f"artifacts inventory failed: {','.join(sorted(set(art_errs)))}")
+        art_fp_before = inventory_fingerprint(art_before)
 
     free_before = {
         "root": free_bytes("/"),
@@ -1059,8 +1441,9 @@ def run_archive(
     }
 
     lock_dir, lock_token = acquire_lock(runtime_root, agent_id)
+    outcome: dict[str, Any] | None = None
     try:
-        # Post-lock revalidation with a new started_at so snapshot must be fresh after lock.
+        # Final matching proof after fresh census + lock.
         started = now_fn()
         probe = run_probe(
             config_path=config_path,
@@ -1074,7 +1457,6 @@ def run_archive(
             holding_lock_for=agent_id,
         )
         cand = find_eligible(probe, agent_id, generation, candidate_token)
-
         if cand is None:
             raise ToolError(
                 "archive revalidation failed: candidate not eligible or token/generation mismatch"
@@ -1082,34 +1464,100 @@ def run_archive(
         if norm(cand["path"]) != norm(scratch_dir):
             raise ToolError("archive revalidation failed: path mismatch")
 
-        bytes_removed = remove_scratch_exact(scratch_dir)
+        # Final inventory after census/lock must still match the candidate token.
+        inv_deadline = time.monotonic() + INVENTORY_TIMEOUT_S
+        final_records, final_errs = tree_inventory(scratch_dir, inv_deadline)
+        if final_errs:
+            raise ToolError(f"final inventory blocked: {','.join(sorted(set(final_errs)))}")
+        final_fp = inventory_fingerprint(final_records)
+        expected_token = make_token(agent_id, generation, str(cand["released_at"]), final_fp)
+        if expected_token != candidate_token:
+            raise ToolError("final inventory does not match candidate token")
 
-        # Artifacts must be untouched
-        for p, content in art_before.items():
-            try:
-                with open(p, "rb") as f:
-                    if f.read() != content:
-                        raise ToolError(f"artifacts mutated during archive: {p}")
-            except OSError as exc:
-                raise ToolError(f"artifacts missing after archive: {p}") from exc
+        try:
+            scratch_st = os.lstat(scratch_dir)
+        except OSError as exc:
+            raise ToolError(f"cannot lstat scratch before rename: {scratch_dir}") from exc
+        if not stat.S_ISDIR(scratch_st.st_mode) or stat.S_ISLNK(scratch_st.st_mode):
+            raise ToolError(f"scratch is not a real directory: {scratch_dir}")
+
+        q_parent = ensure_quarantine_released(runtime_root)
+        # Same-filesystem atomic rename into private tombstone.
+        tname = tombstone_name(agent_id, generation, candidate_token)
+        tombstone_dir = os.path.join(q_parent, tname)
+        ensure_no_symlink_components(tombstone_dir, "tombstone")
+        if os.path.lexists(tombstone_dir):
+            raise ToolError(f"tombstone path already exists (collision): {tombstone_dir}")
+        try:
+            os.rename(scratch_dir, tombstone_dir)
+        except OSError as exc:
+            raise ToolError(f"atomic rename to tombstone failed: {exc}") from exc
+
+        try:
+            t_st = os.lstat(tombstone_dir)
+        except OSError as exc:
+            raise ToolError(f"tombstone missing after rename: {tombstone_dir}") from exc
+        if t_st.st_ino != scratch_st.st_ino or t_st.st_dev != scratch_st.st_dev:
+            raise ToolError(f"tombstone identity mismatch after rename: {tombstone_dir}")
+
+        try:
+            bytes_removed = remove_tombstone_exact(tombstone_dir, t_st)
+        except Exception as exc:
+            # Do not pretend completion; leave recoverable tombstone, keep lock until outcome.
+            outcome = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "quarantined_pending_removal",
+                "agent_id": agent_id,
+                "generation": generation,
+                "path": scratch_dir,
+                "tombstone_path": tombstone_dir,
+                "bytes_removed": 0,
+                "error": str(exc),
+                "free_bytes_before": free_before,
+                "free_bytes_after": {
+                    "root": free_bytes("/"),
+                    "runtime_root": free_bytes(runtime_root),
+                },
+                "artifacts_preserved": True,
+            }
+            return outcome
+
+        # Artifacts must be untouched (inventory match, not full content reload).
+        if art_fp_before is not None and art_before is not None:
+            inv_deadline = time.monotonic() + INVENTORY_TIMEOUT_S
+            art_after, art_errs = tree_inventory(artifacts_dir, inv_deadline)
+            if art_errs:
+                raise ToolError(
+                    f"artifacts inventory after archive failed: {','.join(sorted(set(art_errs)))}"
+                )
+            if inventory_fingerprint(art_after) != art_fp_before:
+                raise ToolError("artifacts mutated during archive")
 
         free_after = {
             "root": free_bytes("/"),
             "runtime_root": free_bytes(runtime_root),
         }
-        return {
+        outcome = {
             "schema_version": SCHEMA_VERSION,
             "status": "archived",
             "agent_id": agent_id,
             "generation": generation,
             "path": scratch_dir,
+            "tombstone_path": None,
             "bytes_removed": bytes_removed,
             "free_bytes_before": free_before,
             "free_bytes_after": free_after,
             "artifacts_preserved": True,
         }
+        return outcome
     finally:
+        # Lock held until outcome is fully determined; release after return path is set.
         release_lock(lock_dir, agent_id, lock_token)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1131,32 +1579,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CENSUS,
         help="Process census snapshot path.",
     )
-    p.add_argument(
-        "--proc-root",
-        default="/proc",
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument(
-        "--wait-seconds",
-        type=float,
-        default=SNAPSHOT_WAIT_S,
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument(
-        "--poll-seconds",
-        type=float,
-        default=0.25,
-        help=argparse.SUPPRESS,
-    )
+    p.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
+    p.add_argument("--wait-seconds", type=float, default=SNAPSHOT_WAIT_S, help=argparse.SUPPRESS)
+    p.add_argument("--poll-seconds", type=float, default=0.25, help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="command", required=True)
-
     sub.add_parser("probe", help="Classify scratch candidates (no mutation).")
-
     arch = sub.add_parser("archive", help="Archive exactly one eligible candidate.")
     arch.add_argument("--agent-id", required=True)
     arch.add_argument("--generation", required=True)
     arch.add_argument("--candidate-token", required=True)
     return p
+
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
@@ -1198,6 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"agent-scratch-cleanup: {exc}", file=sys.stderr)
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -261,7 +261,10 @@ quarantine aggregate sizes are **report-only**.
 `probe` emits deterministic JSON with:
 
 - free bytes for `/` and the runtime root;
-- report-only artifact/quarantine totals;
+- report-only artifact/quarantine totals (`bytes` + `status`; timeouts/unreadable walks
+  report `status=unknown`, `bytes=null`, and an error — **never** a silent `0`);
+- scratch inventory completeness (non-UUID entries under `scratch/` are reported and
+  make the inventory incomplete, blocking all candidates);
 - every scratch UUID candidate classified `protected` / `blocked` / `eligible` with
   exact reasons, a size walk capped at **60s**, and a candidate token when eligible.
 
@@ -269,13 +272,36 @@ Strict manifest requirements for eligibility: exact UUID directory/`agentId`, sc
 version `1`, generation UUID, lifecycle `released`, and `releasedAt` valid and at
 least **24h** old. Active, malformed, symlink, or unknown agents block or protect.
 
-Read-only Paseo CLI census: exact agent inspect must prove `archivedAt` is set **or**
-`status` is `closed`; list all unarchived agents and protect the matching agent or any
-unarchived descendant; protect active schedules targeting it, pending permissions for
-it, and terminals/processes whose resolved paths fall within its scratch; protect a
-present per-agent lock. Any missing, unparseable, or page-capped census **blocks**.
+Candidate identity binds a full deterministic tree inventory (type, relative path,
+device/inode, mode, uid/gid, size, mtime ns, nlink; regular-file SHA-256), capped at
+**60s**, refusing symlinks, hard links, special files, mount crossings, unreadable
+entries, and change races. Two matching complete inventories are required; the final
+matching inventory is taken after the fresh post-start census and per-agent lock.
 
-Process proof uses the census merge rule above.
+Read-only Paseo CLI census (fail closed on malformed entries, ambiguous/missing agent
+IDs, page-limit ambiguity, terminal cwd ambiguity, permits, or active schedules):
+
+- exact agent inspect must prove `archivedAt` is set **or** `status` is `closed`;
+- list all unarchived agents and protect the matching agent;
+- unarchived **descendants** are proven via authoritative `inspect` `ParentAgentId`
+  chains (not an assumed `--label` filter); malformed/unknown ancestry **blocks**;
+- every **active** schedule target is resolved with
+  `paseo schedule inspect <id> --identity-only` (never trust abbreviated display
+  targets from `schedule ls`); protect any schedule whose identity target resolves to
+  the candidate;
+- protect pending permissions for the candidate and terminals/processes whose absolute
+  paths fall within its scratch; protect a present per-agent lock.
+
+Any missing, unparseable, or page-capped census **blocks**. Process proof uses the
+census merge rule above and additionally requires every snapshot record used for proof
+to have `scope_complete=true` and a well-formed `references` list of absolute-path
+records; malformed or incomplete process records block **all** candidates. Live
+PID/start-time identity is confirmed against the post-start snapshot.
+
+Path components under `runtimeRoot` (`locks`, `scratch`, `artifacts`, `quarantine`)
+are validated against symlink traversal. Lock parent creation is exact and fail-closed
+(`mkdir` + `chmod`; chmod/fsync failures are not swallowed). Atomic writes refuse
+symlink parents and fsync the file and its directory.
 
 ### Archive
 
@@ -284,14 +310,26 @@ raw path**. It acquires `{runtimeRoot}/locks/<id>.lock` with the exact documente
 `mkdir` + `owner.json` protocol (a present, symlink, or malformed lock blocks and is
 **never** broken by age). While holding the lock it re-runs the candidate probe with a
 newly captured post-start snapshot and requires `eligible` plus the same
-token/generation, then removes **only** the exact scratch directory.
+token/generation, re-inventories the scratch tree, and requires the inventory to match
+the candidate token.
 
-Deletion is non-following and symlink-safe: refuse special files, mount crossings, path
-changes, unexpected hard links, or contents that change during final verification.
-Artifacts remain byte-for-byte untouched. Lock release rechecks the token and removes
-only `owner.json` plus the empty lock directory non-recursively; unexpected contents
-leave the lock fail-closed.
+Deletion avoids unsafe partial loss: after that final matching proof, the exact scratch
+directory is atomically renamed on the same filesystem to a private tombstone under
+`{runtimeRoot}/quarantine/released-scratch/`, then **only** that exact tombstone is
+removed with lstat identity checks (never recursive delete through symlinks). If
+removal fails, the result reports `status=quarantined_pending_removal` with the
+recoverable exact `tombstone_path` and does **not** pretend completion. Tombstone names
+include agent id, generation, token prefix, and a unique suffix so a relaunch cannot
+collide with a retained tombstone. Archive never touches artifacts or other quarantine
+trees outside its own new tombstone. Artifacts are verified with a bounded deterministic
+inventory before/after (streaming hashes; not full content loaded into memory); inventory
+timeout or change blocks deletion.
+
+The per-agent lock is held until the outcome is recorded, then released with the usual
+token recheck (only `owner.json` + empty lock directory; unexpected contents leave the
+lock fail-closed).
 
 Archive reports exact path, measured bytes, free bytes before/after, agent/generation,
-and `artifacts_preserved=true`. One invocation archives at most one candidate; the
-operator custodian should limit sequential archive calls (recommended cap: eight).
+`artifacts_preserved=true`, and optional `tombstone_path`. One invocation archives at
+most one candidate; the operator custodian should limit sequential archive calls
+(recommended cap: eight).

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT = Path(__file__).resolve().parent / "process-census.py"
+SERVICE_UNIT = SCRIPT.parent / "systemd" / "paseo-process-census.service"
 
 
 def load_census():
@@ -430,6 +431,11 @@ class ProcessCensusTests(unittest.TestCase):
             "processes",
         ):
             self.assertIn(key, snap)
+
+    def test_systemd_unit_preserves_snapshot_between_oneshots(self) -> None:
+        unit = SERVICE_UNIT.read_text(encoding="utf-8")
+        self.assertIn("RuntimeDirectory=paseo", unit)
+        self.assertIn("RuntimeDirectoryPreserve=yes", unit)
 
 
 if __name__ == "__main__":

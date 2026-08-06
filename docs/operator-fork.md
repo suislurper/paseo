@@ -181,6 +181,10 @@ paths themselves.
 - Output: `/run/paseo/process-census.json` (mode `0644`; parent `/run/paseo` mode
   `0755`)
 
+The service is a oneshot, so its systemd unit must keep
+`RuntimeDirectoryPreserve=yes`. Without that setting, systemd removes `/run/paseo`
+immediately after every successful capture and consumers never see the snapshot.
+
 The helper walks `/proc` **without changing processes**. The snapshot includes
 `schema_version`, `boot_id`, `captured_at`, `roots`, `complete`, `errors`, and one
 record per current non-kernel process. Successful records carry `pid`, Linux

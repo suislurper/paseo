@@ -31,6 +31,8 @@ RestrictRealtime=yes
 ReadWritePaths=/run/paseo
 RuntimeDirectory=paseo
 RuntimeDirectoryMode=0755
+# Keep the last successful snapshot available while this oneshot is inactive.
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target

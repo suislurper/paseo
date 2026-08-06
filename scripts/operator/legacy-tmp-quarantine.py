@@ -42,6 +42,7 @@ for _n in (
     "interpret_schedule_identity_target",
     "wait_for_snapshot",
     "process_proof",
+    "wait_for_process_proof",
     "file_sha256",
     "SNAPSHOT_WAIT_S",
     "INVENTORY_TIMEOUT_S",
@@ -459,18 +460,28 @@ def classify_source(
         "mtime_ns": ident["mtime_ns"],
         "nlink": ident["nlink"],
     }
-    snap, snap_reasons = wait_snapshot_safe(
+    try:
+        ensure_no_symlink_components(census_path, "census path")
+    except ToolError:
+        out["reasons"] = ["snapshot_path_is_symlink"]
+        out["process_census"]["reasons"] = ["snapshot_path_is_symlink"]
+        return out
+    if os.path.islink(census_path):
+        out["reasons"] = ["snapshot_path_is_symlink"]
+        out["process_census"]["reasons"] = ["snapshot_path_is_symlink"]
+        return out
+    # Cover exact candidate via same roots rule as scratch (under-root check).
+    # Shared helper: one bounded total window with exclusive-transient retries.
+    process_ok, process_reasons, by_pid, snap = wait_for_process_proof(
         census_path,
-        proc_root=proc_root,
+        proc_root,
+        source,
         started_at=started,
         now_fn=now_fn,
         wait_s=wait_s,
         poll_s=poll_s,
     )
-    process_ok, process_reasons, by_pid = False, list(snap_reasons), {}
     if snap is not None:
-        # Cover exact candidate via same roots rule as scratch (under-root check).
-        process_ok, process_reasons, by_pid = process_proof(snap, proc_root, source)
         out["process_census"]["captured_at"] = snap.get("captured_at")
         out["process_census"]["boot_id"] = snap.get("boot_id")
     out["process_census"]["status"] = "ok" if process_ok else "blocked"

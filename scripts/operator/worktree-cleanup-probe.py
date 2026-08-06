@@ -40,6 +40,7 @@ _spec.loader.exec_module(_asc)
 ToolError = _asc.ToolError
 wait_for_snapshot = _asc.wait_for_snapshot
 process_proof = _asc.process_proof
+wait_for_process_proof = _asc.wait_for_process_proof
 ensure_no_symlink_components = _asc.ensure_no_symlink_components
 interpret_schedule_identity_target = _asc.interpret_schedule_identity_target
 DEFAULT_CENSUS = _asc.DEFAULT_CENSUS
@@ -357,11 +358,12 @@ def collect_process_census(
     wait_s: float,
     poll_s: float,
 ) -> tuple[bool, list[str], dict[int, dict[str, Any]], dict[str, Any]]:
-    """Wait for a post-start ≤45s complete same-boot snapshot and prove identity.
+    """Wait for a post-start complete same-boot snapshot and prove identity.
 
     Snapshot roots must cover both the managed worktree root and the repo common
-    Git directory. Returns (ok, reasons, by_pid, summary). Failures block all
-    candidates.
+    Git directory. Uses the shared bounded wait_for_process_proof helper (default
+    75s total window with exclusive-transient retries). Returns
+    (ok, reasons, by_pid, summary). Failures block all candidates.
     """
     summary: dict[str, Any] = {
         "complete": False,
@@ -374,9 +376,11 @@ def collect_process_census(
         ensure_no_symlink_components(census_path, "process census path")
         if os.path.islink(census_path):
             raise ToolError(f"process census path is a symlink: {census_path}")
-        snap, snap_reasons = wait_for_snapshot(
+        process_ok, process_reasons, by_pid, snap = wait_for_process_proof(
             census_path,
-            proc_root=proc_root,
+            proc_root,
+            managed_root,
+            common_git_dir,
             started_at=started_at,
             now_fn=now_fn,
             wait_s=wait_s,
@@ -386,20 +390,9 @@ def collect_process_census(
         summary["reasons"] = [f"snapshot_wait:{exc}"]
         return False, list(summary["reasons"]), {}, summary
 
-    if snap is None:
-        summary["reasons"] = list(snap_reasons) or ["snapshot_missing"]
-        return False, list(summary["reasons"]), {}, summary
-
-    summary["captured_at"] = snap.get("captured_at")
-    summary["boot_id"] = snap.get("boot_id")
-    try:
-        process_ok, process_reasons, by_pid = process_proof(
-            snap, proc_root, managed_root, common_git_dir
-        )
-    except ToolError as exc:
-        summary["reasons"] = [f"process_proof:{exc}"]
-        return False, list(summary["reasons"]), {}, summary
-
+    if snap is not None:
+        summary["captured_at"] = snap.get("captured_at")
+        summary["boot_id"] = snap.get("boot_id")
     summary["complete"] = process_ok
     summary["status"] = "ok" if process_ok else "blocked"
     summary["reasons"] = list(process_reasons)

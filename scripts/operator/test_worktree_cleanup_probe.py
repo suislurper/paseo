@@ -777,9 +777,112 @@ class InspectAndSourceTests(unittest.TestCase):
 
 
 class WaitBoundTests(unittest.TestCase):
-    def test_default_wait_is_45s(self) -> None:
-        self.assertEqual(M.SNAPSHOT_WAIT_S, 45)
+    def test_default_wait_is_75s(self) -> None:
+        self.assertEqual(M.SNAPSHOT_WAIT_S, 75)
         self.assertEqual(M.DEFAULT_CENSUS, "/run/paseo/process-census.json")
+
+
+class TransientProcessProofRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.h = Harness()
+        self.h.write_census()
+
+    def tearDown(self) -> None:
+        self.h.close()
+
+    def _collect(self, wait_s: float = 2.0, poll_s: float = 0.05) -> tuple[bool, list[str], Any, dict[str, Any]]:
+        return M.collect_process_census(
+            census_path=str(self.h.census),
+            proc_root=str(self.h.proc),
+            managed_root=str(self.h.managed),
+            common_git_dir=str(self.h.repo / ".git"),
+            started_at=self.h.started,
+            now_fn=lambda: self.h.now,
+            wait_s=wait_s,
+            poll_s=poll_s,
+        )
+
+    def test_transient_process_new_retries_with_newer_snapshot(self) -> None:
+        pdir = self.h.proc / "2"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(2, "new", 50))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                self.h.processes = [
+                    {
+                        "pid": 1,
+                        "start_time_ticks": 10,
+                        "name": "init",
+                        "uid": 0,
+                        "scope_complete": True,
+                        "references": [],
+                    },
+                    {
+                        "pid": 2,
+                        "start_time_ticks": 50,
+                        "name": "new",
+                        "uid": 1000,
+                        "scope_complete": True,
+                        "references": [],
+                    },
+                ]
+                self.h.write_census(captured_at=iso(self.h.now + timedelta(seconds=1)))
+
+        with mock.patch.object(M._asc.time, "sleep", side_effect=on_sleep):
+            ok, reasons, _, summary = self._collect()
+        self.assertTrue(ok, reasons)
+        self.assertEqual(summary["status"], "ok")
+        self.assertGreaterEqual(sleep_n["n"], 1)
+
+    def test_persistent_transient_blocks_with_exact_final_reasons(self) -> None:
+        pdir = self.h.proc / "2"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(2, "new", 50))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        with mock.patch.object(M._asc.time, "sleep", return_value=None):
+            ok, reasons, _, summary = self._collect(wait_s=0.15, poll_s=0.01)
+        self.assertFalse(ok)
+        self.assertIn("process_new", reasons)
+        self.assertEqual(summary["status"], "blocked")
+
+    def test_mixed_transient_nontransient_blocks_immediately(self) -> None:
+        pdir = self.h.proc / "2"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(2, "new", 50))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        self.h.write_census(roots=["/var/unrelated"])
+        # Re-add live process after write_census reseeded proc.
+        pdir = self.h.proc / "2"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(2, "new", 50))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_calls: list[float] = []
+        with mock.patch.object(M._asc.time, "sleep", side_effect=lambda s: sleep_calls.append(s)):
+            ok, reasons, _, _ = self._collect(wait_s=2.0)
+        self.assertFalse(ok)
+        self.assertIn("snapshot_roots_unrelated", reasons)
+        self.assertIn("process_new", reasons)
+        self.assertEqual(sleep_calls, [])
+
+    def test_process_new_still_blocks_when_wait_zero(self) -> None:
+        pdir = self.h.proc / "2"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(2, "new", 50))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        ok, reasons, _, _ = self._collect(wait_s=0.0, poll_s=0.0)
+        self.assertFalse(ok)
+        self.assertIn("process_new", reasons)
 
 
 if __name__ == "__main__":

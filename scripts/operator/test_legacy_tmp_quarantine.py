@@ -744,6 +744,125 @@ class Tests(unittest.TestCase):
         self.assertEqual(r["classification"], "eligible")
         self.assertEqual(r["source"]["basename"], "paseo-*")
 
+    def test_default_proof_window_is_75s(self) -> None:
+        self.assertEqual(M.SNAPSHOT_WAIT_S, 75)
+
+    def test_transient_process_new_retries_with_newer_snapshot(self) -> None:
+        src = self.h.put_candidate()
+        self.h.write_census(captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                self.h.processes = [
+                    {
+                        "pid": 1,
+                        "start_time_ticks": 10,
+                        "name": "init",
+                        "scope_complete": True,
+                        "references": [],
+                    },
+                    {
+                        "pid": 77,
+                        "start_time_ticks": 1,
+                        "name": "new",
+                        "scope_complete": True,
+                        "references": [],
+                    },
+                ]
+                self.h.write_census(
+                    captured_at=iso(self.h.now + timedelta(seconds=1)),
+                    roots=[str(src)],
+                )
+
+        with mock.patch.object(M._asc.time, "sleep", side_effect=on_sleep):
+            result = M.run_probe(
+                source=str(src),
+                tmp_root=str(self.h.tmp_root),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+                data_root=str(self.h.data_root),
+            )
+        self.assertGreaterEqual(sleep_n["n"], 1)
+        self.assertEqual(result["classification"], "eligible", result)
+        self.assertEqual(result["process_census"]["status"], "ok")
+
+    def test_persistent_transient_blocks_with_exact_final_reasons(self) -> None:
+        src = self.h.put_candidate()
+        self.h.write_census()
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        with mock.patch.object(M._asc.time, "sleep", return_value=None):
+            result = M.run_probe(
+                source=str(src),
+                tmp_root=str(self.h.tmp_root),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.15,
+                poll_s=0.01,
+                started_at=self.h.now - timedelta(seconds=1),
+                data_root=str(self.h.data_root),
+            )
+        self.assertEqual(result["classification"], "blocked")
+        self.assertIn("process_new", result["reasons"])
+        self.assertIn("process_new", result["process_census"]["reasons"])
+
+    def test_mixed_transient_nontransient_blocks_immediately(self) -> None:
+        src = self.h.put_candidate()
+        self.h.write_census(roots=["/var/unrelated"])
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        sleep_calls: list[float] = []
+        with mock.patch.object(M._asc.time, "sleep", side_effect=lambda s: sleep_calls.append(s)):
+            result = M.run_probe(
+                source=str(src),
+                tmp_root=str(self.h.tmp_root),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+                data_root=str(self.h.data_root),
+            )
+        self.assertEqual(result["classification"], "blocked")
+        self.assertIn("snapshot_roots_unrelated", result["reasons"])
+        self.assertIn("process_new", result["reasons"])
+        self.assertEqual(sleep_calls, [])
+
+    def test_process_new_still_blocks_when_wait_zero(self) -> None:
+        src = self.h.put_candidate()
+        self.h.write_census()
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        result = self.h.probe(src)
+        self.assertEqual(result["classification"], "blocked")
+        self.assertIn("process_new", result["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

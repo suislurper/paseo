@@ -24,7 +24,12 @@ RELEASE_GRACE_S = 24 * 3600
 SIZE_WALK_TIMEOUT_S = 60
 INVENTORY_TIMEOUT_S = 60
 SNAPSHOT_MAX_AGE_S = 45
-SNAPSHOT_WAIT_S = 45
+# Total bounded window for wait-for-acceptable-snapshot + process_proof (+ transient retries).
+SNAPSHOT_WAIT_S = 75
+# Process-proof failures that may be pure timer/scan races; only these may re-wait.
+TRANSIENT_PROCESS_REASONS = frozenset(
+    {"process_new", "process_pid_mismatch", "live_process_race"}
+)
 # Plain JSON list length at/above this matches the worktree probe page-cap ambiguity.
 CLI_PAGE_CAP = 200
 DEFAULT_CENSUS = "/run/paseo/process-census.json"
@@ -895,7 +900,14 @@ def wait_for_snapshot(
     now_fn: Callable[[], datetime],
     wait_s: float,
     poll_s: float,
+    min_captured_at: datetime | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
+    """Poll until a complete same-boot post-start ≤SNAPSHOT_MAX_AGE_S snapshot appears.
+
+    When min_captured_at is set, also require captured_at strictly newer than that
+    timestamp (used after a transient process-proof failure). wait_s is the bound for
+    this wait only; the combined consumer helper owns the total proof window.
+    """
     boot_id = read_boot_id(proc_root)
     deadline = time.monotonic() + wait_s
     last_reasons = ["snapshot_missing"]
@@ -907,13 +919,113 @@ def wait_for_snapshot(
                 snap, boot_id=boot_id, started_at=started_at, now=now
             )
             if ok:
-                return snap, []
-            last_reasons = reasons
+                if min_captured_at is not None:
+                    captured = snap.get("captured_at")
+                    try:
+                        cap_dt = parse_iso(captured) if isinstance(captured, str) else None
+                    except (TypeError, ValueError):
+                        cap_dt = None
+                    if cap_dt is None or cap_dt <= min_captured_at:
+                        # Acceptable but not strictly newer — keep polling.
+                        last_reasons = ["snapshot_not_newer"]
+                    else:
+                        return snap, []
+                else:
+                    return snap, []
+            else:
+                last_reasons = reasons
         else:
             last_reasons = ["snapshot_missing"]
         if time.monotonic() >= deadline:
             return None, last_reasons
         time.sleep(poll_s)
+
+
+def reasons_exclusively_transient(reasons: list[str]) -> bool:
+    """True only when reasons is non-empty and every tag is a pure process race."""
+    return bool(reasons) and all(r in TRANSIENT_PROCESS_REASONS for r in reasons)
+
+
+def wait_for_process_proof(
+    census_path: str,
+    proc_root: str,
+    required_root: str,
+    *extra_required_roots: str,
+    started_at: datetime,
+    now_fn: Callable[[], datetime],
+    wait_s: float,
+    poll_s: float,
+) -> tuple[bool, list[str], dict[int, dict[str, Any]], dict[str, Any] | None]:
+    """Wait for an acceptable snapshot and prove live process identity.
+
+    Single bounded total window (default SNAPSHOT_WAIT_S = 75s) covering the first
+    acceptable-snapshot wait, process_proof, and any exclusive-transient retries.
+
+    When process_proof fails solely for process_new, process_pid_mismatch, and/or
+    live_process_race, wait for a complete same-boot acceptable snapshot whose
+    captured_at is strictly newer than the rejected one, then re-run full proof.
+    Any other reason (missing/malformed/incomplete/stale snapshot, root coverage,
+    unreadable process, scope/reference errors, symlink errors, or mixed
+    transient+nontransient) blocks immediately. Persistent churn blocks at the
+    deadline with the exact final process_proof reasons.
+
+    Returns (ok, reasons, by_pid, snap_or_None).
+    """
+    deadline = time.monotonic() + wait_s
+    last_reasons: list[str] = ["snapshot_missing"]
+    by_pid: dict[int, dict[str, Any]] = {}
+    last_snap: dict[str, Any] | None = None
+    min_captured_at: datetime | None = None
+    attempted = False
+
+    while True:
+        now_mono = time.monotonic()
+        if attempted and now_mono >= deadline:
+            return False, last_reasons, by_pid, last_snap
+
+        remaining = max(0.0, deadline - now_mono)
+        snap, snap_reasons = wait_for_snapshot(
+            census_path,
+            proc_root=proc_root,
+            started_at=started_at,
+            now_fn=now_fn,
+            wait_s=remaining,
+            poll_s=poll_s,
+            min_captured_at=min_captured_at,
+        )
+        attempted = True
+
+        if snap is None:
+            # After a transient proof failure, a missing newer snapshot at deadline
+            # keeps the exact final process_proof reasons (not snapshot_not_newer).
+            if min_captured_at is not None and reasons_exclusively_transient(last_reasons):
+                return False, last_reasons, by_pid, last_snap
+            return False, list(snap_reasons) or last_reasons, by_pid, last_snap
+
+        ok, reasons, by_pid = process_proof(
+            snap, proc_root, required_root, *extra_required_roots
+        )
+        last_snap = snap
+        if ok:
+            return True, [], by_pid, snap
+
+        last_reasons = list(reasons)
+        if not reasons_exclusively_transient(reasons):
+            return False, last_reasons, by_pid, snap
+
+        # Exclusive transient race: require a strictly newer acceptable snapshot.
+        captured = snap.get("captured_at")
+        try:
+            if not isinstance(captured, str):
+                return False, last_reasons, by_pid, snap
+            min_captured_at = parse_iso(captured)
+        except (TypeError, ValueError):
+            return False, last_reasons, by_pid, snap
+
+        if time.monotonic() >= deadline:
+            return False, last_reasons, by_pid, last_snap
+
+        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
 
 
 def _well_formed_reference(ref: Any) -> bool:
@@ -1422,21 +1534,15 @@ def run_probe(
         if agg["status"] != "ok":
             report_blockers.append(f"report_{key}_{agg['error'] or 'unknown'}")
 
-    snap, snap_reasons = wait_for_snapshot(
+    process_ok, process_reasons, by_pid, snap = wait_for_process_proof(
         census_path,
-        proc_root=proc_root,
+        proc_root,
+        runtime_root,
         started_at=started,
         now_fn=now_fn,
         wait_s=wait_s,
         poll_s=poll_s,
     )
-    process_ok = False
-    process_reasons = list(snap_reasons)
-    by_pid: dict[int, dict[str, Any]] = {}
-    if snap is not None:
-        process_ok, process_reasons, by_pid = process_proof(
-            snap, proc_root, runtime_root
-        )
 
     paseo_ok = True
     paseo_reasons: list[str] = []

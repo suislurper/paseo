@@ -229,28 +229,40 @@ requests that packet.
 
 Snapshot freshness alone is **not** proof that a PID still refers to the same
 process, and identity alone is **not** proof that mutable cwd/fd references are still
-safe to act on. The unprivileged managed-scratch cleanup probe and the worktree
-cleanup probe must:
+safe to act on. All three unprivileged cleanup consumers (managed scratch, worktree
+probe, legacy `/tmp` quarantine) share one helper in `agent-scratch-cleanup.py`
+(`wait_for_process_proof`) and must:
 
 1. Record `started_at` at the beginning of the probe.
-2. Wait/poll (at most **45s**) for a **complete** snapshot at
+2. Within a single bounded total proof window of **75s** (CLI `--wait-seconds`;
+   production default), wait/poll for a **complete** snapshot at
    `/run/paseo/process-census.json` that is:
    - same `boot_id` as the current kernel boot id;
    - `captured_at` **strictly after** `started_at` (post-start);
-   - no older than **45s** (`captured_at` vs now).
+   - no older than **45s** (`captured_at` vs now — snapshot max age, unchanged).
 3. Perform its **own current** unprivileged `/proc` scan of **non-kernel** processes
    only (same population rule as the census producer; kernel threads are skipped).
-4. Accept the snapshot only when its `roots` authoritatively cover the configured
-   `runtimeRoot`, and **every** live non-kernel process matches a snapshot record on
-   **both** `pid` and `start_time_ticks`.
-5. If any process is new or reused, any required live/snapshot field is unreadable,
-   kernel-vs-userspace cannot be decided, roots are missing/unrelated/malformed, or
-   the snapshot is incomplete/stale/pre-start, treat process proof as **blocked for all
-   candidates** — do not delete based on the snapshot alone.
+4. Accept the snapshot only when its `roots` authoritatively cover the required path(s)
+   for that consumer, and **every** live non-kernel process matches a snapshot record
+   on **both** `pid` and `start_time_ticks`.
+5. **Exclusive transient retry (within the same 75s window):** if process proof fails
+   **only** for `process_new`, `process_pid_mismatch`, and/or `live_process_race`, wait
+   for a complete same-boot acceptable snapshot whose `captured_at` is **strictly
+   newer** than the rejected snapshot, then re-run the full process proof. Do **not**
+   create another daemon, timer, parser, or public API.
+6. **Non-retryable fail-closed (block immediately):** any other reason — including
+   missing/malformed/incomplete/stale/pre-start snapshot, root coverage failures,
+   unreadable live process, scope/reference errors, symlink errors, or **mixed**
+   transient + non-transient reasons — blocks process proof for **all candidates**
+   with no retry. Persistent exclusive-transient churn blocks at the **75s** deadline
+   with the **exact final** process-proof reasons (existing `process_new` semantics
+   remain when no newer valid snapshot arrives).
 
-This supersedes the earlier five-minute / max-10-minute consumer rule. Matching
-`pid + start_time_ticks` under the same `boot_id` against a post-start ≤45s complete
-snapshot is what closes the race between the 30-second timer and PID reuse.
+This supersedes the earlier five-minute / max-10-minute consumer rule and the prior
+single-shot 45s wait. Matching `pid + start_time_ticks` under the same `boot_id`
+against a post-start ≤45s-age complete snapshot, with a 75s total proof window and
+exclusive-transient newer-snapshot retries, is what closes the race between the
+30-second timer and PID reuse.
 
 ## Managed agent-scratch cleanup
 
@@ -402,11 +414,12 @@ an exact-SHA review lands. Agents must not install, overwrite, or restart live
 ### Process proof (root snapshot consumer)
 
 Replaces the prior unprivileged inline `/proc` path scan. Loads the reviewed consumer
-helpers from sibling `agent-scratch-cleanup.py` (no second process parser). CLI:
+helpers from sibling `agent-scratch-cleanup.py` (no second process parser), including
+shared `wait_for_process_proof`. CLI:
 
 - `--process-census` default `/run/paseo/process-census.json`
-- test seams: `--proc-root`, `--wait-seconds`, `--poll-seconds` (bounded wait default
-  **45s**)
+- test seams: `--proc-root`, `--wait-seconds`, `--poll-seconds` (total proof window
+  default **75s**; individual snapshot max age remains **45s**)
 
 Requires a **complete** same-boot snapshot captured **after** probe `started_at`, age
 ≤ **45s**, with `roots` covering **both** the managed worktree root **and** the
@@ -414,7 +427,10 @@ repository's absolute common Git directory (resolved once per probe via
 `git rev-parse --path-format=absolute --git-common-dir`). Missing either coverage
 blocks every candidate. Validates every current non-kernel PID + `start_time_ticks`,
 `scope_complete`, well-formed absolute references, malformed/duplicate process
-records/roots, snapshot root symlinks, and live races. Any failure sets
+records/roots, snapshot root symlinks, and live races. Exclusive-transient failures
+(`process_new` / `process_pid_mismatch` / `live_process_race` only) may re-wait for a
+strictly newer acceptable snapshot within the same **75s** total window; every other
+failure blocks immediately. Any terminal failure sets
 `process_census.complete=false` / `status=blocked` and blocks all candidates.
 
 Redacted census references become **owner evidence** (no argv/env): protect a
@@ -475,14 +491,17 @@ deleted):
 
 ### Process + Paseo proof
 
-Uses the same producer/consumer merge rule as managed scratch cleanup:
+Uses the same producer/consumer merge rule and shared `wait_for_process_proof` helper
+as managed scratch cleanup:
 
 1. Complete post-start snapshot, same `boot_id`, age ≤ **45s**, with `roots` covering
-   the exact candidate.
+   the exact candidate, inside the shared **75s** total proof window (exclusive-
+   transient newer-snapshot retries only for `process_new` /
+   `process_pid_mismatch` / `live_process_race`).
 2. Every live non-kernel PID + `start_time_ticks` matches a well-formed complete
    snapshot record with absolute path references.
 3. Any process reference under the candidate **protects** it.
-4. Snapshot path symlink or malformed data blocks globally.
+4. Snapshot path symlink or malformed data blocks globally (non-retryable).
 
 Read-only Paseo census (fail closed on missing/ambiguous/page-capped data; never
 infer abbreviated IDs; unarchived list cap `<200`):

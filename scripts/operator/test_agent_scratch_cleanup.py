@@ -1096,6 +1096,134 @@ class Tests(unittest.TestCase):
         self.assertEqual(c["classification"], "blocked")
         self.assertTrue(any("paseo_census" in r and "cycle" in r for r in c["reasons"]), c["reasons"])
 
+    def test_default_proof_window_is_75s(self) -> None:
+        self.assertEqual(M.SNAPSHOT_WAIT_S, 75)
+        self.assertEqual(M.SNAPSHOT_MAX_AGE_S, 45)
+        self.assertEqual(
+            M.TRANSIENT_PROCESS_REASONS,
+            frozenset({"process_new", "process_pid_mismatch", "live_process_race"}),
+        )
+
+    def test_transient_process_new_retries_with_newer_snapshot(self) -> None:
+        """Exclusive process_new re-waits for a strictly newer snapshot then re-proves."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+        # Live process absent from the first snapshot → exclusive transient.
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                self.h.processes = [
+                    {
+                        "pid": 1,
+                        "start_time_ticks": 10,
+                        "name": "init",
+                        "scope_complete": True,
+                        "references": [],
+                    },
+                    {
+                        "pid": 77,
+                        "start_time_ticks": 1,
+                        "name": "new",
+                        "scope_complete": True,
+                        "references": [],
+                    },
+                ]
+                self.h.write_census(captured_at=iso(self.h.now + timedelta(seconds=1)))
+
+        with mock.patch.object(M.time, "sleep", side_effect=on_sleep):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        self.assertGreaterEqual(sleep_n["n"], 1)
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "eligible", c)
+
+    def test_persistent_transient_blocks_with_exact_final_reasons(self) -> None:
+        """Churn that never yields a matching newer snapshot blocks with process_new."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        with mock.patch.object(M.time, "sleep", return_value=None):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.15,
+                poll_s=0.01,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("process_new", c["reasons"])
+
+    def test_mixed_transient_and_nontransient_blocks_immediately(self) -> None:
+        """process_new + non-transient root failure must not enter exclusive retry."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(roots=["/var/unrelated-census-root"], captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_calls: list[float] = []
+        with mock.patch.object(M.time, "sleep", side_effect=lambda s: sleep_calls.append(s)):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_roots_unrelated", c["reasons"])
+        self.assertIn("process_new", c["reasons"])
+        # First snapshot was already acceptable; non-retryable proof → no sleep.
+        self.assertEqual(sleep_calls, [])
+
+    def test_process_new_still_blocks_when_wait_zero(self) -> None:
+        """Existing zero-wait semantics: process_new blocks without a newer snapshot."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census()
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("process_new", c["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

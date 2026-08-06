@@ -862,15 +862,30 @@ def live_pid_map(
     return out, []
 
 
-def load_snapshot(path: str) -> dict[str, Any] | None:
+def load_snapshot(path: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Load a process-census snapshot with an explicit load outcome.
+
+    Returns ``(snap, None)`` on success. On failure ``(None, tag)`` where tag is:
+
+    - ``snapshot_missing`` — path absent (atomic-replace gaps stay pollable)
+    - ``snapshot_malformed`` — JSON parse failure or non-object root (nontransient)
+    - ``snapshot_unreadable`` — read OSError other than path absence (nontransient)
+    """
     if not os.path.isfile(path):
-        return None
+        return None, "snapshot_missing"
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        # TOCTOU / atomic replace: treat absence as missing (pollable).
+        return None, "snapshot_missing"
+    except json.JSONDecodeError:
+        return None, "snapshot_malformed"
+    except OSError:
+        return None, "snapshot_unreadable"
+    if not isinstance(data, dict):
+        return None, "snapshot_malformed"
+    return data, None
 
 
 def snapshot_captured_at(snap: dict[str, Any]) -> datetime | None:
@@ -946,29 +961,44 @@ def wait_for_snapshot(
     wait_s: float,
     poll_s: float,
     min_captured_at: datetime | None = None,
+    deadline_mono: float | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Poll until a complete same-boot post-start ≤SNAPSHOT_MAX_AGE_S snapshot appears.
 
     When min_captured_at is set, also require captured_at strictly newer than that
-    timestamp (used after a transient process-proof failure). wait_s is the bound for
-    this wait only; the combined consumer helper owns the total proof window.
+    timestamp (used after a transient process-proof failure).
+
+    Absolute bound: when ``deadline_mono`` is provided it is the exclusive monotonic
+    deadline for checks and clamped sleeps (production path). When omitted, the
+    standalone ``wait_s`` API establishes ``monotonic() + wait_s`` *before* boot-id
+    / setup work so setup latency cannot extend the window. Zero-wait still does a
+    single observation.
 
     After a transient proof failure (min_captured_at set): if a strictly newer snapshot
     is observed but is incomplete/malformed/stale/otherwise unacceptable, return its
     exact validation reasons immediately (do not poll to the deadline). If the current
     snapshot cannot establish a valid captured_at for the newer-than check, fail closed
-    with the validation tags. Sleeps are clamped to remaining wait time.
+    with the validation tags. Load-time ``snapshot_malformed`` / ``snapshot_unreadable``
+    always block immediately (including after exclusive-transient); path absence stays
+    ``snapshot_missing`` and may be polled (atomic-replace gaps).
     """
+    # Establish the absolute deadline before any setup so boot-id I/O cannot extend it.
+    if deadline_mono is None:
+        deadline_mono = time.monotonic() + max(0.0, wait_s)
     boot_id = read_boot_id(proc_root)
-    deadline = time.monotonic() + max(0.0, wait_s)
     last_reasons = ["snapshot_missing"]
     while True:
         # Always observe at least once (wait_s=0 still does a single-shot check).
         now = now_fn()
-        snap = load_snapshot(census_path)
-        if snap is None:
-            last_reasons = ["snapshot_missing"]
+        snap, load_err = load_snapshot(census_path)
+        if load_err is not None:
+            if load_err == "snapshot_missing":
+                last_reasons = ["snapshot_missing"]
+            else:
+                # Nontransient load failure: block immediately; do not poll.
+                return None, [load_err]
         else:
+            assert snap is not None
             ok, reasons = snapshot_acceptable(
                 snap, boot_id=boot_id, started_at=started_at, now=now
             )
@@ -993,9 +1023,9 @@ def wait_for_snapshot(
                 return snap, []
             else:
                 last_reasons = reasons
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline_mono:
             return None, last_reasons
-        _sleep_clamped(poll_s, deadline)
+        _sleep_clamped(poll_s, deadline_mono)
 
 
 def reasons_exclusively_transient(reasons: list[str]) -> bool:
@@ -1049,6 +1079,8 @@ def wait_for_process_proof(
             return False, last_reasons, by_pid, last_snap
 
         remaining = max(0.0, deadline - now_mono)
+        # Always pass the original absolute deadline for positive windows so setup
+        # work inside wait_for_snapshot cannot rebase monotonic()+remaining.
         snap, snap_reasons = wait_for_snapshot(
             census_path,
             proc_root=proc_root,
@@ -1057,6 +1089,7 @@ def wait_for_process_proof(
             wait_s=remaining,
             poll_s=poll_s,
             min_captured_at=min_captured_at,
+            deadline_mono=deadline if wait_s > 0 else None,
         )
         attempted = True
 

@@ -1346,6 +1346,189 @@ class Tests(unittest.TestCase):
         self.assertIn("process_proof_timeout", c["reasons"])
         self.assertIsNone(c.get("candidate_token"))
 
+    def test_malformed_json_replacement_blocks_immediately_not_process_new(self) -> None:
+        """M1: after exclusive transient, malformed JSON replacement fails closed now.
+
+        load_snapshot must not collapse parse failure into snapshot_missing; wait must
+        return snapshot_malformed immediately and not retain process_new through the
+        deadline.
+        """
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.write_census(captured_at=iso(self.h.now))
+        pdir = self.h.proc / "77"
+        pdir.mkdir()
+        wfile(pdir / "stat", make_stat(77, "new", 1))
+        wfile(pdir / "cmdline", b"new\0")
+        os.symlink("/bin/true", pdir / "exe")
+
+        sleep_n = {"n": 0}
+
+        def on_sleep(_s: float) -> None:
+            sleep_n["n"] += 1
+            if sleep_n["n"] == 1:
+                # Replace with unparseable JSON (malformed load outcome).
+                self.h.census.write_text("{not-valid-json", encoding="utf-8")
+
+        with mock.patch.object(M.time, "sleep", side_effect=on_sleep):
+            probe = M.run_probe(
+                config_path=str(self.h.config),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=2.0,
+                poll_s=0.05,
+                started_at=self.h.now - timedelta(seconds=1),
+            )
+        c = next(x for x in probe["candidates"] if x["agent_id"] == A)
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_malformed", c["reasons"])
+        self.assertNotIn("process_new", c["reasons"])
+        self.assertNotIn("snapshot_missing", c["reasons"])
+        # One sleep to discover the malformed replacement; no deadline polling.
+        self.assertEqual(sleep_n["n"], 1)
+
+    def test_non_object_snapshot_is_malformed_not_missing(self) -> None:
+        """M1: JSON array/non-object root is snapshot_malformed (nontransient)."""
+        self.h.put_scratch()
+        self.h.mark_archived()
+        self.h.seed_proc()
+        self.h.census.write_text("[]\n", encoding="utf-8")
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("snapshot_malformed", c["reasons"])
+        self.assertNotIn("snapshot_missing", c["reasons"])
+
+    def test_load_snapshot_outcomes_distinguish_missing_malformed_unreadable(self) -> None:
+        """M1: explicit load tags for absence / parse failure / read error."""
+        missing_path = str(self.h.root / "no-such-census.json")
+        snap, err = M.load_snapshot(missing_path)
+        self.assertIsNone(snap)
+        self.assertEqual(err, "snapshot_missing")
+
+        bad = self.h.root / "bad.json"
+        bad.write_text("{broken", encoding="utf-8")
+        snap, err = M.load_snapshot(str(bad))
+        self.assertIsNone(snap)
+        self.assertEqual(err, "snapshot_malformed")
+
+        non_obj = self.h.root / "arr.json"
+        non_obj.write_text("null", encoding="utf-8")
+        snap, err = M.load_snapshot(str(non_obj))
+        self.assertIsNone(snap)
+        self.assertEqual(err, "snapshot_malformed")
+
+        # Permission denied → unreadable (skip if we cannot drop mode as this user).
+        denied = self.h.root / "denied.json"
+        denied.write_text('{"ok": true}', encoding="utf-8")
+        os.chmod(denied, 0o000)
+        try:
+            snap, err = M.load_snapshot(str(denied))
+            if err == "snapshot_unreadable":
+                self.assertIsNone(snap)
+            else:
+                # Some environments still allow root/owner read; require a real tag.
+                self.assertIn(err, (None, "snapshot_malformed", "snapshot_unreadable"))
+        finally:
+            os.chmod(denied, 0o644)
+
+        self.h.write_census()
+        snap, err = M.load_snapshot(str(self.h.census))
+        self.assertIsInstance(snap, dict)
+        self.assertIsNone(err)
+
+    def test_wait_for_snapshot_setup_delay_does_not_extend_absolute_deadline(self) -> None:
+        """M2: 10s setup with wait_s=75 must finish by mono 75, not 85.
+
+        wait_for_snapshot must use the original absolute deadline for checks/sleeps
+        rather than rebasing time.monotonic()+remaining after boot-id work.
+        """
+        # No usable census → poll until absolute deadline.
+        if self.h.census.exists():
+            self.h.census.unlink()
+
+        mono = {"t": 0.0}
+
+        def fake_mono() -> float:
+            return mono["t"]
+
+        def slow_boot_id(_proc_root: str) -> str:
+            # Simulated setup delay after the caller already fixed the absolute deadline.
+            mono["t"] += 10.0
+            return BOOT
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(s: float) -> None:
+            sleep_calls.append(s)
+            mono["t"] += s
+
+        with mock.patch.object(M.time, "monotonic", side_effect=fake_mono):
+            with mock.patch.object(M, "read_boot_id", side_effect=slow_boot_id):
+                with mock.patch.object(M.time, "sleep", side_effect=fake_sleep):
+                    _snap, reasons = M.wait_for_snapshot(
+                        str(self.h.census),
+                        proc_root=str(self.h.proc),
+                        started_at=self.h.now - timedelta(seconds=1),
+                        now_fn=lambda: self.h.now,
+                        wait_s=75.0,
+                        poll_s=30.0,
+                        deadline_mono=75.0,
+                    )
+        self.assertEqual(reasons, ["snapshot_missing"])
+        # Original absolute deadline is 75; setup cost 10 must not yield finish at 85.
+        self.assertLessEqual(mono["t"], 75.0)
+        self.assertGreater(mono["t"], 10.0)
+        # Final sleep must be clamped to remaining after setup (≤65), not full poll.
+        self.assertTrue(sleep_calls)
+        self.assertLessEqual(sum(sleep_calls), 65.0 + 1e-9)
+
+    def test_wait_for_process_proof_passes_original_absolute_deadline(self) -> None:
+        """M2: production helper always binds wait_for_snapshot to original deadline."""
+        # Missing census forces polling; 10s boot-id setup must not extend past 75.
+        if self.h.census.exists():
+            self.h.census.unlink()
+
+        mono = {"t": 0.0}
+        seen_deadlines: list[float | None] = []
+
+        def fake_mono() -> float:
+            return mono["t"]
+
+        real_wait = M.wait_for_snapshot
+
+        def tracking_wait(*args: Any, **kwargs: Any) -> tuple[dict[str, Any] | None, list[str]]:
+            seen_deadlines.append(kwargs.get("deadline_mono"))
+            return real_wait(*args, **kwargs)
+
+        def slow_boot_id(_proc_root: str) -> str:
+            mono["t"] += 10.0
+            return BOOT
+
+        def fake_sleep(s: float) -> None:
+            mono["t"] += s
+
+        with mock.patch.object(M.time, "monotonic", side_effect=fake_mono):
+            with mock.patch.object(M, "read_boot_id", side_effect=slow_boot_id):
+                with mock.patch.object(M, "wait_for_snapshot", side_effect=tracking_wait):
+                    with mock.patch.object(M.time, "sleep", side_effect=fake_sleep):
+                        ok, reasons, _by_pid, _snap = M.wait_for_process_proof(
+                            str(self.h.census),
+                            str(self.h.proc),
+                            str(self.h.runtime / "scratch"),
+                            started_at=self.h.now - timedelta(seconds=1),
+                            now_fn=lambda: self.h.now,
+                            wait_s=75.0,
+                            poll_s=30.0,
+                        )
+        self.assertFalse(ok)
+        self.assertEqual(reasons, ["snapshot_missing"])
+        self.assertTrue(seen_deadlines)
+        # Production positive window must pass the original absolute deadline (75.0).
+        self.assertEqual(seen_deadlines[0], 75.0)
+        self.assertLessEqual(mono["t"], 75.0)
+
 
 if __name__ == "__main__":
     unittest.main()

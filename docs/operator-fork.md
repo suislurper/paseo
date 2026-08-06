@@ -256,21 +256,32 @@ probe, legacy `/tmp` quarantine) share one helper in `agent-scratch-cleanup.py`
    missing/malformed/incomplete/stale/pre-start snapshot, root coverage failures,
    unreadable live process, scope/reference errors, symlink errors, or **mixed**
    transient + non-transient reasons — blocks process proof for **all candidates**
-   with no retry. After an exclusive-transient failure, a **strictly newer** snapshot
-   that is incomplete/malformed/stale/root-invalid (or otherwise non-acceptable) also
+   with no retry. Snapshot **load** outcomes are explicit: true path absence is
+   `snapshot_missing` (atomic-replace gaps may still be polled); JSON parse failure
+   or non-object root is `snapshot_malformed`; other read errors are
+   `snapshot_unreadable`. Malformed/unreadable are **nontransient** and block
+   immediately — including when observed after an exclusive-transient proof — and
+   must **not** retain prior `process_new` / mismatch / race tags. After an
+   exclusive-transient failure, a **strictly newer** snapshot that is
+   incomplete/malformed/stale/root-invalid (or otherwise non-acceptable) also
    blocks **immediately** with that snapshot's exact validation reasons — never keep
    polling to the deadline and never overwrite those tags with the prior
-   `process_new` / mismatch / race reasons. Persistent exclusive-transient churn with
+   exclusive-transient reasons. Persistent exclusive-transient churn with
    **no** strictly newer snapshot blocks at the **75s** deadline with the **exact
    final** process-proof reasons (existing `process_new` semantics remain only when no
    newer snapshot ever arrives).
-7. **Deadline coverage:** the **75s** total window includes snapshot waits, **all**
-   sleeps (each clamped to remaining time), and live `/proc` scans inside
-   `live_pid_map` / `process_proof`. Before success, re-check the absolute deadline
-   and snapshot acceptability/freshness with current `now_fn`. A proof that would
-   complete after the deadline returns a clear non-transient reason such as
-   `process_proof_timeout` (or `snapshot_stale` when freshness fails) and **never**
-   authorizes cleanup.
+7. **Deadline coverage:** the **75s** total window is one **original absolute**
+   monotonic deadline from proof start. `wait_for_process_proof` passes that same
+   absolute deadline into `wait_for_snapshot`; checks and clamped sleeps use it
+   directly (never rebased as `monotonic()+remaining` after boot-id/setup work).
+   The window includes snapshot waits, **all** sleeps, and live `/proc` scans
+   inside `live_pid_map` / `process_proof`. A simulated 10s setup delay with
+   `wait_s=75` must finish by monotonic 75, not 85. Before success, re-check the
+   absolute deadline and snapshot acceptability/freshness with current `now_fn`.
+   A proof that would complete after the deadline returns a clear non-transient
+   reason such as `process_proof_timeout` (or `snapshot_stale` when freshness
+   fails) and **never** authorizes cleanup. Zero-wait single-shot test seams may
+   remain but cannot authorize late production cleanup.
 
 This supersedes the earlier five-minute / max-10-minute consumer rule and the prior
 single-shot 45s wait. Matching `pid + start_time_ticks` under the same `boot_id`

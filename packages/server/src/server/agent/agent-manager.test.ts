@@ -2016,6 +2016,9 @@ test.each([
   ["codex", "codex"] as const,
   ["claude", "claude"] as const,
   ["acp (generic)", "acp"] as const,
+  ["opencode", "opencode"] as const,
+  ["omp", "omp"] as const,
+  ["pi", "pi"] as const,
 ])(
   "createAgent injects runtime storage env after caller env for %s via common launch context",
   async (_label, provider) => {

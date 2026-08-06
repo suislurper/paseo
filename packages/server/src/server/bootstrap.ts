@@ -132,6 +132,7 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
+import { AgentRuntimeStorage } from "./agent/agent-runtime-storage.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
@@ -377,6 +378,11 @@ export type DaemonLifecycleIntent =
 export interface PaseoDaemonConfig {
   listen: string;
   paseoHome: string;
+  /**
+   * Optional absolute root for durable per-agent scratch/artifacts.
+   * When unset, AgentManager does not create runtime storage or inject runtime dirs.
+   */
+  agentRuntimeRoot?: string;
   daemonVersion?: string;
   desktopManaged?: boolean;
   worktreesRoot?: string;
@@ -811,10 +817,16 @@ export async function createPaseoDaemon(
     extraClients: config.agentClients,
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
+  // One shared runtime storage when configured; unset keeps upstream launch env only.
+  const agentRuntimeStorage =
+    config.agentRuntimeRoot !== undefined
+      ? new AgentRuntimeStorage({ runtimeRoot: config.agentRuntimeRoot })
+      : undefined;
   const agentManager = new AgentManager({
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
+    agentRuntimeStorage,
     appendSystemPrompt: config.appendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);

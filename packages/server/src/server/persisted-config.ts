@@ -81,7 +81,8 @@ const WorktreesConfigSchema = z
   .strict();
 
 function isAbsoluteFilesystemPath(value: string): boolean {
-  return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
+  // Native platform absolute only so a Windows-looking path is not accepted on POSIX.
+  return path.isAbsolute(value);
 }
 
 const AbsoluteFilesystemPathSchema = z.string().min(1).refine(isAbsoluteFilesystemPath, {

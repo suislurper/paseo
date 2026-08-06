@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -14,6 +14,12 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import {
+  AGENT_RUNTIME_ARTIFACTS_DIRNAME,
+  AGENT_RUNTIME_MANIFEST_FILENAME,
+  AGENT_RUNTIME_SCRATCH_DIRNAME,
+  AgentRuntimeStorage,
+} from "./agent-runtime-storage.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt } from "./agent-prompt.js";
@@ -1956,6 +1962,266 @@ test("createAgent passes daemon launch env through the provider launch context",
       PASEO_AGENT_ID: snapshot.id,
     },
   });
+});
+
+class LaunchContextCaptureClient implements AgentClient {
+  readonly capabilities = TEST_CAPABILITIES;
+  lastLaunchContext: AgentLaunchContext | undefined;
+  createSessionCalls = 0;
+
+  constructor(public readonly provider: AgentProvider) {}
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  async fetchCatalog() {
+    return {
+      models: [
+        {
+          provider: this.provider,
+          id: `${this.provider}-default`,
+          label: `${this.provider} default`,
+          isDefault: true,
+        },
+      ],
+      modes: [],
+    };
+  }
+
+  async createSession(
+    config: AgentSessionConfig,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    this.createSessionCalls += 1;
+    this.lastLaunchContext = launchContext;
+    return new TestAgentSession({ ...config, provider: this.provider });
+  }
+
+  async resumeSession(
+    _handle: AgentPersistenceHandle,
+    overrides?: Partial<AgentSessionConfig>,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    this.lastLaunchContext = launchContext;
+    return new TestAgentSession({
+      provider: this.provider,
+      cwd: overrides?.cwd ?? process.cwd(),
+      ...overrides,
+    });
+  }
+}
+
+test.each([
+  ["codex", "codex"] as const,
+  ["claude", "claude"] as const,
+  ["acp (generic)", "acp"] as const,
+])(
+  "createAgent injects runtime storage env after caller env for %s via common launch context",
+  async (_label, provider) => {
+    const workdir = mkdtempSync(join(tmpdir(), `agent-manager-runtime-${provider}-`));
+    const runtimeRoot = mkdtempSync(join(tmpdir(), `agent-runtime-root-${provider}-`));
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
+    const agentRuntimeStorage = new AgentRuntimeStorage({ runtimeRoot });
+    const agentId = "00000000-0000-4000-8000-000000000a01";
+    const client = new LaunchContextCaptureClient(provider);
+
+    try {
+      const manager = new AgentManager({
+        clients: {
+          [provider]: client,
+        },
+        providerDefinitions: {
+          [provider]: { enabled: true, derivedFromProviderId: null },
+        },
+        registry: storage,
+        agentRuntimeStorage,
+        logger,
+        idFactory: () => agentId,
+      });
+
+      const snapshot = await manager.createAgent(
+        {
+          provider,
+          cwd: workdir,
+        },
+        undefined,
+        {
+          env: {
+            TMPDIR: "/tmp/caller-should-lose",
+            TMP: "/tmp/caller-tmp",
+            TEMP: "/tmp/caller-temp",
+            PASEO_AGENT_SCRATCH_DIR: "/tmp/caller-scratch",
+            PASEO_AGENT_ARTIFACT_DIR: "/tmp/caller-artifacts",
+            PASEO_AGENT_ID: "caller-agent-id",
+            KEEP_ME: "from-caller",
+          },
+          workspaceId: undefined,
+        },
+      );
+
+      const expectedScratch = join(runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME, agentId);
+      const expectedArtifacts = join(runtimeRoot, AGENT_RUNTIME_ARTIFACTS_DIRNAME, agentId);
+
+      expect(client.createSessionCalls).toBe(1);
+      expect(client.lastLaunchContext).toEqual({
+        agentId: snapshot.id,
+        env: {
+          KEEP_ME: "from-caller",
+          TMPDIR: expectedScratch,
+          TMP: expectedScratch,
+          TEMP: expectedScratch,
+          PASEO_AGENT_SCRATCH_DIR: expectedScratch,
+          PASEO_AGENT_ARTIFACT_DIR: expectedArtifacts,
+          PASEO_AGENT_ID: agentId,
+        },
+      });
+      expect(readFileSync(join(expectedScratch, AGENT_RUNTIME_MANIFEST_FILENAME), "utf8")).toMatch(
+        /"lifecycle": "active"/,
+      );
+      expect(
+        readFileSync(join(expectedArtifacts, AGENT_RUNTIME_MANIFEST_FILENAME), "utf8"),
+      ).toMatch(/"retention": "retained"/);
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("createAgent without agentRuntimeStorage does not create runtime directories", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-no-runtime-"));
+  const runtimeRoot = mkdtempSync(join(tmpdir(), "agent-runtime-unused-"));
+  const client = new LaunchContextCaptureClient("codex");
+  const agentId = "00000000-0000-4000-8000-000000000a02";
+
+  try {
+    const manager = new AgentManager({
+      clients: { codex: client },
+      logger,
+      idFactory: () => agentId,
+    });
+
+    await manager.createAgent(
+      {
+        provider: "codex",
+        cwd: workdir,
+      },
+      undefined,
+      {
+        env: { KEEP_ME: "yes" },
+        workspaceId: undefined,
+      },
+    );
+
+    expect(client.lastLaunchContext).toEqual({
+      agentId,
+      env: {
+        KEEP_ME: "yes",
+        PASEO_AGENT_ID: agentId,
+      },
+    });
+    // Unset runtime storage must not touch a configured-looking path.
+    expect(() =>
+      readFileSync(
+        join(runtimeRoot, AGENT_RUNTIME_SCRATCH_DIRNAME, agentId, AGENT_RUNTIME_MANIFEST_FILENAME),
+        "utf8",
+      ),
+    ).toThrow();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+test("createAgent fails before provider start when runtime prepare fails", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-runtime-fail-"));
+  const client = new LaunchContextCaptureClient("codex");
+  const agentId = "00000000-0000-4000-8000-000000000a03";
+
+  // prepare rejects for invalid agent ids (not a UUID) — but AgentManager
+  // validates agent ids first. Use a storage whose prepare always throws.
+  const failingStorage = {
+    prepare: async () => {
+      throw new Error("runtime prepare boom");
+    },
+  } as unknown as AgentRuntimeStorage;
+
+  try {
+    const manager = new AgentManager({
+      clients: { codex: client },
+      agentRuntimeStorage: failingStorage,
+      logger,
+      idFactory: () => agentId,
+    });
+
+    await expect(
+      manager.createAgent(
+        {
+          provider: "codex",
+          cwd: workdir,
+        },
+        undefined,
+        { workspaceId: undefined },
+      ),
+    ).rejects.toThrow(/runtime prepare boom/);
+
+    expect(client.createSessionCalls).toBe(0);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("runtime storage preserves artifacts across relaunch generation rotation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-runtime-rotate-"));
+  const runtimeRoot = mkdtempSync(join(tmpdir(), "agent-runtime-rotate-"));
+  const agentRuntimeStorage = new AgentRuntimeStorage({ runtimeRoot });
+  const agentId = "00000000-0000-4000-8000-000000000a04";
+  const client = new LaunchContextCaptureClient("codex");
+
+  try {
+    const manager = new AgentManager({
+      clients: { codex: client },
+      agentRuntimeStorage,
+      logger,
+      idFactory: () => agentId,
+    });
+
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const first = client.lastLaunchContext?.env;
+    expect(first?.PASEO_AGENT_SCRATCH_DIR).toBeTruthy();
+    const artifactPath = join(first!.PASEO_AGENT_ARTIFACT_DIR!, "kept.bin");
+    writeFileSync(artifactPath, "retain-me");
+
+    const preparedFirst = await agentRuntimeStorage.prepare(agentId);
+    expect(preparedFirst.lifecycle).toBe("active");
+    await agentRuntimeStorage.markReleased({
+      agentId,
+      generation: preparedFirst.generation,
+    });
+
+    // Reload is a common launch path and must re-prepare (rotate released → active).
+    await manager.reloadAgentSession(snapshot.id, {
+      systemPrompt: "relaunch after release",
+    });
+
+    const second = client.lastLaunchContext?.env;
+    expect(second?.PASEO_AGENT_ARTIFACT_DIR).toBe(first?.PASEO_AGENT_ARTIFACT_DIR);
+    expect(second?.PASEO_AGENT_SCRATCH_DIR).toBe(first?.PASEO_AGENT_SCRATCH_DIR);
+    expect(second?.PASEO_AGENT_ID).toBe(agentId);
+    expect(readFileSync(artifactPath, "utf8")).toBe("retain-me");
+
+    const afterReload = await agentRuntimeStorage.prepare(agentId);
+    expect(afterReload.lifecycle).toBe("active");
+    expect(afterReload.generation).not.toBe(preparedFirst.generation);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(runtimeRoot, { recursive: true, force: true });
+  }
 });
 
 test("createAgent passes persistSession to provider create options", async () => {

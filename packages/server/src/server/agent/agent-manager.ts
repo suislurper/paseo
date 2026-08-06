@@ -44,6 +44,7 @@ import {
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import type { AgentRuntimeStorage } from "./agent-runtime-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -246,6 +247,12 @@ export interface AgentManagerOptions {
   providerDefinitions?: ProviderEnabledMap;
   idFactory?: () => string;
   registry?: AgentStorage;
+  /**
+   * Optional durable per-agent scratch/artifacts storage. When set, every launch
+   * path prepares runtime dirs and injects env via buildLaunchContext. When unset,
+   * launch env is limited to PASEO_AGENT_ID (upstream behavior).
+   */
+  agentRuntimeStorage?: AgentRuntimeStorage;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   durableTimelineStore?: AgentTimelineStore;
@@ -577,6 +584,7 @@ export class AgentManager {
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
+  private readonly agentRuntimeStorage?: AgentRuntimeStorage;
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
@@ -598,6 +606,7 @@ export class AgentManager {
   constructor(options: AgentManagerOptions) {
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
+    this.agentRuntimeStorage = options?.agentRuntimeStorage;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
@@ -4136,12 +4145,26 @@ export class AgentManager {
     client: AgentClient,
     env?: Record<string, string>,
   ): Promise<AgentLaunchContext> {
+    // Caller/provider env first; daemon runtime keys always win (set after spread).
+    const launchEnv: Record<string, string> = {
+      ...env,
+      PASEO_AGENT_ID: agentId,
+    };
+
+    if (this.agentRuntimeStorage) {
+      // Fail launch explicitly if prepare fails — never silently fall back to /tmp.
+      const runtimePaths = await this.agentRuntimeStorage.prepare(agentId);
+      launchEnv.TMPDIR = runtimePaths.scratchDir;
+      launchEnv.TMP = runtimePaths.scratchDir;
+      launchEnv.TEMP = runtimePaths.scratchDir;
+      launchEnv.PASEO_AGENT_SCRATCH_DIR = runtimePaths.scratchDir;
+      launchEnv.PASEO_AGENT_ARTIFACT_DIR = runtimePaths.artifactsDir;
+      launchEnv.PASEO_AGENT_ID = agentId;
+    }
+
     const context: AgentLaunchContext = {
       agentId,
-      env: {
-        ...env,
-        PASEO_AGENT_ID: agentId,
-      },
+      env: launchEnv,
     };
     if (
       this.paseoToolsEnabled &&

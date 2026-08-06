@@ -62,7 +62,9 @@ export class AgentRuntimeStorageError extends Error {
 }
 
 function isAbsoluteFilesystemPath(value: string): boolean {
-  return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
+  // Native platform absolute only — a Windows drive path must not be accepted on POSIX
+  // (path.resolve would treat it as relative and mis-place the runtime root).
+  return path.isAbsolute(value);
 }
 
 function isMissingEntryError(error: unknown): boolean {
@@ -116,6 +118,11 @@ export class AgentRuntimeStorage {
   /**
    * Ensure scratch + artifacts directories exist for the agent, create or reuse the
    * daemon-owned scratch generation manifest, and ensure the retained artifacts marker.
+   *
+   * - Active generation: reused across daemon restarts (idempotent prepare).
+   * - Released generation: atomically rotated to a fresh active generation. Bytes under
+   *   scratch/artifacts are retained; only the scratch manifest generation + lifecycle
+   *   change. This prevents a stale release receipt from authorizing cleanup after relaunch.
    */
   async prepare(agentId: string): Promise<AgentRuntimeLaunchPaths> {
     const validatedAgentId = validateAgentId(agentId, "prepare");
@@ -338,7 +345,22 @@ export class AgentRuntimeStorage {
           `scratch manifest agentId mismatch (expected ${agentId})`,
         );
       }
-      return existing;
+      if (existing.lifecycle === "active") {
+        // Daemon restart / relaunch of a still-active agent reuses the generation.
+        return existing;
+      }
+
+      // Released → new launch: rotate generation and return to active without deleting
+      // any scratch or artifact bytes. Atomic write makes the rotation crash-safe.
+      const rotated: AgentScratchManifest = {
+        schemaVersion: AGENT_RUNTIME_MANIFEST_SCHEMA_VERSION,
+        agentId,
+        generation: randomUUID(),
+        createdAt: new Date().toISOString(),
+        lifecycle: "active",
+      };
+      await this.writeScratchManifestAtomic(paths.scratchManifestPath, rotated);
+      return rotated;
     } catch (error) {
       if (!isMissingEntryError(error)) {
         throw error;
@@ -484,8 +506,11 @@ export class AgentRuntimeStorage {
     }
     try {
       await fs.chmod(dirPath, PRIVATE_DIRECTORY_MODE);
-    } catch {
-      // Best-effort on filesystems that do not support POSIX modes.
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `failed to set private mode on directory ${dirPath}: ${errorMessage(error)}`,
+        { cause: error },
+      );
     }
   }
 
@@ -495,8 +520,11 @@ export class AgentRuntimeStorage {
     }
     try {
       await fs.chmod(filePath, PRIVATE_FILE_MODE);
-    } catch {
-      // Best-effort on filesystems that do not support POSIX modes.
+    } catch (error) {
+      throw new AgentRuntimeStorageError(
+        `failed to set private mode on file ${filePath}: ${errorMessage(error)}`,
+        { cause: error },
+      );
     }
   }
 

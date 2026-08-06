@@ -161,6 +161,24 @@ describe("PersistedConfigSchema agents.runtimeRoot", () => {
     }
   });
 
+  test("rejects a Windows-looking runtime root on non-Windows platforms", () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const result = PersistedConfigSchema.safeParse({
+      agents: {
+        runtimeRoot: "C:\\paseo\\agent-runtime",
+      },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some((issue) => issue.path.join(".") === "agents.runtimeRoot"),
+      ).toBe(true);
+    }
+  });
+
   test("rejects an empty runtime root", () => {
     const result = PersistedConfigSchema.safeParse({
       agents: {

@@ -55,6 +55,18 @@ describe("AgentRuntimeStorage", () => {
     );
   });
 
+  test("rejects a Windows-looking path on non-Windows platforms", () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    expect(() => new AgentRuntimeStorage({ runtimeRoot: "C:\\paseo\\agent-runtime" })).toThrow(
+      /absolute filesystem path/,
+    );
+    expect(() => new AgentRuntimeStorage({ runtimeRoot: "D:/paseo/agent-runtime" })).toThrow(
+      /absolute filesystem path/,
+    );
+  });
+
   test("rejects an invalid agent id", async () => {
     const runtimeRoot = createTempRuntimeRoot();
     const storage = new AgentRuntimeStorage({ runtimeRoot });
@@ -309,23 +321,38 @@ describe("AgentRuntimeStorage", () => {
     ).rejects.toThrow(/agentId mismatch/);
   });
 
-  test("prepare still succeeds after release without deleting artifacts", async () => {
+  test("prepare after release rotates generation to active while retaining bytes", async () => {
     const runtimeRoot = createTempRuntimeRoot();
     const storage = new AgentRuntimeStorage({ runtimeRoot });
     const agentId = randomUUID();
     const prepared = await storage.prepare(agentId);
+
+    const scratchFile = path.join(prepared.scratchDir, "work.txt");
+    const artifactFile = path.join(prepared.artifactsDir, "retained.bin");
+    writeFileSync(scratchFile, "scratch-data");
+    writeFileSync(artifactFile, "blob");
+
     await storage.markReleased({ agentId, generation: prepared.generation });
 
-    const markerPath = path.join(prepared.artifactsDir, "retained.bin");
-    writeFileSync(markerPath, "blob");
-
     const again = await storage.prepare(agentId);
-    expect(again.generation).toBe(prepared.generation);
-    expect(again.lifecycle).toBe("released");
-    expect(readFileSync(markerPath, "utf8")).toBe("blob");
+    expect(again.lifecycle).toBe("active");
+    expect(again.generation).not.toBe(prepared.generation);
+    expect(again.scratchDir).toBe(prepared.scratchDir);
+    expect(again.artifactsDir).toBe(prepared.artifactsDir);
+    expect(readFileSync(scratchFile, "utf8")).toBe("scratch-data");
+    expect(readFileSync(artifactFile, "utf8")).toBe("blob");
+
+    const scratchManifest = readJson(again.scratchManifestPath) as {
+      generation: string;
+      lifecycle: string;
+      releasedAt?: string;
+    };
+    expect(scratchManifest.generation).toBe(again.generation);
+    expect(scratchManifest.lifecycle).toBe("active");
+    expect(scratchManifest).not.toHaveProperty("releasedAt");
   });
 
-  test("does not delete existing content on prepare reuse", async () => {
+  test("does not delete existing content on prepare reuse of active generation", async () => {
     const runtimeRoot = createTempRuntimeRoot();
     const storage = new AgentRuntimeStorage({ runtimeRoot });
     const agentId = randomUUID();
@@ -336,7 +363,9 @@ describe("AgentRuntimeStorage", () => {
     writeFileSync(scratchFile, "scratch-data");
     writeFileSync(artifactFile, "artifact-data");
 
-    await storage.prepare(agentId);
+    const again = await storage.prepare(agentId);
+    expect(again.generation).toBe(prepared.generation);
+    expect(again.lifecycle).toBe("active");
 
     expect(readFileSync(scratchFile, "utf8")).toBe("scratch-data");
     expect(readFileSync(artifactFile, "utf8")).toBe("artifact-data");

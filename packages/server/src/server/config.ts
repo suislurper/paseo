@@ -490,6 +490,8 @@ export function loadConfig(
     paseoHome,
     desktopManaged: env.PASEO_DESKTOP_MANAGED === "1",
     worktreesRoot: resolveWorktreesRoot(paseoHome, persisted),
+    // Optional; unset means no AgentRuntimeStorage construction in bootstrap.
+    agentRuntimeRoot: persisted.agents?.runtimeRoot,
     corsAllowedOrigins: resolveCorsAllowedOrigins(env, persisted),
     hostnames,
     trustedProxies,

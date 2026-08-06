@@ -391,8 +391,9 @@ deleted):
 - Top-level symlink blocks. Support regular top-level files and directories.
 - Reject special files, mount crossings, hard-linked regular files, unreadable
   content, sockets/devices/FIFOs, escaping symlinks, and change races.
-- Nested symlinks are preservable only when both the lexical target and the resolved
-  target stay inside the candidate; otherwise the candidate is blocked.
+- Nested symlinks are preservable only when they are **relative** and both the lexical
+  target and the resolved target stay inside the candidate. **Absolute** symlink text
+  is blocked (cannot stay self-contained after relocation while preserving link text).
 
 ### Process + Paseo proof
 
@@ -419,8 +420,8 @@ infer abbreviated IDs; unarchived list cap `<200`):
 Bounded **60s** deterministic inventory (twice; mismatch/timeout/change blocks): type,
 relative path, mode, uid/gid, size, mtime ns, link count, SHA-256 for regular files,
 and symlink target text when preservable. File paths that change while hashing block.
-Eligible candidates carry a `candidate_token` bound to source path, producer, owner
-identity fields, and inventory fingerprint.
+Eligible candidates carry a `candidate_token` bound to source path, producer, root
+identity fields (including `st_dev`/`st_ino`), and inventory fingerprint.
 
 ### Commands
 
@@ -439,14 +440,28 @@ when eligible, and free bytes for `/` and `/mnt/data`.
    run-id).
 5. Independently verify destination against the manifest; atomically rename partial →
    `{quarantineRoot}/<run-id>/` and fsync the parent.
-6. Only after durable verification: recheck source identity, atomically rename the
-   exact source to a hidden tombstone direct child of the same tmp root, then delete
-   **only** that tombstone without following symlinks.
-7. If tombstone deletion fails, the durable quarantine copy remains recovery authority
-   and the response reports `status=quarantined_pending_removal` with the exact
-   `tombstone_path`. Source changes before rename block; never touch another `/tmp`
+6. **Post-publish revalidation** (before any source mutation): fresh complete
+   process/Paseo census + two matching source inventories; require classification
+   `eligible` and the **exact original** `candidate_token`. Nested content changes
+   that do not update the root directory mtime are caught here. If the source is
+   active/protected/changed/unreadable/token-mismatched: preserve **both** the
+   original source and the durable quarantine copy; return
+   `status=quarantined_source_preserved` with exact paths/reasons; **never delete**.
+7. Only after post-publish revalidation: atomically rename the exact source to a
+   hidden tombstone direct child of the same tmp root. Inventory that tombstone and
+   require the same final inventory fingerprint plus root `st_dev`/`st_ino`, then
+   delete **only** that tombstone without following symlinks.
+8. If tombstone inventory/identity/delete fails, the durable quarantine copy remains
+   recovery authority and the response reports `status=quarantined_pending_removal`
+   with the exact `tombstone_path`. Never pretend success. Never touch another `/tmp`
    entry.
+9. `free_bytes_after` is measured only after the actual source outcome (removed,
+   preserved, or tombstoned). Every structured post-copy status includes
+   `manifest_path`, `size_bytes`, source/quarantine/tombstone paths, free before/after,
+   and `recovery_authority` (durable quarantine path).
 
+Quarantine root parents are created component-by-component as real directories only
+(no broad `os.makedirs`); symlink races and parent fsync/chmod failures fail closed.
 Quarantine copies are **never** auto-deleted by this tool.
 
 ### Operator orchestration (outside the tool)

@@ -177,11 +177,10 @@ def symlink_inside(path: str, root_n: str) -> tuple[str | None, list[str]]:
         link_text = os.readlink(path)
     except OSError:
         return None, ["unreadable_symlink"]
-    lexical = (
-        norm(link_text)
-        if os.path.isabs(link_text)
-        else norm(os.path.join(os.path.dirname(path), link_text))
-    )
+    # Absolute link text cannot stay self-contained after relocation.
+    if os.path.isabs(link_text):
+        return None, ["absolute_symlink"]
+    lexical = norm(os.path.join(os.path.dirname(path), link_text))
     if not under(lexical, root_n):
         return None, ["symlink_escape"]
     try:
@@ -316,7 +315,8 @@ def inventory_fingerprint(records: list[dict[str, Any]]) -> str:
 def make_token(source: str, producer: str, inv_fp: str, identity: dict[str, Any]) -> str:
     parts = [norm(source), producer, inv_fp]
     parts.extend(
-        str(identity.get(k)) for k in ("type", "mode", "uid", "gid", "size", "mtime_ns", "nlink")
+        str(identity.get(k))
+        for k in ("type", "mode", "uid", "gid", "size", "mtime_ns", "nlink", "dev", "ino")
     )
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 def size_from_inventory(records: list[dict[str, Any]]) -> int:
@@ -496,17 +496,50 @@ def classify_source(
 def run_probe(**kwargs: Any) -> dict[str, Any]:
     return {k: v for k, v in classify_source(**kwargs).items() if not k.startswith("_")}
 def ensure_quarantine_root(qroot: str) -> None:
+    """Ensure quarantine root exists via exact real-dir components only.
+
+    No broad os.makedirs: each existing component must be a real directory, and
+    each newly created component uses mkdir_exact. Symlink races and parent
+    fsync/chmod failures fail closed.
+    """
     require_abs(qroot, "quarantine root")
-    ensure_no_symlink_components(qroot, "quarantine root")
-    if os.path.lexists(qroot):
-        if os.path.islink(qroot) or not os.path.isdir(qroot):
-            raise ToolError(f"quarantine root is not a real directory: {qroot}")
-    else:
-        parent = os.path.dirname(qroot)
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent, mode=0o700, exist_ok=True)
-        if not os.path.isdir(qroot):
-            mkdir_exact(qroot, 0o700)
+    target = norm(qroot)
+    chain: list[str] = []
+    cur = target
+    while True:
+        chain.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for component in reversed(chain):
+        if component == os.sep:
+            continue
+        ensure_no_symlink_components(component, "quarantine path component")
+        if os.path.lexists(component):
+            if os.path.islink(component) or not os.path.isdir(component):
+                raise ToolError(
+                    f"quarantine path component is not a real directory: {component}"
+                )
+            # Re-check after lexists to close symlink-replace races.
+            ensure_no_symlink_components(component, "quarantine path component")
+            if os.path.islink(component) or not os.path.isdir(component):
+                raise ToolError(
+                    f"quarantine path component race (not real dir): {component}"
+                )
+            continue
+        parent = os.path.dirname(component)
+        if not parent or os.path.islink(parent) or not os.path.isdir(parent):
+            raise ToolError(f"parent directory missing or not a real dir: {parent}")
+        ensure_no_symlink_components(parent, "quarantine parent")
+        mkdir_exact(component, 0o700)
+        try:
+            fsync_dir(parent)
+        except OSError as exc:
+            raise ToolError(f"fsync failed for parent {parent}: {exc}") from exc
+        ensure_no_symlink_components(component, "quarantine path component")
+        if os.path.islink(component) or not os.path.isdir(component):
+            raise ToolError(f"quarantine path component race after create: {component}")
 def _meta_owner(path: str, st: os.stat_result, *, follow: bool = True) -> None:
     try:
         if follow:
@@ -673,6 +706,45 @@ def remove_tree_nofollow(root: str, expected: os.stat_result) -> None:
     walk_delete(root)
     if os.path.lexists(root):
         raise ToolError(f"tombstone still exists after removal: {root}")
+
+
+def measure_free(data_root: str) -> dict[str, int]:
+    return {"root": free_bytes("/"), "mnt_data": free_bytes(data_root)}
+
+
+def post_copy_status(
+    *,
+    status: str,
+    run_id: str,
+    source_path: str,
+    quarantine_path: str,
+    tombstone_path: str | None,
+    size_bytes: int,
+    free_before: dict[str, int],
+    free_after: dict[str, int],
+    error: str | None = None,
+    reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "run_id": run_id,
+        "source_path": source_path,
+        "quarantine_path": quarantine_path,
+        "tombstone_path": tombstone_path,
+        "manifest_path": os.path.join(quarantine_path, "manifest.json"),
+        "size_bytes": size_bytes,
+        "free_bytes_before": free_before,
+        "free_bytes_after": free_after,
+        "recovery_authority": quarantine_path,
+    }
+    if error is not None:
+        out["error"] = error
+    if reasons is not None:
+        out["reasons"] = reasons
+    return out
+
+
 def run_quarantine(
     *,
     source: str,
@@ -700,7 +772,7 @@ def run_quarantine(
     for p, label in ((partial, "partial"), (final, "final"), (tomb, "tombstone")):
         if os.path.lexists(p):
             raise ToolError(f"refusing reused or existing {label} path: {p}")
-    free_before = {"root": free_bytes("/"), "mnt_data": free_bytes(data_root)}
+    free_before = measure_free(data_root)
     classified = classify_source(
         source=source,
         tmp_root=tmp_root,
@@ -728,6 +800,8 @@ def run_quarantine(
     producer = classified["source"]["recognized_producer"]
     if not isinstance(producer, str):
         raise ToolError("producer missing")
+    inv_fp = inventory_fingerprint(records)
+    size_bytes = size_from_inventory(records)
     try:
         if not identities_match(ident, identity_from_lstat(source)):
             raise ToolError("source changed before copy")
@@ -751,8 +825,8 @@ def run_quarantine(
             for k in ("type", "mode", "uid", "gid", "size", "mtime_ns", "nlink", "dev", "ino")
         },
         "inventory": [{k: v for k, v in r.items() if k not in ("dev", "ino")} for r in records],
-        "inventory_fingerprint": inventory_fingerprint(records),
-        "size_bytes": size_from_inventory(records),
+        "inventory_fingerprint": inv_fp,
+        "size_bytes": size_bytes,
     }
     write_manifest(os.path.join(partial, "manifest.json"), man)
     verify_payload_against_manifest(payload, man, time.monotonic() + INVENTORY_TIMEOUT_S)
@@ -766,62 +840,174 @@ def run_quarantine(
         raise ToolError(f"final path appeared: {final}")
     os.rename(partial, final)
     fsync_dir(quarantine_root)
-    free_after = {"root": free_bytes("/"), "mnt_data": free_bytes(data_root)}
+
+    # Post-publish: fresh complete process/Paseo census + dual inventory.
+    # Catches nested content changes that do not update root directory mtime.
+    post = classify_source(
+        source=source,
+        tmp_root=tmp_root,
+        census_path=census_path,
+        proc_root=proc_root,
+        runner=runner,
+        now_fn=now_fn,
+        wait_s=wait_s,
+        poll_s=poll_s,
+        started_at=now_fn(),
+        data_root=data_root,
+    )
+    post_class = post.get("classification")
+    post_token = post.get("candidate_token")
+    post_reasons = list(post.get("reasons") or [])
+    if post_class != "eligible" or post_token != candidate_token:
+        if post_class == "eligible" and post_token != candidate_token:
+            post_reasons = post_reasons or ["candidate_token_mismatch"]
+            if post.get("inventory_fingerprint") != inv_fp:
+                post_reasons = sorted(set(post_reasons + ["tree_changed"]))
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_source_preserved",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=None,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=(
+                "post-publish revalidation refused tombstone: "
+                f"{post_class}: {','.join(post_reasons)}"
+            ),
+            reasons=post_reasons,
+        )
+
     try:
         if not identities_match(ident, identity_from_lstat(source)):
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "status": "quarantined_source_changed",
-                "run_id": run_id,
-                "source_path": source,
-                "quarantine_path": final,
-                "tombstone_path": None,
-                "error": "source changed before tombstone rename",
-                "free_bytes_before": free_before,
-                "free_bytes_after": free_after,
-            }
+            free_after = measure_free(data_root)
+            return post_copy_status(
+                status="quarantined_source_preserved",
+                run_id=run_id,
+                source_path=source,
+                quarantine_path=final,
+                tombstone_path=None,
+                size_bytes=size_bytes,
+                free_before=free_before,
+                free_after=free_after,
+                error="source root identity changed before tombstone rename",
+                reasons=["path_changed"],
+            )
     except OSError as exc:
-        raise ToolError(f"source unreadable before tombstone: {exc}") from exc
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_source_preserved",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=None,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=f"source unreadable before tombstone: {exc}",
+            reasons=["source_unreadable"],
+        )
+
     if os.path.lexists(tomb):
-        raise ToolError(f"tombstone path already exists: {tomb}")
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_source_preserved",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=None,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=f"tombstone path already exists: {tomb}",
+            reasons=["tombstone_exists"],
+        )
     ensure_no_symlink_components(tomb, "tombstone")
     try:
         os.rename(source, tomb)
     except OSError as exc:
-        raise ToolError(f"atomic source tombstone rename failed: {exc}") from exc
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_source_preserved",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=None,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=f"atomic source tombstone rename failed: {exc}",
+            reasons=["tombstone_rename_failed"],
+        )
+
+    def pending(msg: str, reasons: list[str] | None = None) -> dict[str, Any]:
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_pending_removal",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=tomb,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=msg,
+            reasons=reasons,
+        )
+
     try:
         t_st = os.lstat(tomb)
     except OSError as exc:
-        raise ToolError(f"tombstone missing after rename: {exc}") from exc
-    if t_st.st_ino != ident["ino"] or t_st.st_dev != ident["dev"]:
-        raise ToolError("tombstone identity mismatch after rename")
+        return pending(f"tombstone missing after rename: {exc}", ["tombstone_missing"])
+    if t_st.st_ino != ident["ino"] or t_st.st_dev != ident["dev"] or stat.S_ISLNK(t_st.st_mode):
+        return pending(
+            "tombstone root identity mismatch after rename",
+            ["tombstone_identity_mismatch"],
+        )
+
+    # Inventory renamed tombstone; require final source fingerprint + root dev/ino.
+    try:
+        tomb_records, tomb_errs = dual_inventory(tomb)
+    except Exception as exc:  # noqa: BLE001 — never pretend success
+        return pending(f"tombstone inventory failed: {exc}", ["tombstone_inventory_failed"])
+    if tomb_errs:
+        return pending(
+            f"tombstone inventory errors: {','.join(sorted(set(tomb_errs)))}",
+            sorted(set(tomb_errs)),
+        )
+    if inventory_fingerprint(tomb_records) != inv_fp:
+        return pending(
+            "tombstone inventory fingerprint mismatch",
+            ["tombstone_fingerprint_mismatch"],
+        )
+    try:
+        tomb_ident = identity_from_lstat(tomb)
+    except OSError as exc:
+        return pending(f"tombstone unreadable before delete: {exc}", ["tombstone_unreadable"])
+    if tomb_ident.get("dev") != ident["dev"] or tomb_ident.get("ino") != ident["ino"]:
+        return pending(
+            "tombstone root dev/ino mismatch before delete",
+            ["tombstone_identity_mismatch"],
+        )
+
     try:
         remove_tree_nofollow(tomb, t_st)
-    except Exception as exc:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "status": "quarantined_pending_removal",
-            "run_id": run_id,
-            "source_path": source,
-            "quarantine_path": final,
-            "tombstone_path": tomb,
-            "error": str(exc),
-            "size_bytes": size_from_inventory(records),
-            "free_bytes_before": free_before,
-            "free_bytes_after": free_after,
-        }
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "status": "quarantined",
-        "run_id": run_id,
-        "source_path": source,
-        "quarantine_path": final,
-        "tombstone_path": None,
-        "size_bytes": size_from_inventory(records),
-        "manifest_path": os.path.join(final, "manifest.json"),
-        "free_bytes_before": free_before,
-        "free_bytes_after": free_after,
-    }
+    except Exception as exc:  # noqa: BLE001 — durable copy remains recovery authority
+        return pending(str(exc), ["tombstone_delete_failed"])
+
+    free_after = measure_free(data_root)
+    return post_copy_status(
+        status="quarantined",
+        run_id=run_id,
+        source_path=source,
+        quarantine_path=final,
+        tombstone_path=None,
+        size_bytes=size_bytes,
+        free_before=free_before,
+        free_after=free_after,
+    )
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Probe or quarantine exactly one legacy /tmp producer candidate."

@@ -405,9 +405,9 @@ class Tests(unittest.TestCase):
         r = self.h.probe(src)
         self.assertIn("root_is_symlink", r["reasons"])
 
-        # Escaping nested symlink
+        # Escaping nested relative symlink
         src2 = self.h.put_candidate("paseo-escape")
-        os.symlink("/etc/passwd", src2 / "evil")
+        os.symlink("../../outside", src2 / "evil")
         self.h.write_census()
         r2 = self.h.probe(src2)
         self.assertEqual(r2["classification"], "blocked")
@@ -433,6 +433,16 @@ class Tests(unittest.TestCase):
         self.h.write_census()
         r4 = self.h.probe(src4)
         self.assertIn("special_file", r4["reasons"])
+
+    def test_absolute_symlink_blocked(self) -> None:
+        src = self.h.put_candidate("paseo-abs-link")
+        # Absolute link text even when real target is inside the candidate.
+        os.symlink(str(src / "data.bin"), src / "abs-link")
+        self.h.write_census()
+        r = self.h.probe(src)
+        self.assertEqual(r["classification"], "blocked")
+        self.assertIn("absolute_symlink", r["reasons"])
+        self.assertIsNone(r["candidate_token"])
 
     def test_inventory_change_and_timeout(self) -> None:
         src = self.h.put_candidate("paseo-change")
@@ -469,6 +479,11 @@ class Tests(unittest.TestCase):
         self.assertFalse(src.exists())
         final = Path(result["quarantine_path"])
         self.assertTrue(final.is_dir())
+        self.assertEqual(result["manifest_path"], str(final / "manifest.json"))
+        self.assertEqual(result["recovery_authority"], str(final))
+        self.assertIn("free_bytes_before", result)
+        self.assertIn("free_bytes_after", result)
+        self.assertIsNone(result["tombstone_path"])
         man = json.loads((final / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(man["run_id"], RUN)
         self.assertEqual(man["source_path"], str(src))
@@ -476,8 +491,7 @@ class Tests(unittest.TestCase):
         self.assertTrue(man["inventory_fingerprint"])
         self.assertTrue((final / "payload" / "data.bin").is_file())
         self.assertEqual((final / "payload" / "data.bin").read_bytes(), b"hello-legacy")
-        # Internal safe symlink preserved
-        # (recreate scenario with symlink in a new eligible tree)
+        # Internal safe relative symlink preserved
         src2 = self.h.put_candidate("paseo-with-link")
         os.symlink("data.bin", src2 / "rel-link")
         self.h.write_census()
@@ -564,10 +578,93 @@ class Tests(unittest.TestCase):
         self.assertEqual(result["status"], "quarantined_pending_removal")
         self.assertTrue(Path(result["quarantine_path"]).is_dir())
         self.assertTrue(Path(result["tombstone_path"]).exists())
+        self.assertEqual(result["recovery_authority"], result["quarantine_path"])
+        self.assertEqual(
+            result["manifest_path"],
+            str(Path(result["quarantine_path"]) / "manifest.json"),
+        )
+        self.assertIn("free_bytes_before", result)
+        self.assertIn("free_bytes_after", result)
+        self.assertIsNotNone(result["size_bytes"])
         # Durable copy is recovery authority.
         man = Path(result["quarantine_path"]) / "manifest.json"
         self.assertTrue(man.is_file())
         self.assertFalse(src.exists())
+
+    def test_content_change_after_durable_copy_preserves_both(self) -> None:
+        """Nested content change after durable publish must not delete source.
+
+        Root directory identity can stay unchanged when only file bytes change;
+        post-publish census + dual inventory + exact token must refuse tombstone.
+        """
+        src, probe = self.h.eligible("paseo-post-content", body=b"original-bytes")
+        token = probe["candidate_token"]
+        root_before = os.lstat(src)
+        real_rename = os.rename
+
+        def rename_then_mutate(src_path: str, dst_path: str) -> None:
+            real_rename(src_path, dst_path)
+            if os.path.basename(src_path).startswith(".partial-"):
+                # Change nested file content without replacing the root inode.
+                wfile(src / "data.bin", b"mutated-after-durable-publish")
+                root_after = os.lstat(src)
+                self.assertEqual(root_after.st_ino, root_before.st_ino)
+                self.assertEqual(root_after.st_dev, root_before.st_dev)
+
+        with mock.patch.object(os, "rename", side_effect=rename_then_mutate):
+            result = self.h.quarantine(src, token)
+        self.assertEqual(result["status"], "quarantined_source_preserved", result)
+        self.assertTrue(src.exists(), "original source must be preserved")
+        self.assertTrue(Path(result["quarantine_path"]).is_dir())
+        self.assertIsNone(result["tombstone_path"])
+        self.assertEqual(result["recovery_authority"], result["quarantine_path"])
+        self.assertTrue(Path(result["manifest_path"]).is_file())
+        self.assertIn("free_bytes_after", result)
+        # Durable copy still holds pre-mutation bytes.
+        payload = Path(result["quarantine_path"]) / "payload" / "data.bin"
+        self.assertEqual(payload.read_bytes(), b"original-bytes")
+        self.assertEqual((src / "data.bin").read_bytes(), b"mutated-after-durable-publish")
+
+    def test_replacement_inode_token_mismatch(self) -> None:
+        src, probe = self.h.eligible("paseo-inode", body=b"same-bytes")
+        token = probe["candidate_token"]
+        self.assertTrue(token)
+        # Replace path with a new inode; content and metadata-ish shape match.
+        if src.is_dir():
+            for child in src.rglob("*"):
+                if child.is_file():
+                    child.unlink()
+            for child in sorted(src.rglob("*"), reverse=True):
+                if child.is_dir():
+                    child.rmdir()
+            src.rmdir()
+        else:
+            src.unlink()
+        src2 = self.h.put_candidate("paseo-inode", body=b"same-bytes")
+        self.assertEqual(src2, src)
+        self.h.write_census()
+        p2 = self.h.probe(src2)
+        self.assertEqual(p2["classification"], "eligible", p2)
+        self.assertNotEqual(p2["candidate_token"], token)
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.quarantine(src2, token)
+        self.assertIn("token", str(ctx.exception).lower())
+
+    def test_quarantine_root_symlink_parent_fail_closed(self) -> None:
+        real_parent = self.h.root / "real-q-parent"
+        real_parent.mkdir(parents=True, exist_ok=True)
+        link_parent = self.h.root / "q-link-parent"
+        os.symlink(str(real_parent), link_parent)
+        bad_qroot = link_parent / "legacy-tmp"
+        with self.assertRaises(M.ToolError) as ctx:
+            M.ensure_quarantine_root(str(bad_qroot))
+        self.assertTrue(
+            "symlink" in str(ctx.exception).lower() or "real directory" in str(ctx.exception).lower(),
+            ctx.exception,
+        )
+        # Source fixtures untouched.
+        src = self.h.put_candidate("paseo-symlink-parent")
+        self.assertTrue(src.exists())
 
     def test_file_candidate_and_cli_main(self) -> None:
         src, probe = self.h.eligible("paseo-file-only", as_file=True, body=b"flat")

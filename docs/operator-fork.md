@@ -223,7 +223,8 @@ requests that packet.
 
 Snapshot freshness alone is **not** proof that a PID still refers to the same
 process, and identity alone is **not** proof that mutable cwd/fd references are still
-safe to act on. The unprivileged managed-scratch cleanup probe must:
+safe to act on. The unprivileged managed-scratch cleanup probe and the worktree
+cleanup probe must:
 
 1. Record `started_at` at the beginning of the probe.
 2. Wait/poll (at most **45s**) for a **complete** snapshot at
@@ -354,6 +355,68 @@ Archive reports exact path, measured bytes, free bytes before/after, agent/gener
 `artifacts_preserved=true`, and optional `tombstone_path`. One invocation archives at
 most one candidate; the operator custodian should limit sequential archive calls
 (recommended cap: eight).
+
+## Worktree cleanup probe
+
+Read-only, fail-closed local evidence for the Paseo worktree custodian. Paseo remains
+authoritative for the managed-worktree list and for archive; this probe never mutates
+Git, files, processes, services, schedules, agents, or Paseo state.
+
+- **Canonical source (this repo):** `scripts/operator/worktree-cleanup-probe.py`
+- **Tests:** `scripts/operator/test_worktree_cleanup_probe.py`
+  (`npm run test:worktree-cleanup-probe`)
+- **Installed executable path (after exact-SHA review only):**
+  `/home/user/.paseo/bin/worktree_cleanup_probe.py`
+- Policy (live host): `/home/user/.paseo/WORKTREE_CLEANUP_POLICY.md`
+- Managed root (production): `/home/user/.paseo/worktrees`
+
+Install is operator-owned: copy the reviewed repo file to the installed path only after
+an exact-SHA review lands. Agents must not install, overwrite, or restart live
+`~/.paseo` probe files, services, or schedules from this packet.
+
+### Local gates (unchanged, fail closed)
+
+- Managed path membership under the configured managed root (Paseo list remains
+  authoritative for archive decisions).
+- Manual pins from the policy file; global unarchived agents; exact pin inspects;
+  active schedule identity (`paseo schedule inspect <id> --identity-only`);
+  terminals; pending permissions; filesystem/Git locks; dirty/untracked trees;
+  ignored roots via exactly
+  `git status --porcelain=v1 -z --ignored=matching -unormal`;
+  unique commits / remote-default reachability and branch/default/base identity;
+  bounded **60s** `du` size walk.
+- Any process-census incompleteness **blocks every candidate** for that wake.
+
+### Process proof (root snapshot consumer)
+
+Replaces the prior unprivileged inline `/proc` path scan. Loads the reviewed consumer
+helpers from sibling `agent-scratch-cleanup.py` (no second process parser). CLI:
+
+- `--process-census` default `/run/paseo/process-census.json`
+- test seams: `--proc-root`, `--wait-seconds`, `--poll-seconds` (bounded wait default
+  **45s**)
+
+Requires a **complete** same-boot snapshot captured **after** probe `started_at`, age
+≤ **45s**, with `roots` covering the managed worktree root. Validates every current
+non-kernel PID + `start_time_ticks`, `scope_complete`, well-formed absolute
+references, malformed/duplicate process records/roots, snapshot root symlinks, and
+live races. Any failure sets `process_census.complete=false` / `status=blocked` and
+blocks all candidates.
+
+Redacted census references become **owner evidence** (no argv/env): protect a
+candidate when any `cwd`, `exe`, `interpreter_script`, or `open_fd` path falls under
+the checkout **or** its exact git-dir. Each evidence row carries `pid`, `uid`,
+`name`, `kind`, and `path`.
+
+### Output
+
+Main emits **one** well-formed JSON report (compatible keys retained where practical:
+`schema_version`, `complete`, `fatal_errors`, `repo`, `managed_root`, `disks`,
+`remote_default`, `paseo`, `worktrees[]`, …) plus process snapshot fields
+`started_at`, `process_census.captured_at`, `process_census.boot_id`,
+`process_census.reasons`, and `process_census.status`. Unexpected failures exit
+nonzero with a concise stderr line — do not rebuild porcelain/process/size inventory
+inline in schedule instructions; call this probe once per wake.
 
 ## Legacy /tmp recovery lane
 

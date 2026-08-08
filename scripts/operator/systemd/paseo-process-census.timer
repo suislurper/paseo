@@ -3,7 +3,7 @@ Description=Run Paseo process census every 10 seconds
 Documentation=file:///usr/local/share/doc/paseo/operator-fork.md
 
 [Timer]
-OnBootSec=10s
+OnActiveSec=10s
 OnUnitActiveSec=10s
 AccuracySec=1s
 Persistent=true

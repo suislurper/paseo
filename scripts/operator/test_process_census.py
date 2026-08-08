@@ -483,9 +483,12 @@ class ProcessCensusTests(unittest.TestCase):
 
     def test_timer_cadence_supports_bounded_process_retry(self) -> None:
         timer = TIMER_UNIT.read_text(encoding="utf-8")
-        self.assertIn("OnBootSec=10s", timer)
+        self.assertIn("OnActiveSec=10s", timer)
+        self.assertNotIn("OnBootSec=", timer)
         self.assertIn("OnUnitActiveSec=10s", timer)
         self.assertIn("AccuracySec=1s", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=paseo-process-census.service", timer)
 
 
 if __name__ == "__main__":

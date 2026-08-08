@@ -4,10 +4,14 @@
 # Restarts only paseo-process-census.timer — never Paseo or other services.
 #
 # PCT-001: after unprivileged preflight, copy reviewed inputs into a unique
-# root-owned staging dir, re-verify hashes/modes there, install only from stage,
-# and re-verify destinations before daemon-reload/enable/restart.
-# PCT-002: record any pre-existing census snapshot identity, then require two
-# distinct complete same-boot empty-error captures strictly after restart.
+# root-owned staging dir (dir mode 0711 so unprivileged verify can traverse),
+# re-verify hashes/modes there, install only from stage, and re-verify
+# destinations before daemon-reload/activation. Cleanup uses unconditional
+# sudo rm of the four known children + exact rmdir (no globs/rm -rf).
+# PCT-002: stop only the census timer, wait for the census service to become
+# inactive, then record the census baseline; start/enable only the timer and
+# require two distinct complete same-boot empty-error captures after that
+# quiesced baseline. Never touch Paseo or other services.
 set -euo pipefail
 
 readonly SOURCE_COMMIT=83bf0839c16ed73191f097ccd905aa81ee6acd14
@@ -24,6 +28,7 @@ readonly DEST_DOC_DIR=/usr/local/share/doc/paseo
 readonly DEST_DOC="${DEST_DOC_DIR}/operator-fork.md"
 readonly CENSUS_OUT=/run/paseo/process-census.json
 readonly TIMER_UNIT=paseo-process-census.timer
+readonly SERVICE_UNIT=paseo-process-census.service
 readonly BACKUP_PARENT=/mnt/data/paseo-runtime/artifacts/operator-install/backups
 
 # Narrow, explicit staging parent/prefix. Cleanup validates both before removal.
@@ -33,6 +38,9 @@ readonly STAGED_TIMER_NAME=paseo-process-census.timer
 readonly STAGED_SERVICE_NAME=paseo-process-census.service
 readonly STAGED_HELPER_NAME=paseo-process-census
 readonly STAGED_DOC_NAME=operator-fork.md
+# Staging dir stays root-owned; 0711 allows unprivileged traverse for verify.
+readonly STAGING_DIR_MODE=0711
+readonly STAGING_DIR_OWNER_MODE='root:root:711'
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -75,7 +83,10 @@ is_valid_staging_dir() {
   return 0
 }
 
-# Remove only the four known staged basenames, then rmdir. No globs, no rm -rf.
+# Remove the four exact known staged basenames, then exact rmdir.
+# No globs, no rm -rf. Existence tests are not used: a 0700 root stage would
+# make unprivileged [[ -e ]] miss children and leave residue; sudo -n rm -f
+# on the exact known paths is unconditional after path validation.
 # Safe no-op when STAGING_DIR is unset/invalid. Uses sudo -n only.
 cleanup_staging() {
   local d=${STAGING_DIR:-}
@@ -83,19 +94,51 @@ cleanup_staging() {
   STAGING_DIR=
   [[ -n "$d" ]] || return 0
   is_valid_staging_dir "$d" || return 0
-  [[ -d "$d" ]] || return 0
   for f in \
     "$STAGED_TIMER_NAME" \
     "$STAGED_SERVICE_NAME" \
     "$STAGED_HELPER_NAME" \
     "$STAGED_DOC_NAME"; do
-    # Only remove the exact known basenames under the validated dir.
-    if [[ -e "$d/$f" || -L "$d/$f" ]]; then
-      sudo -n rm -f -- "$d/$f" || true
+    sudo -n rm -f -- "$d/$f" || true
+  done
+  # Exact dir removal only (no broad recursive delete).
+  sudo -n rmdir -- "$d" 2>/dev/null || true
+}
+
+# Wait until SERVICE_UNIT is inactive. Does not stop/kill/restart the service.
+# Fail-closed: timeout or 'failed' aborts. Bounded by caller deadline.
+wait_service_inactive() {
+  local unit=$1
+  local deadline=$2
+  local state remaining poll_sleep=1
+  while ((SECONDS < deadline)); do
+    state=$(systemctl is-active -- "$unit" 2>/dev/null || true)
+    case "$state" in
+      inactive | dead)
+        return 0
+        ;;
+      failed)
+        die "census service entered failed state while waiting for quiescence"
+        ;;
+      active | activating | deactivating | reloading)
+        ;;
+      *)
+        # Unknown/empty: treat as not yet proven inactive; keep polling.
+        ;;
+    esac
+    remaining=$((deadline - SECONDS))
+    ((remaining <= 0)) && break
+    if ((remaining < poll_sleep)); then
+      sleep "$remaining"
+    else
+      sleep "$poll_sleep"
     fi
   done
-  # Exact dir removal only when empty (no broad recursive delete).
-  sudo -n rmdir -- "$d" 2>/dev/null || true
+  state=$(systemctl is-active -- "$unit" 2>/dev/null || true)
+  case "$state" in
+    inactive | dead) return 0 ;;
+  esac
+  die "census service did not become inactive before quiescence deadline (state=${state:-empty})"
 }
 
 # Robust snapshot identity: captured_at + device/inode/size/mtime + content hash.
@@ -263,6 +306,11 @@ process_census_install_main() {
   is_valid_staging_dir "$STAGING_DIR" ||
     die "staging path failed validation: ${STAGING_DIR:-empty}"
 
+  # mktemp defaults to 0700; unprivileged hash/stat cannot traverse that.
+  # Keep staging root-owned, open only other-execute+other-read-dir (0711).
+  sudo -n chmod -- "$STAGING_DIR_MODE" "$STAGING_DIR"
+  assert_owner_mode "$STAGING_DIR" "$STAGING_DIR_OWNER_MODE"
+
   # Copy reviewed inputs under root authority into staging (root reads sources
   # at this moment). Modes match final destinations for staged verify.
   sudo -n install -o root -g root -m 0644 -- "$timer_src" \
@@ -275,6 +323,7 @@ process_census_install_main() {
     "$STAGING_DIR/$STAGED_DOC_NAME"
 
   # Any mutation of sources between preflight hash and this point fails here.
+  # Traversal works because the stage root is 0711 (verified above).
   assert_sha "$STAGING_DIR/$STAGED_TIMER_NAME" "$EXPECTED_TIMER_SHA"
   assert_sha "$STAGING_DIR/$STAGED_SERVICE_NAME" "$EXPECTED_SERVICE_SHA"
   assert_sha "$STAGING_DIR/$STAGED_HELPER_NAME" "$EXPECTED_HELPER_SHA"
@@ -297,7 +346,7 @@ process_census_install_main() {
   sudo -n install -o root -g root -m 0644 -- \
     "$STAGING_DIR/$STAGED_DOC_NAME" "$DEST_DOC"
 
-  # Verify installed destinations before any systemd reload/restart.
+  # Verify installed destinations before any systemd reload/activation.
   assert_sha "$DEST_TIMER" "$EXPECTED_TIMER_SHA"
   assert_sha "$DEST_SERVICE" "$EXPECTED_SERVICE_SHA"
   assert_sha "$DEST_HELPER" "$EXPECTED_HELPER_SHA"
@@ -307,17 +356,33 @@ process_census_install_main() {
   assert_owner_mode "$DEST_TIMER" 'root:root:644'
   assert_owner_mode "$DEST_DOC" 'root:root:644'
 
-  # PCT-002: identity of any pre-existing snapshot (do not count it later).
+  # Total activation proof budget < 60s wall (quiesce + two captures).
+  local total_deadline quiesce_deadline poll_deadline
+  total_deadline=$((SECONDS + 55))
+
+  # Load new units under a stopped timer so a mid-install capture cannot race
+  # the baseline. Never touch Paseo or any non-census unit.
+  sudo -n systemctl daemon-reload
+  # Stop only the census timer (do not stop/kill/restart the service).
+  sudo -n systemctl stop -- "$TIMER_UNIT"
+
+  # Bound quiescence wait; leave most of the budget for post-baseline captures.
+  quiesce_deadline=$((SECONDS + 15))
+  if ((quiesce_deadline > total_deadline)); then
+    quiesce_deadline=$total_deadline
+  fi
+  wait_service_inactive "$SERVICE_UNIT" "$quiesce_deadline"
+
+  # PCT-002: baseline only after quiescence — in-flight producer captures and
+  # any pre-existing snapshot identity are excluded from first/second proof.
   local baseline_identity boot_id
   baseline_identity=$(census_file_identity "$CENSUS_OUT")
   boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id)
   [[ -n "$boot_id" ]] || die "cannot read current boot_id"
 
-  # Load new units; enable timer; restart *only* the census timer so the changed
-  # active timer unit is loaded. Never touch Paseo or any other service.
-  sudo -n systemctl daemon-reload
+  # Start/enable *only* the census timer. Never restart shared services.
   sudo -n systemctl enable -- "$TIMER_UNIT"
-  sudo -n systemctl restart -- "$TIMER_UNIT"
+  sudo -n systemctl start -- "$TIMER_UNIT"
 
   local enabled_state active_state next_rt next_mono next_trigger
   enabled_state=$(systemctl is-enabled -- "$TIMER_UNIT" 2>/dev/null || true)
@@ -337,18 +402,18 @@ process_census_install_main() {
     die "timer has no finite next trigger (rt=${next_rt:-empty} mono=${next_mono:-empty})"
   fi
 
-  # Bounded poll: ≤5s sleep, total wall < 60s. Two distinct complete same-boot
-  # empty-error captures with identities strictly subsequent to baseline.
-  local deadline first_identity second_identity poll_sleep candidate step remaining
+  # Bounded poll for two distinct complete same-boot empty-error captures with
+  # identities strictly subsequent to the quiesced baseline. Rebalanced budget.
+  local first_identity second_identity poll_sleep candidate step remaining
   local first_at second_at
-  deadline=$((SECONDS + 55))
+  poll_deadline=$total_deadline
   first_identity=''
   second_identity=''
   first_at=''
   second_at=''
-  poll_sleep=2
+  poll_sleep=1
 
-  while ((SECONDS < deadline)); do
+  while ((SECONDS < poll_deadline)); do
     candidate=$(valid_census_capture_identity "$CENSUS_OUT" "$boot_id")
     step=$(accept_capture_step "$baseline_identity" "$first_identity" "$candidate")
     case "$step" in
@@ -366,7 +431,7 @@ process_census_install_main() {
         die "internal error: unexpected accept_capture_step result: $step"
         ;;
     esac
-    remaining=$((deadline - SECONDS))
+    remaining=$((poll_deadline - SECONDS))
     ((remaining <= 0)) && break
     if ((remaining < poll_sleep)); then
       sleep "$remaining"

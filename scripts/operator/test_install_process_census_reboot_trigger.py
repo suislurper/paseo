@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Focused tests for install-process-census-reboot-trigger.sh helpers.
 
-No sudo. No real systemd. Temporary directories only.
-Proves PCT-002 baseline exclusion and PCT-001 staging-path validation.
+No real sudo. No real systemd. Temporary directories only.
+Proves PCT-001 staging traverse/cleanup and PCT-002 quiesced baseline exclusion.
 """
 
 from __future__ import annotations
@@ -17,6 +17,14 @@ import unittest
 from pathlib import Path
 
 INSTALLER = Path(__file__).resolve().parent / "install-process-census-reboot-trigger.sh"
+STAGING_PARENT = "/var/tmp"
+STAGING_PREFIX = "paseo-process-census-install."
+STAGED_NAMES = (
+    "paseo-process-census.timer",
+    "paseo-process-census.service",
+    "paseo-process-census",
+    "operator-fork.md",
+)
 
 
 def _bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -38,6 +46,40 @@ def _source_helpers_prefix() -> str:
         set -euo pipefail
         # shellcheck source=/dev/null
         source {INSTALLER.as_posix()!r}
+        """
+    )
+
+
+def _fake_sudo_fn() -> str:
+    """Sudo stand-in: drop -n, restore traverse on locked parents, run as self.
+
+    cleanup_staging clears STAGING_DIR before rm, so unlock uses path parents
+    (simulating root's ability to unlink through a mode-000 directory).
+    """
+    return textwrap.dedent(
+        """\
+        sudo() {
+          local -a args=()
+          local a parent
+          for a in "$@"; do
+            if [[ "$a" == "-n" ]]; then
+              continue
+            fi
+            args+=("$a")
+          done
+          # Simulate elevated access: unlock parents of path operands.
+          for a in "${args[@]}"; do
+            [[ "$a" == /* ]] || continue
+            parent=$(dirname -- "$a")
+            if [[ -d "$parent" ]]; then
+              chmod u+rwx -- "$parent" 2>/dev/null || true
+            fi
+            if [[ -d "$a" ]]; then
+              chmod u+rwx -- "$a" 2>/dev/null || true
+            fi
+          done
+          "${args[@]}"
+        }
         """
     )
 
@@ -91,6 +133,280 @@ class StagingPathValidationTests(unittest.TestCase):
         self.assertFalse(self._valid("/var/tmp/other-prefix.abc123"))
         self.assertFalse(self._valid("paseo-process-census-install.abc123"))
         self.assertFalse(self._valid("/var/tmp/../tmp/paseo-process-census-install.abc123"))
+
+
+class StagingTraverseAndCleanupTests(unittest.TestCase):
+    """PCT-001: 0711 traverse + unconditional cleanup of exact known children."""
+
+    def setUp(self) -> None:
+        self.stage = Path(
+            tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=STAGING_PARENT),
+        )
+        for name in STAGED_NAMES:
+            (self.stage / name).write_text(f"payload:{name}\n", encoding="utf-8")
+            if name == "paseo-process-census":
+                (self.stage / name).chmod(0o755)
+            else:
+                (self.stage / name).chmod(0o644)
+
+    def tearDown(self) -> None:
+        # Best-effort residual cleanup if a test failed mid-way.
+        if self.stage.exists():
+            try:
+                self.stage.chmod(0o700)
+            except OSError:
+                pass
+            for name in STAGED_NAMES:
+                p = self.stage / name
+                if p.exists() or p.is_symlink():
+                    p.unlink(missing_ok=True)
+            try:
+                self.stage.rmdir()
+            except OSError:
+                pass
+
+    def test_mode_0711_allows_unprivileged_traverse_and_hash(self) -> None:
+        """0700-style lock blocks child open; 0711 restores traverse for verify."""
+        # Lock down like root mktemp 0700 would for a non-owner — use 000 so even
+        # the owner cannot open children (deterministic without real root).
+        self.stage.chmod(0o000)
+        blocked = _bash(
+            textwrap.dedent(
+                f"""\
+                set -euo pipefail
+                if sha256sum -- {str(self.stage / STAGED_NAMES[0])!r} >/dev/null 2>&1; then
+                  printf 'open\\n'
+                else
+                  printf 'blocked\\n'
+                fi
+                """
+            )
+        )
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(blocked.stdout.strip(), "blocked")
+
+        self.stage.chmod(0o711)
+        mode = stat.S_IMODE(self.stage.stat().st_mode)
+        self.assertEqual(mode, 0o711)
+
+        opened = _bash(
+            textwrap.dedent(
+                f"""\
+                set -euo pipefail
+                sha256sum -- {str(self.stage / STAGED_NAMES[0])!r} | awk '{{print $1}}'
+                """
+            )
+        )
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertRegex(opened.stdout.strip(), r"^[0-9a-f]{64}$")
+
+    def test_cleanup_unconditional_rm_removes_children_when_dir_not_traversable(self) -> None:
+        """Existence tests would miss children under locked dir; unconditional sudo rm must not."""
+        # Prove unprivileged existence checks cannot see children under 000.
+        self.stage.chmod(0o000)
+        exists_probe = _bash(
+            textwrap.dedent(
+                f"""\
+                set -euo pipefail
+                d={str(self.stage)!r}
+                seen=0
+                for f in \\
+                  paseo-process-census.timer \\
+                  paseo-process-census.service \\
+                  paseo-process-census \\
+                  operator-fork.md
+                do
+                  if [[ -e "$d/$f" || -L "$d/$f" ]]; then
+                    seen=$((seen + 1))
+                  fi
+                done
+                printf '%s\\n' "$seen"
+                """
+            )
+        )
+        self.assertEqual(exists_probe.returncode, 0, exists_probe.stderr)
+        self.assertEqual(exists_probe.stdout.strip(), "0")
+
+        # cleanup_staging with fake sudo must still clear all four + rmdir.
+        script = (
+            _source_helpers_prefix()
+            + _fake_sudo_fn()
+            + textwrap.dedent(
+                f"""\
+                STAGING_DIR={str(self.stage)!r}
+                cleanup_staging
+                if [[ -e {str(self.stage)!r} ]]; then
+                  printf 'residue-dir\\n' >&2
+                  exit 2
+                fi
+                printf 'clean\\n'
+                """
+            )
+        )
+        proc = _bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(proc.stdout.strip(), "clean")
+        self.assertFalse(self.stage.exists())
+
+    def test_cleanup_noop_on_invalid_or_unset_staging(self) -> None:
+        script = (
+            _source_helpers_prefix()
+            + _fake_sudo_fn()
+            + textwrap.dedent(
+                """\
+                STAGING_DIR=
+                cleanup_staging
+                STAGING_DIR=/tmp/paseo-process-census-install.evil
+                cleanup_staging
+                STAGING_DIR=/var/tmp/not-the-prefix.xyz
+                cleanup_staging
+                printf 'ok\\n'
+                """
+            )
+        )
+        proc = _bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "ok")
+        # Original fixture still present (invalid paths must not delete it).
+        self.stage.chmod(0o700)
+        self.assertTrue(self.stage.is_dir())
+        for name in STAGED_NAMES:
+            self.assertTrue((self.stage / name).is_file())
+
+    def test_cleanup_issues_exact_four_rm_and_rmdir_no_glob(self) -> None:
+        """Record fake-sudo argv: four exact rm -f paths + one exact rmdir."""
+        log = self.stage.parent / f"{self.stage.name}.sudo-log"
+        if log.exists():
+            log.unlink()
+        script = (
+            _source_helpers_prefix()
+            + textwrap.dedent(
+                f"""\
+                SUDO_LOG={log.as_posix()!r}
+                sudo() {{
+                  local -a args=()
+                  local a parent
+                  for a in "$@"; do
+                    [[ "$a" == "-n" ]] && continue
+                    args+=("$a")
+                  done
+                  {{
+                    printf 'CMD'
+                    printf '\\t%s' "${{args[@]}}"
+                    printf '\\n'
+                  }} >>"$SUDO_LOG"
+                  for a in "${{args[@]}}"; do
+                    [[ "$a" == /* ]] || continue
+                    parent=$(dirname -- "$a")
+                    if [[ -d "$parent" ]]; then
+                      chmod u+rwx -- "$parent" 2>/dev/null || true
+                    fi
+                    if [[ -d "$a" ]]; then
+                      chmod u+rwx -- "$a" 2>/dev/null || true
+                    fi
+                  done
+                  "${{args[@]}}"
+                }}
+                STAGING_DIR={str(self.stage)!r}
+                cleanup_staging
+                printf 'ok\\n'
+                """
+            )
+        )
+        proc = _bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertFalse(self.stage.exists())
+        lines = log.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 5, lines)
+        rm_lines = [ln for ln in lines if ln.startswith("CMD\trm\t")]
+        rmdir_lines = [ln for ln in lines if ln.startswith("CMD\trmdir\t")]
+        self.assertEqual(len(rm_lines), 4, lines)
+        self.assertEqual(len(rmdir_lines), 1, lines)
+        for name in STAGED_NAMES:
+            expected = f"CMD\trm\t-f\t--\t{self.stage / name}"
+            self.assertIn(expected, lines)
+        self.assertEqual(rmdir_lines[0], f"CMD\trmdir\t--\t{self.stage}")
+        joined = "\n".join(lines)
+        self.assertNotIn("*", joined)
+        self.assertNotIn("rm -rf", joined)
+        self.assertNotIn("rm\t-rf", joined)
+        log.unlink(missing_ok=True)
+
+    def test_stage_create_chmod_verify_cleanup_integration_with_fakes(self) -> None:
+        """Integration-style: mktemp→0711 verify→stage files→hash→cleanup, no residue."""
+        stage_holder = Path(
+            tempfile.mkdtemp(prefix=f"{STAGING_PREFIX}holder-", dir=STAGING_PARENT),
+        )
+        try:
+            script = (
+                _source_helpers_prefix()
+                + _fake_sudo_fn()
+                + textwrap.dedent(
+                    f"""\
+                    # Use sourced STAGING_PARENT (readonly); do not reassign.
+                    STAGING_DIR=$(mktemp -d -p "$STAGING_PARENT" "${{STAGING_NAME_PREFIX}}XXXXXX")
+                    is_valid_staging_dir "$STAGING_DIR" || {{
+                      printf 'bad-stage:%s\\n' "$STAGING_DIR" >&2
+                      exit 2
+                    }}
+                    # Simulate mktemp 0700 then fix to reviewed 0711.
+                    chmod 0700 -- "$STAGING_DIR"
+                    chmod -- "$STAGING_DIR_MODE" "$STAGING_DIR"
+                    mode=$(stat -c '%a' -- "$STAGING_DIR")
+                    [[ "$mode" == "711" ]] || {{
+                      printf 'mode-want-711-got-%s\\n' "$mode" >&2
+                      exit 3
+                    }}
+                    # Stage four known files (owner is test user; modes match install).
+                    printf 'timer\\n' >"$STAGING_DIR/$STAGED_TIMER_NAME"
+                    printf 'service\\n' >"$STAGING_DIR/$STAGED_SERVICE_NAME"
+                    printf 'helper\\n' >"$STAGING_DIR/$STAGED_HELPER_NAME"
+                    printf 'doc\\n' >"$STAGING_DIR/$STAGED_DOC_NAME"
+                    chmod 0644 -- "$STAGING_DIR/$STAGED_TIMER_NAME" \\
+                      "$STAGING_DIR/$STAGED_SERVICE_NAME" \\
+                      "$STAGING_DIR/$STAGED_DOC_NAME"
+                    chmod 0755 -- "$STAGING_DIR/$STAGED_HELPER_NAME"
+                    # Unprivileged traverse+hash must succeed under 0711.
+                    for f in \\
+                      "$STAGED_TIMER_NAME" \\
+                      "$STAGED_SERVICE_NAME" \\
+                      "$STAGED_HELPER_NAME" \\
+                      "$STAGED_DOC_NAME"
+                    do
+                      sha256sum -- "$STAGING_DIR/$f" >/dev/null
+                      got=$(stat -c '%a' -- "$STAGING_DIR/$f")
+                      case "$f" in
+                        "$STAGED_HELPER_NAME")
+                          [[ "$got" == "755" ]] || exit 4
+                          ;;
+                        *)
+                          [[ "$got" == "644" ]] || exit 5
+                          ;;
+                      esac
+                    done
+                    # Record path then cleanup; must leave no residue.
+                    printf '%s\\n' "$STAGING_DIR" >{stage_holder.as_posix()!r}/path.txt
+                    cleanup_staging
+                    [[ ! -e $(cat {stage_holder.as_posix()!r}/path.txt) ]] || {{
+                      printf 'residue\\n' >&2
+                      exit 6
+                    }}
+                    printf 'ok\\n'
+                    """
+                )
+            )
+            proc = _bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(proc.stdout.strip(), "ok")
+            path_file = stage_holder / "path.txt"
+            self.assertTrue(path_file.is_file())
+            staged = Path(path_file.read_text(encoding="utf-8").strip())
+            self.assertFalse(staged.exists())
+        finally:
+            # holder only; staged path already cleaned
+            for p in stage_holder.iterdir():
+                p.unlink(missing_ok=True)
+            stage_holder.rmdir()
 
 
 class CaptureIdentityTests(unittest.TestCase):
@@ -353,6 +669,333 @@ class CaptureIdentityTests(unittest.TestCase):
         self.assertIn("first_cap=2026-08-01T00:00:10Z", lines)
         self.assertIn("second_cap=2026-08-01T00:00:20Z", lines)
 
+    def test_capture_before_quiescence_boundary_is_excluded(self) -> None:
+        """PCT-002: in-flight capture that lands before the quiesced baseline is not first/second.
+
+        Sequence models: stop timer → in-flight producer finishes → service inactive →
+        record baseline → start timer → only later replacements count.
+        """
+        pre = self.root / "pre.json"
+        inflight = self.root / "inflight.json"
+        post1 = self.root / "post1.json"
+        post2 = self.root / "post2.json"
+        write_census(
+            pre,
+            captured_at="2026-08-01T00:00:00Z",
+            boot_id=self.boot,
+            processes=[{"pid": 1, "comm": "pre"}],
+        )
+        write_census(
+            inflight,
+            captured_at="2026-08-01T00:00:05Z",
+            boot_id=self.boot,
+            processes=[{"pid": 2, "comm": "inflight"}],
+        )
+        write_census(
+            post1,
+            captured_at="2026-08-01T00:00:15Z",
+            boot_id=self.boot,
+            processes=[{"pid": 3, "comm": "post1"}],
+        )
+        write_census(
+            post2,
+            captured_at="2026-08-01T00:00:25Z",
+            boot_id=self.boot,
+            processes=[{"pid": 4, "comm": "post2"}],
+        )
+
+        script = _source_helpers_prefix() + textwrap.dedent(
+            f"""\
+            boot={self.boot!r}
+            # Wrong order (pre-restart race): baseline before in-flight completes.
+            early_baseline=$(census_file_identity {pre.as_posix()!r})
+            inflight_id=$(valid_census_capture_identity {inflight.as_posix()!r} "$boot")
+            wrong_step=$(accept_capture_step "$early_baseline" "" "$inflight_id")
+            # Buggy path would accept the in-flight write as first.
+            [[ "$wrong_step" == first:* ]] || {{
+              printf 'expected-wrong-first\\n' >&2
+              exit 2
+            }}
+
+            # Correct order: quiesce, then baseline includes the completed in-flight write.
+            baseline=$(census_file_identity {inflight.as_posix()!r})
+            [[ -n "$baseline" ]] || {{ printf 'empty-baseline\\n' >&2; exit 3; }}
+            # Same in-flight identity after boundary must be ignored.
+            step0=$(accept_capture_step "$baseline" "" "$inflight_id")
+            [[ "$step0" == ignore ]] || {{
+              printf 'inflight-not-ignored:%s\\n' "$step0" >&2
+              exit 4
+            }}
+
+            first_identity=''
+            second_identity=''
+            for path in \\
+              {inflight.as_posix()!r} \\
+              {post1.as_posix()!r} \\
+              {post1.as_posix()!r} \\
+              {post2.as_posix()!r}
+            do
+              candidate=$(valid_census_capture_identity "$path" "$boot")
+              step=$(accept_capture_step "$baseline" "$first_identity" "$candidate")
+              case "$step" in
+                first:*)
+                  first_identity=${{step#first:}}
+                  ;;
+                second:*)
+                  second_identity=${{step#second:}}
+                  break
+                  ;;
+                ignore) ;;
+                *)
+                  printf 'bad-step:%s\\n' "$step" >&2
+                  exit 5
+                  ;;
+              esac
+            done
+            [[ -n "$first_identity" && -n "$second_identity" ]] || {{
+              printf 'missing-captures\\n' >&2
+              exit 6
+            }}
+            [[ "$first_identity" != "$baseline" ]] || {{
+              printf 'first-is-baseline\\n' >&2
+              exit 7
+            }}
+            [[ "$first_identity" != "$inflight_id" ]] || {{
+              printf 'first-is-inflight\\n' >&2
+              exit 8
+            }}
+            [[ "$second_identity" != "$inflight_id" ]] || {{
+              printf 'second-is-inflight\\n' >&2
+              exit 9
+            }}
+            printf 'ok\\n'
+            printf 'first_cap=%s\\n' "${{first_identity%%$'\\t'*}}"
+            printf 'second_cap=%s\\n' "${{second_identity%%$'\\t'*}}"
+            """
+        )
+        proc = _bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        lines = proc.stdout.strip().splitlines()
+        self.assertEqual(lines[0], "ok")
+        self.assertIn("first_cap=2026-08-01T00:00:15Z", lines)
+        self.assertIn("second_cap=2026-08-01T00:00:25Z", lines)
+
+
+class WaitServiceInactiveTests(unittest.TestCase):
+    """PCT-002: wait_service_inactive fail-closed behaviour with fake systemctl."""
+
+    def test_wait_accepts_inactive_and_dead(self) -> None:
+        script = _source_helpers_prefix() + textwrap.dedent(
+            """\
+            systemctl() {
+              if [[ "$1" == "is-active" ]]; then
+                printf 'inactive\\n'
+                return 0
+              fi
+              printf 'unexpected systemctl: %s\\n' "$*" >&2
+              return 1
+            }
+            SECONDS=0
+            wait_service_inactive paseo-process-census.service $((SECONDS + 5))
+            systemctl() {
+              if [[ "$1" == "is-active" ]]; then
+                printf 'dead\\n'
+                return 0
+              fi
+              return 1
+            }
+            wait_service_inactive paseo-process-census.service $((SECONDS + 5))
+            printf 'ok\\n'
+            """
+        )
+        proc = _bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "ok")
+
+    def test_wait_fails_closed_on_failed_state(self) -> None:
+        script = _source_helpers_prefix() + textwrap.dedent(
+            """\
+            systemctl() {
+              if [[ "$1" == "is-active" ]]; then
+                printf 'failed\\n'
+                return 0
+              fi
+              return 1
+            }
+            SECONDS=0
+            if wait_service_inactive paseo-process-census.service $((SECONDS + 5)); then
+              printf 'unexpected-success\\n'
+              exit 2
+            else
+              rc=$?
+              printf 'failed-closed rc=%s\\n' "$rc"
+            fi
+            """
+        )
+        proc = _bash(script)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("failed state", proc.stderr)
+
+    def test_wait_fails_closed_on_timeout_while_active(self) -> None:
+        script = _source_helpers_prefix() + textwrap.dedent(
+            """\
+            systemctl() {
+              if [[ "$1" == "is-active" ]]; then
+                printf 'active\\n'
+                return 0
+              fi
+              return 1
+            }
+            # Freeze SECONDS so the deadline is already past on entry to the loop end.
+            SECONDS=100
+            if wait_service_inactive paseo-process-census.service 100; then
+              printf 'unexpected-success\\n'
+              exit 2
+            fi
+            """
+        )
+        proc = _bash(script)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("did not become inactive", proc.stderr)
+
+    def test_activation_sequence_orders_stop_wait_baseline_start(self) -> None:
+        """Deterministic fake sequence: in-flight before baseline excluded; only post counts."""
+        tmp = tempfile.TemporaryDirectory(prefix="pct-seq-")
+        root = Path(tmp.name)
+        try:
+            census = root / "process-census.json"
+            log = root / "sys.log"
+            phase_file = root / "phase"
+            stop_file = root / "timer-stopped"
+            inflight_body = root / "inflight-body.json"
+            # Pre-seed a capture that will be replaced mid-quiesce.
+            write_census(
+                census,
+                captured_at="2026-08-01T00:00:00Z",
+                boot_id="boot-seq-1",
+                processes=[{"pid": 1}],
+            )
+            write_census(
+                inflight_body,
+                captured_at="2026-08-01T00:00:30Z",
+                boot_id="boot-seq-1",
+                processes=[{"pid": 2, "comm": "inflight"}],
+            )
+            post1 = root / "post1.json"
+            post2 = root / "post2.json"
+            write_census(
+                post1,
+                captured_at="2026-08-01T00:01:00Z",
+                boot_id="boot-seq-1",
+                processes=[{"pid": 10}],
+            )
+            write_census(
+                post2,
+                captured_at="2026-08-01T00:02:00Z",
+                boot_id="boot-seq-1",
+                processes=[{"pid": 11}],
+            )
+            phase_file.write_text("0\n", encoding="utf-8")
+            stop_file.write_text("0\n", encoding="utf-8")
+            # Phase/stop files: command substitutions run systemctl in a subshell,
+            # so state must live on disk (not shell variables).
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                LOG={log.as_posix()!r}
+                CENSUS={census.as_posix()!r}
+                POST1={post1.as_posix()!r}
+                POST2={post2.as_posix()!r}
+                PHASE_FILE={phase_file.as_posix()!r}
+                STOP_FILE={stop_file.as_posix()!r}
+                INFLIGHT_BODY={inflight_body.as_posix()!r}
+                boot=boot-seq-1
+
+                systemctl() {{
+                  printf '%s\\n' "$*" >>"$LOG"
+                  case "$1" in
+                    stop)
+                      [[ "$2" == "--" && "$3" == "paseo-process-census.timer" ]] || return 1
+                      printf '1\\n' >"$STOP_FILE"
+                      return 0
+                      ;;
+                    is-active)
+                      unit=${{3:-$2}}
+                      if [[ "$unit" == "paseo-process-census.service" ]]; then
+                        phase=$(cat "$PHASE_FILE")
+                        stopped=$(cat "$STOP_FILE")
+                        if [[ "$phase" == "0" ]]; then
+                          [[ "$stopped" == "1" ]] || {{
+                            printf 'inflight-before-stop\\n' >&2
+                            return 1
+                          }}
+                          # In-flight producer finishes; still active this poll.
+                          cp -- "$INFLIGHT_BODY" "$CENSUS"
+                          printf '1\\n' >"$PHASE_FILE"
+                          printf 'active\\n'
+                          return 0
+                        fi
+                        printf 'inactive\\n'
+                        return 0
+                      fi
+                      if [[ "$unit" == "paseo-process-census.timer" ]]; then
+                        printf 'active\\n'
+                        return 0
+                      fi
+                      ;;
+                    start|enable|daemon-reload|is-enabled|show)
+                      return 0
+                      ;;
+                  esac
+                  return 0
+                }}
+
+                # --- activation fragment under test (mirrors installer order) ---
+                systemctl stop -- paseo-process-census.timer
+                SECONDS=0
+                wait_service_inactive paseo-process-census.service $((SECONDS + 10))
+                baseline=$(census_file_identity "$CENSUS")
+                [[ -n "$baseline" ]] || {{ printf 'empty-baseline\\n' >&2; exit 2; }}
+                systemctl enable -- paseo-process-census.timer
+                systemctl start -- paseo-process-census.timer
+
+                first_identity=''
+                second_identity=''
+                for path in "$CENSUS" "$POST1" "$POST2"; do
+                  candidate=$(valid_census_capture_identity "$path" "$boot")
+                  step=$(accept_capture_step "$baseline" "$first_identity" "$candidate")
+                  case "$step" in
+                    first:*) first_identity=${{step#first:}} ;;
+                    second:*) second_identity=${{step#second:}}; break ;;
+                    ignore) ;;
+                    *) printf 'bad:%s\\n' "$step" >&2; exit 3 ;;
+                  esac
+                done
+                [[ -n "$first_identity" && -n "$second_identity" ]] || exit 4
+                # Baseline must be the in-flight capture (00:00:30), not pre (00:00:00).
+                [[ "${{baseline%%$'\\t'*}}" == "2026-08-01T00:00:30Z" ]] || {{
+                  printf 'baseline_cap=%s\\n' "${{baseline%%$'\\t'*}}" >&2
+                  exit 5
+                }}
+                [[ "${{first_identity%%$'\\t'*}}" == "2026-08-01T00:01:00Z" ]] || exit 6
+                [[ "${{second_identity%%$'\\t'*}}" == "2026-08-01T00:02:00Z" ]] || exit 7
+                # Must never stop/kill/restart the service unit.
+                if grep -E '(^|[[:space:]])(stop|kill|restart)([[:space:]].*)?paseo-process-census\\.service' "$LOG"; then
+                  printf 'service-mutated\\n' >&2
+                  exit 8
+                fi
+                if ! grep -q 'stop -- paseo-process-census.timer' "$LOG"; then
+                  printf 'timer-not-stopped\\n' >&2
+                  exit 9
+                fi
+                printf 'ok\\n'
+                """
+            )
+            proc = _bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(proc.stdout.strip().splitlines()[0], "ok")
+        finally:
+            tmp.cleanup()
+
 
 class InstallerSyntaxAndSurfaceTests(unittest.TestCase):
     def test_bash_n_clean(self) -> None:
@@ -373,6 +1016,16 @@ class InstallerSyntaxAndSurfaceTests(unittest.TestCase):
         proc = _bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "sourced-ok")
+
+    def test_surface_mentions_quiesce_and_staging_mode(self) -> None:
+        text = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("STAGING_DIR_MODE=0711", text)
+        self.assertIn("wait_service_inactive", text)
+        self.assertIn("SERVICE_UNIT=paseo-process-census.service", text)
+        # Must not restart/kill the census service for quiescence.
+        self.assertNotIn('systemctl restart -- "$SERVICE_UNIT"', text)
+        self.assertNotIn('systemctl stop -- "$SERVICE_UNIT"', text)
+        self.assertNotIn('systemctl kill', text)
 
 
 if __name__ == "__main__":

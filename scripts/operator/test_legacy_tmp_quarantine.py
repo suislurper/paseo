@@ -826,6 +826,57 @@ class Tests(unittest.TestCase):
         self.assertEqual(payload.read_bytes(), b"original-bytes")
         self.assertEqual((src / "data.bin").read_bytes(), b"mutated-after-durable-publish")
 
+    def test_protection_after_second_probe_refuses_quarantine_source_rename(self) -> None:
+        """Process protection after the second accepted probe must refuse source rename.
+
+        Source bytes stay stable; quarantine copy remains; original source preserved.
+        """
+        src, probe = self.h.eligible("paseo-late-prot", body=b"stable-late-prot")
+        self.assertEqual(probe["classification"], "eligible", probe)
+        token = probe["candidate_token"]
+        real_classify = M.classify_source
+        calls = {"n": 0}
+
+        def inject_process_after_second(**kwargs: Any) -> dict[str, Any]:
+            calls["n"] += 1
+            out = real_classify(**kwargs)
+            if calls["n"] == 2 and out.get("classification") == "eligible":
+                # After post-publish revalidation accepted; source inventory still matches.
+                self.h.processes.append(
+                    {
+                        "pid": 77,
+                        "start_time_ticks": 19,
+                        "name": "late-worker",
+                        "scope_complete": True,
+                        "references": [{"kind": "cwd", "path": str(src)}],
+                    }
+                )
+                # Keep census post-start relative to quarantine now_fn (now + 5s).
+                self.h.write_census(
+                    captured_at=iso(self.h.now + timedelta(seconds=6)),
+                )
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=inject_process_after_second):
+            result = self.h.quarantine(src, token, now_shift=5.0)
+        self.assertEqual(result["status"], "quarantined_source_preserved", result)
+        self.assertTrue(src.exists(), "source must be preserved when late protection appears")
+        self.assertEqual((src / "data.bin").read_bytes(), b"stable-late-prot")
+        self.assertTrue(Path(result["quarantine_path"]).is_dir())
+        self.assertTrue(Path(result["manifest_path"]).is_file())
+        self.assertIsNone(result["tombstone_path"])
+        self.assertEqual(result["recovery_authority"], result["quarantine_path"])
+        err = (result.get("error") or "").lower()
+        self.assertTrue(
+            "final protection" in err or "fingerprint mismatch" in err,
+            result,
+        )
+        self.assertIn("final_protection_mismatch", result.get("reasons") or [])
+        # Durable copy holds original bytes.
+        payload = Path(result["quarantine_path"]) / "payload" / "data.bin"
+        self.assertEqual(payload.read_bytes(), b"stable-late-prot")
+        self.assertGreaterEqual(calls["n"], 2)
+
     def test_replacement_inode_token_mismatch(self) -> None:
         src, probe = self.h.eligible("paseo-inode", body=b"same-bytes")
         token = probe["candidate_token"]
@@ -1928,6 +1979,92 @@ class FinalizeExistingTests(unittest.TestCase):
         self.assertTrue(src.exists())
         self.assertTrue(final.is_dir())
         partial.rmdir()
+
+    def test_protection_after_second_probe_refuses_finalize_rename(self) -> None:
+        """Process or lock protection after probe two must refuse finalize rename.
+
+        Source bytes stay stable; durable quarantine copy remains untouched.
+        """
+        # Process appears after the second accepted full probe.
+        src, final, man, token = self._eligible_planted(
+            "test-runner", historic=True, run_id=str(uuid.uuid4()), body=b"late-proc-fin"
+        )
+        payload_before = (final / "payload" / "data.bin").read_bytes()
+        man_before = (final / "manifest.json").read_text(encoding="utf-8")
+        real_classify = M.classify_source
+        calls = {"n": 0}
+
+        def inject_process_after_second(**kwargs: Any) -> dict[str, Any]:
+            calls["n"] += 1
+            out = real_classify(**kwargs)
+            if calls["n"] == 2 and out.get("classification") == "eligible":
+                self.h.processes.append(
+                    {
+                        "pid": 91,
+                        "start_time_ticks": 21,
+                        "name": "late-fin-worker",
+                        "scope_complete": True,
+                        "references": [{"kind": "cwd", "path": str(src)}],
+                    }
+                )
+                # Keep census post-start relative to finalize now_fn (now + 5s).
+                self.h.write_census(
+                    captured_at=iso(self.h.now + timedelta(seconds=6)),
+                )
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=inject_process_after_second):
+            with self.assertRaises(M.ToolError) as ctx:
+                self.h.finalize(src, token, run_id=final.name, now_shift=5.0)
+        self.assertIn("final protection", str(ctx.exception).lower())
+        self.assertTrue(src.exists())
+        self.assertEqual((src / "data.bin").read_bytes(), b"late-proc-fin")
+        self.assertTrue(final.is_dir())
+        self.assertEqual((final / "payload" / "data.bin").read_bytes(), payload_before)
+        self.assertEqual((final / "manifest.json").read_text(encoding="utf-8"), man_before)
+        self.assertEqual(payload_before, b"late-proc-fin")
+        self.assertEqual(calls["n"], 2)
+
+        # Lock appears after the second accepted full probe (source inventory stable).
+        self.h.processes = [
+            {
+                "pid": 1,
+                "start_time_ticks": 10,
+                "name": "init",
+                "scope_complete": True,
+                "references": [],
+            }
+        ]
+        src_l, final_l, _man_l, token_l = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"late-lock-fin"
+        )
+        lock = self.h.locks / "verify.lock"
+        calls_l = {"n": 0}
+
+        def inject_lock_after_second(**kwargs: Any) -> dict[str, Any]:
+            calls_l["n"] += 1
+            out = real_classify(**kwargs)
+            if calls_l["n"] == 2 and out.get("classification") == "eligible":
+                if not (lock.exists() or lock.is_symlink()):
+                    lock.mkdir()
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=inject_lock_after_second):
+            with self.assertRaises(M.ToolError) as ctx_l:
+                self.h.finalize(src_l, token_l, run_id=final_l.name, now_shift=5.0)
+        msg_l = str(ctx_l.exception).lower()
+        self.assertTrue(
+            "lock_present" in msg_l or "final protection" in msg_l,
+            ctx_l.exception,
+        )
+        self.assertTrue(src_l.exists())
+        self.assertEqual((src_l / "data.bin").read_bytes(), b"late-lock-fin")
+        self.assertTrue(final_l.is_dir())
+        self.assertTrue((final_l / "payload" / "data.bin").is_file())
+        self.assertEqual(calls_l["n"], 2)
+        if lock.exists():
+            lock.rmdir()
+        del man
 
 
 if __name__ == "__main__":

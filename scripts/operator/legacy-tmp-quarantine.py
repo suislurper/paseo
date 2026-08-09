@@ -242,6 +242,154 @@ def protection_fingerprint(evidence: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def observe_protection_only(
+    *,
+    source: str,
+    profile: str,
+    census_path: str,
+    proc_root: str,
+    runner: Callable[[list[str]], tuple[int, str, str]],
+    now_fn: Callable[[], datetime],
+    wait_s: float,
+    poll_s: float,
+    started_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Fresh process/Paseo/lock/owner protection observation only.
+
+    Does **not** walk candidate payload/source inventory trees. Used as the
+    final check after all slow inventories and immediately before source rename.
+    """
+    started = started_at or now_fn()
+    if profile not in KNOWN_PROFILES:
+        raise ToolError(f"unknown profile: {profile}")
+    basename = os.path.basename(norm(source))
+    try:
+        ensure_no_symlink_components(census_path, "census path")
+    except ToolError as exc:
+        raise ToolError(f"final protection observation failed: {exc}") from exc
+    if os.path.islink(census_path):
+        raise ToolError("final protection observation failed: snapshot_path_is_symlink")
+    if not os.path.lexists(source):
+        raise ToolError("final protection observation failed: source_missing")
+    if os.path.islink(source):
+        raise ToolError("final protection observation failed: root_is_symlink")
+    try:
+        ident = identity_from_lstat(source)
+    except OSError as exc:
+        raise ToolError(
+            f"final protection observation failed: source unreadable: {exc}"
+        ) from exc
+    if ident["type"] not in ("file", "dir"):
+        raise ToolError("final protection observation failed: special_file")
+    owner_evidence = {
+        "uid": ident["uid"],
+        "gid": ident["gid"],
+        "mode": ident["mode"],
+        "mtime_ns": ident["mtime_ns"],
+        "nlink": ident["nlink"],
+    }
+    process_ok, process_reasons, by_pid, snap = wait_for_process_proof(
+        census_path,
+        proc_root,
+        source,
+        started_at=started,
+        now_fn=now_fn,
+        wait_s=wait_s,
+        poll_s=poll_s,
+    )
+    boot_id = snap.get("boot_id") if isinstance(snap, dict) else None
+    if not isinstance(boot_id, str) or not boot_id:
+        boot_id = None
+    if not process_ok:
+        prot = build_protection_evidence(
+            owner_evidence=owner_evidence,
+            boot_id=boot_id,
+            process_status="blocked",
+            process_reasons=list(process_reasons) or ["process_census_blocked"],
+            process_reference_pids=[],
+            paseo_reasons=[],
+            lock=inspect_lock_evidence(profile, basename),
+        )
+        return {
+            "protection_evidence": prot,
+            "protection_fingerprint": protection_fingerprint(prot),
+            "lock": prot["lock"],
+            "process_ok": False,
+            "process_reasons": list(process_reasons) or ["process_census_blocked"],
+        }
+    try:
+        paseo_reasons = collect_paseo_protections(runner, source)
+    except ToolError as exc:
+        raise ToolError(f"final protection observation failed: paseo_census:{exc}") from exc
+    proc_hits = processes_touching(by_pid, source)
+    lock = inspect_lock_evidence(profile, basename)
+    prot = build_protection_evidence(
+        owner_evidence=owner_evidence,
+        boot_id=boot_id,
+        process_status="ok",
+        process_reasons=[],
+        process_reference_pids=proc_hits,
+        paseo_reasons=paseo_reasons,
+        lock=lock,
+    )
+    return {
+        "protection_evidence": prot,
+        "protection_fingerprint": protection_fingerprint(prot),
+        "lock": lock,
+        "process_ok": True,
+        "process_reasons": [],
+    }
+
+
+def require_final_protection_match(
+    *,
+    expected_fp: str,
+    source: str,
+    profile: str,
+    census_path: str,
+    proc_root: str,
+    runner: Callable[[list[str]], tuple[int, str, str]],
+    now_fn: Callable[[], datetime],
+    wait_s: float,
+    poll_s: float,
+    started_at: datetime | None = None,
+) -> dict[str, Any]:
+    """After slow inventories: require matching protection fingerprint, lock not present.
+
+    Raises ToolError on any new protection, fingerprint mismatch, or present lock.
+    Call immediately before source rename with no intervening slow inventory work.
+    """
+    if not isinstance(expected_fp, str) or not expected_fp:
+        raise ToolError("final protection: accepted protection_fingerprint empty or missing")
+    obs = observe_protection_only(
+        source=source,
+        profile=profile,
+        census_path=census_path,
+        proc_root=proc_root,
+        runner=runner,
+        now_fn=now_fn,
+        wait_s=wait_s,
+        poll_s=poll_s,
+        started_at=started_at,
+    )
+    lock = obs.get("lock") if isinstance(obs.get("lock"), dict) else {}
+    # Eligible accepted fingerprints always carry lock absent or not_applicable.
+    if lock.get("status") == "present":
+        raise ToolError("final protection refused: lock_present")
+    if lock.get("status") not in ("absent", "not_applicable"):
+        raise ToolError(
+            f"final protection refused: unexpected lock status {lock.get('status')!r}"
+        )
+    if obs.get("protection_fingerprint") != expected_fp:
+        raise ToolError(
+            "final protection fingerprint mismatch: "
+            "process/Paseo/lock/owner protection changed after accepted probes"
+        )
+    return obs
+
+
 def agent_cwd(info: dict[str, Any], label: str) -> str:
     cwd = info.get("Cwd") if isinstance(info.get("Cwd"), str) else info.get("cwd")
     if not isinstance(cwd, str) or not cwd.strip() or cwd == "-":
@@ -1199,6 +1347,40 @@ def run_quarantine(
             reasons=["tombstone_exists"],
         )
     ensure_no_symlink_components(tomb, "tombstone")
+    # After all slow payload/source inventories (copy verify + post dual inventory):
+    # final protection-only observation, then rename immediately.
+    accepted_prot_fp = post.get("protection_fingerprint")
+    try:
+        require_final_protection_match(
+            expected_fp=accepted_prot_fp if isinstance(accepted_prot_fp, str) else "",
+            source=source,
+            profile=profile,
+            census_path=census_path,
+            proc_root=proc_root,
+            runner=runner,
+            now_fn=now_fn,
+            wait_s=wait_s,
+            poll_s=poll_s,
+            started_at=now_fn(),
+        )
+    except ToolError as exc:
+        free_after = measure_free(data_root)
+        reasons = ["final_protection_mismatch"]
+        msg = str(exc)
+        if "lock_present" in msg:
+            reasons = ["lock_present", "final_protection_mismatch"]
+        return post_copy_status(
+            status="quarantined_source_preserved",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=None,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=msg,
+            reasons=reasons,
+        )
     try:
         os.rename(source, tomb)
     except OSError as exc:
@@ -1581,6 +1763,20 @@ def run_finalize_existing(
     except OSError as exc:
         raise ToolError(f"source unreadable before tombstone: {exc}") from exc
 
+    # After all slow payload/source inventories (including pre-rename reverify):
+    # final protection-only observation matching the two accepted probes, then rename.
+    require_final_protection_match(
+        expected_fp=prot1,
+        source=source,
+        profile=profile,
+        census_path=census_path,
+        proc_root=proc_root,
+        runner=runner,
+        now_fn=now_fn,
+        wait_s=wait_s,
+        poll_s=poll_s,
+        started_at=now_fn(),
+    )
     try:
         os.rename(source, tomb)
     except OSError as exc:

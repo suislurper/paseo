@@ -193,11 +193,11 @@ The service is a oneshot, so its systemd unit must keep
 `RuntimeDirectoryPreserve=yes`. Without that setting, systemd removes `/run/paseo`
 immediately after every successful capture and consumers never see the snapshot.
 
-Installer validation (when the operator runs the census reboot-trigger installer)
-requires **two** stable snapshot observations after a quiesced baseline: exact four
-roots, same boot, `complete=true`, empty `errors`, distinct file identity, and a
-strictly later second `captured_at`. This document does not claim deployment or live
-verification yet.
+Installer validation (when the operator runs the attended cleanup-system repair
+installer, which invokes the census reboot-trigger child once) requires **two**
+stable snapshot observations after a quiesced baseline: exact four roots, same boot,
+`complete=true`, empty `errors`, distinct file identity, and a strictly later second
+`captured_at`. This document does not claim deployment or live verification yet.
 
 The helper walks `/proc` **without changing processes**. The snapshot includes
 `schema_version`, `boot_id`, `captured_at`, `roots`, `complete`, `errors`, and one
@@ -242,9 +242,11 @@ class — no sensitive detail.
    not prevent full `/proc` reads or writing `/run/paseo` is allowed; do not enable
    `ProcSubset=pid`, `PrivateUsers=yes`, or other settings that hide foreign processes.
 
-Agents in this repo must not install, start, or restart these units, and must not
-mutate the live `/home/user/.paseo` probe state, unless the operator explicitly
-requests that packet.
+Root units and user-owned cleanup probes/policies are installed only via the
+attended self-verifying installer described under
+[Cleanup-system repair installer](#cleanup-system-repair-installer). Agents must not
+ad-hoc install, start, or restart these units, and must not free-hand mutate live
+`/home/user/.paseo` probe state outside that exact reviewed path.
 
 ### Consumer merge rule (closes the timer race)
 
@@ -469,15 +471,16 @@ Git, files, processes, services, schedules, agents, or Paseo state.
 - **Canonical source (this repo):** `scripts/operator/worktree-cleanup-probe.py`
 - **Tests:** `scripts/operator/test_worktree_cleanup_probe.py`
   (`npm run test:worktree-cleanup-probe`)
-- **Installed executable path (after exact-SHA review only):**
+- **Installed executable path (after exact reviewed installer only):**
   `/home/user/.paseo/bin/worktree_cleanup_probe.py`
 - Policy template: `scripts/operator/policy/WORKTREE_CLEANUP_POLICY.md`
   (live host, when installed: `/home/user/.paseo/WORKTREE_CLEANUP_POLICY.md`)
 - Managed root (production): `/home/user/.paseo/worktrees`
 
-Install is operator-owned: copy the reviewed repo file to the installed path only after
-an exact-SHA review lands. Agents must not install, overwrite, or restart live
-`~/.paseo` probe files, services, or schedules from this packet.
+Install of this probe (and sibling cleanup tools/policies) is only via the attended
+self-verifying installer under
+[Cleanup-system repair installer](#cleanup-system-repair-installer). Agents must not
+ad-hoc overwrite live `~/.paseo` probe files, services, or schedules.
 
 ### Local gates (unchanged, fail closed)
 
@@ -726,3 +729,53 @@ daemon/schedule/lock/policy engine. The SHAB controller's private checkout lifec
 is explicitly outside this custodian lane. Manual pins, release/grace gates,
 artifact/quarantine survival, and no-raw-delete rules are preserved in the templates.
 This document does not claim deployment or live verification of the wake yet.
+
+## Cleanup-system repair installer
+
+Attended, self-verifying repair for the complete cleanup system (root process-census
+timer path plus user-owned probes/policies/wake template). Ownership is exact
+reviewed bytes from a clean fork head — not ad-hoc agent copies.
+
+**Production command** (unprivileged after a one-time interactive `sudo -v`; the
+script itself must not run as root and never prompts):
+
+```bash
+sudo -v && /home/user/.paseo/worktrees/1n5bfhhm/fix-process-census-reboot-trigger/scripts/operator/install-cleanup-system-repair.sh
+```
+
+### What it does
+
+1. Fail-closed preflight before any backup/staging/target mutation: `EUID != 0`,
+   exact install user/home `user` / `/home/user`, real non-symlink target parents,
+   non-interactive `sudo -n`, clean checkout (tracked + untracked), valid worktree,
+   remote `fork` normalized to `https://github.com/suislurper/paseo`, and local
+   `HEAD` exactly equal to read-only `git ls-remote fork refs/heads/main` (no fetch,
+   no ref mutation). Every payload is hard-pinned by SHA-256.
+2. Invokes the existing child installer
+   `scripts/operator/install-process-census-reboot-trigger.sh` **exactly once**. That
+   child may use `sudo -n`, `daemon-reload`, and restart **only**
+   `paseo-process-census.timer`, and must keep its quiesced baseline, finite trigger,
+   and two stable exact-root snapshot proof.
+3. Only after the child prints `PASS`, creates one permanent backup directory under
+   `/mnt/data/paseo-runtime/artifacts/operator-install/backups/` (UTC timestamp +
+   exact `HEAD`; never deletes or overwrites a prior backup), then atomically installs
+   user-owned reviewed payloads:
+   - `worktree-cleanup-probe.py` → `/home/user/.paseo/bin/worktree_cleanup_probe.py` (`0755`)
+   - `agent-scratch-cleanup.py` → `/home/user/.paseo/bin/agent-scratch-cleanup.py` (`0755`)
+   - `legacy-tmp-quarantine.py` → `/home/user/.paseo/bin/legacy-tmp-quarantine.py` (`0755`)
+   - policy templates → `/home/user/.paseo/WORKTREE_CLEANUP_POLICY.md`,
+     `/home/user/.paseo/AGENT_SCRATCH_CLEANUP_POLICY.md`,
+     `/home/user/.paseo/worktree-cleanup-wake.txt` (`0644`)
+
+### What it does not do
+
+- Does **not** restart Paseo, SHAB services, or the census **service** unit.
+- Does **not** mutate Paseo AppImage, protocol, schedule state, databases, or
+  scratch/quarantine/artifact content.
+- Does **not** activate the recurring cleanup wake. Schedule prompt activation for
+  schedule ID **`aa27775d`** remains a **separate** exact reviewed user-state step
+  after installer verification.
+
+Source: `scripts/operator/install-cleanup-system-repair.sh`. Focused tests:
+`scripts/operator/test_install_cleanup_system_repair.py`. This document does not claim
+the repair has been deployed or live-verified yet.

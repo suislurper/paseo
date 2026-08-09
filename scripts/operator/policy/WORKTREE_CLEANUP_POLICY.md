@@ -107,8 +107,8 @@ but its absence does not block classification of unrelated exact paths.
      rejected or incomplete census blocks the wake; do not improvise a larger
      limit.
    - Parse the CLI census with the static, type-safe shape
-     `.[] | select((.cwd | type) == "string") | [.id, .status, (.cwd |
-sub("^~"; "/home/user"))] | @tsv`. Do not splice shell variables into
+     `.[] | select((.cwd | type) == "string") | [.id, .status, (.cwd | sub("^~"; "/home/user"))] | @tsv`.
+     Do not splice shell variables into
      this `jq` program. A non-string or missing `cwd` on an unarchived record
      requires exact `paseo inspect <agent-id>` resolution; never discard it.
    - Do not recursively enumerate dependency trees. Use ordinary

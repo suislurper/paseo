@@ -23,7 +23,7 @@ readonly EXPECTED_DOC_SHA=e88df8a832fd4d514b96885c8ee607744751aed9c9fb6bde5453d2
 readonly EXPECTED_WORKTREE_PROBE_SHA=d2173ef4183e62d906b42a06f9ea3cff02f0081bcbcf9255fba764c66f281aa7
 readonly EXPECTED_AGENT_SCRATCH_SHA=814facdbabce625f8c905fdb148cd2d29686f159037aad947806efa7ec22910d
 readonly EXPECTED_LEGACY_TMP_SHA=7dbb2efec2cb95675680591bf0d58a762ed350e6f0fd720db5e18d45215ebe45
-readonly EXPECTED_WORKTREE_POLICY_SHA=aa7a2891c0ff30401991ef6510b7fd754020c35e76afd14d27e54f4999cafe09
+readonly EXPECTED_WORKTREE_POLICY_SHA=be850445170660520aee687d7c1891196316d5f9e8da836631601ec2b9586e6c
 readonly EXPECTED_SCRATCH_POLICY_SHA=a5b16e918dbf33336b7139ad07b648a10d1f0f42d958cb8c4397156e93b1e51d
 readonly EXPECTED_WAKE_TXT_SHA=93580f3e80d671ce6f8eac974927eab1cccb5b50af198bdf141d88f0d259b48c
 
@@ -311,6 +311,9 @@ PY
 # Args: source_root
 # Uses ambient: id, HOME, sudo, git.
 # Prints: head=<sha> on success.
+# Requires exact linked dedicated branch fix-process-census-reboot-trigger:
+# resolved top-level == source_root, git-dir != common-dir and under
+# common-dir/worktrees/, symbolic branch exact, clean, fork URL, HEAD==fork/main.
 preflight_identity_and_git() {
   local source_root=$1
 
@@ -337,6 +340,42 @@ preflight_identity_and_git() {
   bare=$(git -C "$source_root" rev-parse --is-bare-repository 2>/dev/null || printf 'true')
   [[ "$bare" == "false" ]] || die "refusing bare repository: $source_root"
 
+  # Exact linked dedicated worktree identity (fail before child/backups/targets).
+  local top_level top_resolved source_resolved
+  top_level=$(git -C "$source_root" rev-parse --show-toplevel) ||
+    die "failed to resolve git top-level for $source_root"
+  top_resolved=$(cd -- "$top_level" && pwd -P)
+  source_resolved=$(cd -- "$source_root" && pwd -P)
+  [[ "$top_resolved" == "$source_resolved" ]] ||
+    die "git top-level ($top_resolved) does not equal source_root ($source_resolved)"
+
+  local git_dir common_dir
+  git_dir=$(git -C "$source_root" rev-parse --absolute-git-dir) ||
+    die "failed to resolve absolute git-dir for $source_root"
+  common_dir=$(git -C "$source_root" rev-parse --git-common-dir) ||
+    die "failed to resolve git-common-dir for $source_root"
+  git_dir=$(cd -- "$git_dir" && pwd -P)
+  if [[ "$common_dir" != /* ]]; then
+    common_dir=$(cd -- "$source_root/$common_dir" && pwd -P)
+  else
+    common_dir=$(cd -- "$common_dir" && pwd -P)
+  fi
+  [[ "$git_dir" != "$common_dir" ]] ||
+    die "refusing main/shared checkout (git-dir equals common-dir): $git_dir"
+  case "$git_dir" in
+    "$common_dir"/worktrees/*) ;;
+    *)
+      die "git-dir is not under common-dir/worktrees/ (not a linked worktree): $git_dir (common=$common_dir)"
+      ;;
+  esac
+
+  local branch
+  if ! branch=$(git -C "$source_root" symbolic-ref -q --short HEAD); then
+    die "HEAD is detached; require branch fix-process-census-reboot-trigger"
+  fi
+  [[ "$branch" == "fix-process-census-reboot-trigger" ]] ||
+    die "branch must be fix-process-census-reboot-trigger; got: $branch"
+
   local status_out
   status_out=$(git -C "$source_root" status --porcelain)
   [[ -z "$status_out" ]] || die "checkout is not clean (tracked+untracked must be empty)"
@@ -358,6 +397,68 @@ preflight_identity_and_git() {
     die "local HEAD ($head) != fork/main ($remote_head); install only exact reviewed clean fork head"
 
   printf 'head=%s\n' "$head"
+}
+
+# Validate the six user-owned destinations and backup parent before child installer.
+# Does not create destinations or backup parent; does not mutate sources/targets.
+# Args: backup_parent dest1 [dest2 ...]
+# For each dest: parent must be a real non-symlink directory (bin may be absent
+# only as already handled; existing parent chain must be real). Destination must
+# be absent or a non-symlink regular file owned exactly EXPECTED_USER:EXPECTED_USER.
+# Rejects directory, symlink, special file, unreadable stat, or unexpected owner.
+# Existing backup-parent path components must be non-symlink; if backup parent
+# exists it must be a real user-owned directory.
+preflight_destinations_and_backup_parents() {
+  local backup_parent=$1
+  shift
+  local -a dests=("$@")
+  local dest parent owner
+
+  ((${#dests[@]} > 0)) || die "preflight_destinations_and_backup_parents requires at least one dest"
+  [[ -n "$backup_parent" && "$backup_parent" == /* ]] ||
+    die "backup_parent must be absolute: ${backup_parent:-empty}"
+
+  for dest in "${dests[@]}"; do
+    [[ -n "$dest" && "$dest" == /* ]] || die "destination must be absolute: ${dest:-empty}"
+    parent=$(dirname -- "$dest")
+
+    if [[ -e "$parent" || -L "$parent" ]]; then
+      assert_real_dir "$parent"
+    else
+      # Parent absent only allowed for the bin dir (already handled in main).
+      [[ "$parent" == "$EXPECTED_BIN_DIR" ]] ||
+        die "destination parent missing (only bin may be absent): $parent"
+      path_has_no_symlink_components "$parent" ||
+        die "symlink in destination parent path components: $parent"
+      assert_real_dir "$(dirname -- "$parent")"
+    fi
+
+    if [[ -L "$dest" ]]; then
+      die "destination is a symlink (refusing): $dest"
+    fi
+    if [[ -e "$dest" ]]; then
+      # Regular file only — reject directory, special, or anything else.
+      [[ -f "$dest" ]] || die "destination must be a regular file or absent: $dest"
+      owner=$(stat -c '%U:%G' -- "$dest" 2>/dev/null) ||
+        die "unreadable stat for destination: $dest"
+      [[ "$owner" == "${EXPECTED_USER}:${EXPECTED_USER}" ]] ||
+        die "destination owner must be ${EXPECTED_USER}:${EXPECTED_USER}; got ${owner} for ${dest}"
+    fi
+  done
+
+  # Backup parent: never create during preflight.
+  path_has_no_symlink_components "$backup_parent" ||
+    die "symlink component in backup parent path: $backup_parent"
+  if [[ -L "$backup_parent" ]]; then
+    die "backup parent is a symlink (refusing): $backup_parent"
+  fi
+  if [[ -e "$backup_parent" ]]; then
+    assert_real_dir "$backup_parent"
+    owner=$(stat -c '%U:%G' -- "$backup_parent" 2>/dev/null) ||
+      die "unreadable stat for backup parent: $backup_parent"
+    [[ "$owner" == "${EXPECTED_USER}:${EXPECTED_USER}" ]] ||
+      die "backup parent owner must be ${EXPECTED_USER}:${EXPECTED_USER}; got ${owner}"
+  fi
 }
 
 # Verify all hard-pinned source payloads under source_root / script_dir.
@@ -452,6 +553,16 @@ cleanup_system_repair_main() {
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || die "preflight did not yield head: $head_line"
 
   preflight_payload_pins "$source_root" "$script_dir"
+
+  # Destination/backup parent gates after identity+payload pins, before child.
+  # No source/target/backup mutation; does not create backup parent or bin.
+  preflight_destinations_and_backup_parents "$BACKUP_PARENT" \
+    "$DEST_WORKTREE_PROBE" \
+    "$DEST_AGENT_SCRATCH" \
+    "$DEST_LEGACY_TMP" \
+    "$DEST_WORKTREE_POLICY" \
+    "$DEST_SCRATCH_POLICY" \
+    "$DEST_WAKE_TXT"
 
   # Child timer installer exactly once (root units + activation proof).
   local child_installer child_out child_rc

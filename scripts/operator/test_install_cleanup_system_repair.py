@@ -475,7 +475,8 @@ class SudoGateOrderTests(unittest.TestCase):
                   echo backup-called >>{marker.as_posix()!r}
                   die "backup should not run"
                 }}
-                # Capture die() which exits the subshell only.
+                # Outer harness may catch only while asserting exact rc=1 and no marker.
+                # Prove the actual preflight function returns nonzero (not just harness).
                 set +e
                 out=$(preflight_identity_and_git /tmp 2>&1)
                 rc=$?
@@ -488,8 +489,8 @@ class SudoGateOrderTests(unittest.TestCase):
                 else
                   printf 'marker=absent\\n'
                 fi
-                # Fail the harness if preflight did not fail closed on sudo.
-                [[ "$rc" -ne 0 ]]
+                # Exact nonzero from preflight_identity_and_git (die → exit 1).
+                [[ "$rc" -eq 1 ]] || {{ printf 'preflight-rc-not-1\\n'; exit 2; }}
                 printf 'harness-ok\\n'
                 """
             )
@@ -498,9 +499,11 @@ class SudoGateOrderTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, combined)
             self.assertIn("rc=1", proc.stdout)
             self.assertIn("harness-ok", proc.stdout)
+            self.assertNotIn("preflight-rc-not-1", combined)
             self.assertIn("sudo -n not available", combined)
             self.assertNotIn("backup-called", combined)
             self.assertNotIn("git-called", combined)
+            self.assertIn("marker=absent", proc.stdout)
             if marker.exists():
                 content = marker.read_text(encoding="utf-8")
                 self.assertNotIn("backup-called", content)
@@ -508,6 +511,8 @@ class SudoGateOrderTests(unittest.TestCase):
 
 
 class PreflightGitGateTests(unittest.TestCase):
+    REQUIRED_BRANCH = "fix-process-census-reboot-trigger"
+
     def _make_repo(self, root: Path, *, remote_url: str, head_msg: str = "init") -> str:
         subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
         subprocess.run(
@@ -538,19 +543,55 @@ class PreflightGitGateTests(unittest.TestCase):
         ).strip()
         return head
 
+    def _fake_sudo_bin(self, base: Path) -> Path:
+        fake_bin = base / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        sudo_path = fake_bin / "sudo"
+        sudo_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sudo_path.chmod(0o755)
+        return fake_bin
+
+    def _make_linked_worktree(
+        self,
+        base: Path,
+        *,
+        branch: str,
+        remote_url: str = "https://github.com/suislurper/paseo.git",
+        detach: bool = False,
+    ) -> Path:
+        """Create a main repo + linked worktree; return the worktree path."""
+        main = base / "main"
+        main.mkdir()
+        self._make_repo(main, remote_url=remote_url)
+        wt = base / "wt"
+        if detach:
+            subprocess.run(
+                ["git", "-C", str(main), "worktree", "add", "--detach", str(wt)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            # Create/checkout the named branch in the linked worktree.
+            subprocess.run(
+                ["git", "-C", str(main), "branch", "-M", "main-seed"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt)],
+                check=True,
+                capture_output=True,
+            )
+        return wt
+
     def test_dirty_checkout_fails_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            repo = base / "repo"
-            repo.mkdir()
-            self._make_repo(repo, remote_url="https://github.com/suislurper/paseo.git")
-            (repo / "dirt").write_text("untracked\n", encoding="utf-8")
+            # Dirty linked worktree on required branch still fails clean gate.
+            wt = self._make_linked_worktree(base, branch=self.REQUIRED_BRANCH)
+            (wt / "dirt").write_text("untracked\n", encoding="utf-8")
             marker = base / "marker"
-            fake_bin = base / "bin"
-            fake_bin.mkdir()
-            sudo_path = fake_bin / "sudo"
-            sudo_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            sudo_path.chmod(0o755)
+            fake_bin = self._fake_sudo_bin(base)
             script = _source_helpers_prefix() + textwrap.dedent(
                 f"""\
                 export PATH={fake_bin.as_posix()!r}:"$PATH"
@@ -558,7 +599,7 @@ class PreflightGitGateTests(unittest.TestCase):
                   echo backup >>{marker.as_posix()!r}
                   die unexpected
                 }}
-                preflight_identity_and_git {repo.as_posix()!r}
+                preflight_identity_and_git {wt.as_posix()!r}
                 """
             )
             proc = _bash(script)
@@ -569,15 +610,13 @@ class PreflightGitGateTests(unittest.TestCase):
     def test_wrong_remote_fails_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            repo = base / "repo"
-            repo.mkdir()
-            self._make_repo(repo, remote_url="https://github.com/getpaseo/paseo.git")
+            wt = self._make_linked_worktree(
+                base,
+                branch=self.REQUIRED_BRANCH,
+                remote_url="https://github.com/getpaseo/paseo.git",
+            )
             marker = base / "marker"
-            fake_bin = base / "bin"
-            fake_bin.mkdir()
-            sudo_path = fake_bin / "sudo"
-            sudo_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            sudo_path.chmod(0o755)
+            fake_bin = self._fake_sudo_bin(base)
             script = _source_helpers_prefix() + textwrap.dedent(
                 f"""\
                 export PATH={fake_bin.as_posix()!r}:"$PATH"
@@ -585,7 +624,7 @@ class PreflightGitGateTests(unittest.TestCase):
                   echo backup >>{marker.as_posix()!r}
                   die unexpected
                 }}
-                preflight_identity_and_git {repo.as_posix()!r}
+                preflight_identity_and_git {wt.as_posix()!r}
                 """
             )
             proc = _bash(script)
@@ -596,39 +635,13 @@ class PreflightGitGateTests(unittest.TestCase):
     def test_remote_head_mismatch_fails_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            repo = base / "repo"
-            repo.mkdir()
-            head = self._make_repo(
-                repo, remote_url="https://github.com/suislurper/paseo.git"
-            )
+            wt = self._make_linked_worktree(base, branch=self.REQUIRED_BRANCH)
+            head = subprocess.check_output(
+                ["git", "-C", str(wt), "rev-parse", "HEAD"], text=True
+            ).strip()
             other = "f" * 40
             self.assertNotEqual(head, other)
-            fake_bin = base / "bin"
-            fake_bin.mkdir()
-            sudo_path = fake_bin / "sudo"
-            sudo_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            sudo_path.chmod(0o755)
-            # Wrap git: pass through except ls-remote
-            real_git = shutil.which("git")
-            assert real_git is not None
-            git_path = fake_bin / "git"
-            git_path.write_text(
-                textwrap.dedent(
-                    f"""\
-                    #!/usr/bin/env bash
-                    if [[ "$1" == "-C" ]]; then
-                      shift 2
-                    fi
-                    if [[ "$1" == "ls-remote" ]]; then
-                      printf '%s\\trefs/heads/main\\n' {other!r}
-                      exit 0
-                    fi
-                    exec {real_git!r} -C {repo.as_posix()!r} "$@"
-                    """
-                ),
-                encoding="utf-8",
-            )
-            git_path.chmod(0o755)
+            fake_bin = self._fake_sudo_bin(base)
             marker = base / "marker"
             script = _source_helpers_prefix() + textwrap.dedent(
                 f"""\
@@ -637,11 +650,8 @@ class PreflightGitGateTests(unittest.TestCase):
                   echo backup >>{marker.as_posix()!r}
                   die unexpected
                 }}
-                # git -C is used; our wrapper ignores -C path for ls-remote
-                # but for other commands re-invokes with fixed repo.
-                # Override: provide a git that handles -C properly.
                 git() {{
-                  local root={repo.as_posix()!r}
+                  local root={wt.as_posix()!r}
                   if [[ "$1" == "-C" ]]; then
                     root=$2
                     shift 2
@@ -652,13 +662,154 @@ class PreflightGitGateTests(unittest.TestCase):
                   fi
                   command git -C "$root" "$@"
                 }}
-                preflight_identity_and_git {repo.as_posix()!r}
+                preflight_identity_and_git {wt.as_posix()!r}
                 """
             )
             proc = _bash(script)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("local HEAD", proc.stderr)
             self.assertIn("fork/main", proc.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_main_shared_checkout_fails(self) -> None:
+        """Main/shared checkout (git-dir == common-dir) fails closed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "repo"
+            repo.mkdir()
+            self._make_repo(repo, remote_url="https://github.com/suislurper/paseo.git")
+            # Rename to required branch so failure is specifically git-dir==common-dir.
+            subprocess.run(
+                ["git", "-C", str(repo), "branch", "-M", self.REQUIRED_BRANCH],
+                check=True,
+                capture_output=True,
+            )
+            fake_bin = self._fake_sudo_bin(base)
+            marker = base / "marker"
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                export PATH={fake_bin.as_posix()!r}:"$PATH"
+                create_user_payload_backup() {{
+                  echo backup >>{marker.as_posix()!r}
+                  die unexpected
+                }}
+                set +e
+                out=$(preflight_identity_and_git {repo.as_posix()!r} 2>&1)
+                rc=$?
+                set -e
+                printf 'rc=%s\\n' "$rc"
+                printf '%s\\n' "$out" >&2
+                """
+            )
+            proc = _bash(script)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("git-dir equals common-dir", combined)
+            self.assertFalse(marker.exists())
+
+    def test_detached_head_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            wt = self._make_linked_worktree(base, branch=self.REQUIRED_BRANCH, detach=True)
+            fake_bin = self._fake_sudo_bin(base)
+            marker = base / "marker"
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                export PATH={fake_bin.as_posix()!r}:"$PATH"
+                create_user_payload_backup() {{
+                  echo backup >>{marker.as_posix()!r}
+                  die unexpected
+                }}
+                set +e
+                out=$(preflight_identity_and_git {wt.as_posix()!r} 2>&1)
+                rc=$?
+                set -e
+                printf 'rc=%s\\n' "$rc"
+                printf '%s\\n' "$out" >&2
+                """
+            )
+            proc = _bash(script)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("detached", combined.lower())
+            self.assertFalse(marker.exists())
+
+    def test_wrong_branch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            wt = self._make_linked_worktree(base, branch="not-the-required-branch")
+            fake_bin = self._fake_sudo_bin(base)
+            marker = base / "marker"
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                export PATH={fake_bin.as_posix()!r}:"$PATH"
+                create_user_payload_backup() {{
+                  echo backup >>{marker.as_posix()!r}
+                  die unexpected
+                }}
+                set +e
+                out=$(preflight_identity_and_git {wt.as_posix()!r} 2>&1)
+                rc=$?
+                set -e
+                printf 'rc=%s\\n' "$rc"
+                printf '%s\\n' "$out" >&2
+                """
+            )
+            proc = _bash(script)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("branch must be fix-process-census-reboot-trigger", combined)
+            self.assertFalse(marker.exists())
+
+    def test_top_level_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            wt = self._make_linked_worktree(base, branch=self.REQUIRED_BRANCH)
+            other = base / "other-root"
+            other.mkdir()
+            fake_bin = self._fake_sudo_bin(base)
+            marker = base / "marker"
+            # Intercept only --show-toplevel so resolved top-level != source_root.
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                export PATH={fake_bin.as_posix()!r}:"$PATH"
+                create_user_payload_backup() {{
+                  echo backup >>{marker.as_posix()!r}
+                  die unexpected
+                }}
+                git() {{
+                  local root=""
+                  if [[ "$1" == "-C" ]]; then
+                    root=$2
+                    shift 2
+                  fi
+                  if [[ "$1" == "rev-parse" ]]; then
+                    local a
+                    for a in "$@"; do
+                      if [[ "$a" == "--show-toplevel" ]]; then
+                        printf '%s\\n' {other.as_posix()!r}
+                        return 0
+                      fi
+                    done
+                  fi
+                  if [[ -n "$root" ]]; then
+                    command git -C "$root" "$@"
+                  else
+                    command git "$@"
+                  fi
+                }}
+                set +e
+                out=$(preflight_identity_and_git {wt.as_posix()!r} 2>&1)
+                rc=$?
+                set -e
+                printf 'rc=%s\\n' "$rc"
+                printf '%s\\n' "$out" >&2
+                """
+            )
+            proc = _bash(script)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("does not equal source_root", combined)
             self.assertFalse(marker.exists())
 
     def test_payload_hash_mismatch_fails(self) -> None:
@@ -728,6 +879,201 @@ class DestinationAllowlistTests(unittest.TestCase):
         self.assertIn('install user must be ${EXPECTED_USER}', text)
         self.assertIn("HOME must be ${EXPECTED_HOME}", text)
         self.assertIn("must not run as root", text)
+
+    def test_dest_preflight_precedes_child_in_main(self) -> None:
+        """Surface/order: destination preflight textually precedes the child call."""
+        text = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("preflight_destinations_and_backup_parents", text)
+        # Function definition exists.
+        self.assertIn("preflight_destinations_and_backup_parents()", text)
+        # Main body order: payload pins → dest preflight → child invocation.
+        pin_idx = text.find("preflight_payload_pins \"$source_root\" \"$script_dir\"")
+        dest_idx = text.find("preflight_destinations_and_backup_parents \"$BACKUP_PARENT\"")
+        child_idx = text.find('child_out=$("$child_installer" 2>&1)')
+        self.assertGreater(pin_idx, 0)
+        self.assertGreater(dest_idx, pin_idx)
+        self.assertGreater(child_idx, dest_idx)
+        # Exactly one child invocation capture.
+        self.assertEqual(text.count('child_out=$("$child_installer" 2>&1)'), 1)
+
+
+class DestinationBackupPreflightTests(unittest.TestCase):
+    """Unit tests for preflight_destinations_and_backup_parents."""
+
+    def _run_preflight(self, backup_parent: Path, *dests: Path) -> subprocess.CompletedProcess[str]:
+        dest_args = " ".join(f"{d.as_posix()!r}" for d in dests)
+        script = _source_helpers_prefix() + textwrap.dedent(
+            f"""\
+            set +e
+            out=$(preflight_destinations_and_backup_parents \\
+              {backup_parent.as_posix()!r} {dest_args} 2>&1)
+            rc=$?
+            set -e
+            printf 'rc=%s\\n' "$rc"
+            printf '%s\\n' "$out"
+            """
+        )
+        return _bash(script)
+
+    def test_absent_dest_with_real_parent_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            backup = base / "backups"  # absent is fine
+            proc = self._run_preflight(backup, dest)
+            self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_user_owned_regular_dest_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            dest.write_text("existing\n", encoding="utf-8")
+            backup = base / "backups"
+            backup.mkdir()
+            # Owner is current user; EXPECTED_USER is user — require match.
+            user = os.environ.get("USER") or "user"
+            if user != "user":
+                self.skipTest("EXPECTED_USER is hard-coded to user")
+            proc = self._run_preflight(backup, dest)
+            self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_directory_dest_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            dest.mkdir()  # directory, not regular file
+            backup = base / "backups"
+            proc = self._run_preflight(backup, dest)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("regular file", combined)
+
+    def test_symlink_dest_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            real = parent / "real.py"
+            real.write_text("x\n", encoding="utf-8")
+            dest = parent / "probe.py"
+            dest.symlink_to(real)
+            backup = base / "backups"
+            proc = self._run_preflight(backup, dest)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("symlink", combined.lower())
+
+    def test_special_file_dest_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            os.mkfifo(dest)
+            backup = base / "backups"
+            proc = self._run_preflight(backup, dest)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("regular file", combined)
+
+    def test_wrong_owner_dest_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            dest.write_text("x\n", encoding="utf-8")
+            backup = base / "backups"
+            # Mock stat so owner appears as root:root for the dest path.
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                stat() {{
+                  if [[ "$*" == *'%U:%G'* && "$*" == *{dest.as_posix()!r}* ]]; then
+                    printf 'root:root\\n'
+                    return 0
+                  fi
+                  command stat "$@"
+                }}
+                set +e
+                out=$(preflight_destinations_and_backup_parents \\
+                  {backup.as_posix()!r} {dest.as_posix()!r} 2>&1)
+                rc=$?
+                set -e
+                printf 'rc=%s\\n' "$rc"
+                printf '%s\\n' "$out"
+                """
+            )
+            proc = _bash(script)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("owner must be", combined)
+
+    def test_symlink_parent_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            real = base / "real"
+            real.mkdir()
+            link = base / "link"
+            link.symlink_to(real)
+            dest = link / "probe.py"
+            backup = base / "backups"
+            proc = self._run_preflight(backup, dest)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertTrue(
+                "symlink" in combined.lower() or "not a directory" in combined,
+                msg=combined,
+            )
+
+    def test_backup_parent_symlink_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            real_bp = base / "real-backups"
+            real_bp.mkdir()
+            backup = base / "backups"
+            backup.symlink_to(real_bp)
+            proc = self._run_preflight(backup, dest)
+            combined = proc.stderr + proc.stdout
+            self.assertIn("rc=1", proc.stdout)
+            self.assertIn("symlink", combined.lower())
+
+    def test_backup_parent_existing_user_dir_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            backup = base / "backups"
+            backup.mkdir()
+            user = os.environ.get("USER") or "user"
+            if user != "user":
+                self.skipTest("EXPECTED_USER is hard-coded to user")
+            proc = self._run_preflight(backup, dest)
+            self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_no_mutation_on_preflight(self) -> None:
+        """Preflight must not create backup parent or destination."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            parent = base / "dests"
+            parent.mkdir()
+            dest = parent / "probe.py"
+            backup = base / "backups"
+            self.assertFalse(dest.exists())
+            self.assertFalse(backup.exists())
+            proc = self._run_preflight(backup, dest)
+            self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+            self.assertFalse(dest.exists())
+            self.assertFalse(backup.exists())
 
 
 class EndToEndFakeRootTests(unittest.TestCase):

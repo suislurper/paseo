@@ -1,0 +1,51 @@
+Paseo worktree and managed-agent-scratch cleanup wake. Read
+`/home/user/.paseo/WORKTREE_CLEANUP_POLICY.md` and
+`/home/user/.paseo/AGENT_SCRATCH_CLEANUP_POLICY.md` completely and follow them
+exactly (repo templates: `scripts/operator/policy/`). This is fail-closed
+maintenance.
+
+Recurring schedule ID remains exactly `aa27775d`. At most eight exact cleanup
+actions per wake across both lanes. No generic `/tmp` cleanup, no new
+daemon/schedule/lock/policy engine. The SHAB controller's private checkout
+lifecycle is outside this custodian lane.
+
+Run two independent canonical lanes. First list Paseo-managed SHAB worktrees,
+then run `/home/user/.paseo/bin/worktree_cleanup_probe.py`; do not rebuild its
+inventory or parser inline. Separately run
+`/home/user/.paseo/bin/agent-scratch-cleanup.py --config
+/home/user/.paseo/config.json probe`. A blocker makes that candidate ineligible;
+an incomplete global census or unexpected error blocks action and stops the
+wake. The root process snapshot must be complete, same-boot, post-start, fresh,
+and cover every required root. Never prompt for or add elevation during a wake.
+
+Protect every manual pin, Release Captain/main checkout, unarchived agent or
+descendant, active schedule, terminal, permission, process, detached owner,
+lock, dirty/untracked checkout, unique commit, non-rebuildable ignored file,
+artifact, quarantine entry, and corrective commit
+`298a58ec2a5e6da94802eb7aadda889f5fe84f71`.
+
+Use each probe's top-level `size_summary` as the only managed-candidate size
+aggregate (sums already-measured 60s per-candidate sizes; never a second
+whole-root `du`). Unknown size is unknown/null, never zero. For scratch, report
+each UUID row with agent_id, generation, manifest_lifecycle, owner_state,
+size_bytes, and reasons even under global blocks. Missing manifest and
+ambiguous owner remain protected.
+
+For a worktree that passes every gate twice, use only Paseo's exact-path
+`archive_worktree`. For managed scratch that passes every gate twice, use only
+the probe-returned exact agent ID, generation, and candidate token with the
+canonical scratch `archive` command. Work sequentially and perform at most
+eight cleanup actions total per wake. Stop on any state change, error, or once
+root free space reaches 128 GiB.
+
+Never use raw filesystem deletion, raw Git worktree removal, branch/ref
+mutation, lock breaking, process termination, service/database/data changes,
+or cleanup of unmanaged paths. Never automatically clean generic `/tmp`,
+artifacts, or quarantine. Do not recursively enumerate ignored dependency
+trees. Every `du` or deterministic tree walk is bounded to 60 seconds; timeout
+means unknown and blocks the candidate.
+
+Report exact owners, paths, generations, evidence, root and `/mnt/data` free
+bytes before/after, worktree/scratch/artifact/quarantine sizes, probe
+size_summary counts, released versus blocked scratch, preserved artifacts,
+bytes recovered by this wake, blockers, and the next automatic action.

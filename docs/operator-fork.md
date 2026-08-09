@@ -170,14 +170,17 @@ paths themselves.
 
 - Source: `scripts/operator/process-census.py`
 - Unit templates: `scripts/operator/systemd/paseo-process-census.service` and
-  `paseo-process-census.timer`. The timer uses `OnActiveSec=10s` (first fire
-  **10s after the timer unit becomes active** — reboot-safe, not boot-offset
-  `OnBootSec`) and `OnUnitActiveSec=10s` (recurring every **10s** after each
-  successful service run), with `AccuracySec=1s` and `Persistent=true`. That
-  cadence gives the bounded proof retry several chances on process-heavy
-  developer machines.
+  `paseo-process-census.timer`. **One service + one timer only.** Timer contract:
+  - `OnActiveSec=10s` — first fire **10s after the timer unit becomes active**
+    (reboot-safe activation-relative start; **not** boot-offset `OnBootSec`)
+  - `OnUnitActiveSec=10s` — recurring every **10s** after each successful service run
+  - `Persistent=true`, `AccuracySec=1s`
+  - **No `OnBootSec`**
+    That cadence gives the bounded proof retry several chances on process-heavy
+    developer machines. **Late activation is the attended proof** for this rollout;
+    a live reboot is not required to validate the timer.
 - Installed executable path: `/usr/local/libexec/paseo-process-census`
-- Fixed roots (production unit): `/home/user/.paseo/worktrees`,
+- Fixed roots (production unit — exact four): `/home/user/.paseo/worktrees`,
   `/mnt/data/paseo-runtime`, `/mnt/data/shab/.git`, and `/tmp`
   (`/mnt/data/shab/.git` covers administrative Git paths for linked worktrees;
   the `/tmp` root exists so the legacy `/tmp` recovery lane can require a covering
@@ -189,6 +192,12 @@ paths themselves.
 The service is a oneshot, so its systemd unit must keep
 `RuntimeDirectoryPreserve=yes`. Without that setting, systemd removes `/run/paseo`
 immediately after every successful capture and consumers never see the snapshot.
+
+Installer validation (when the operator runs the census reboot-trigger installer)
+requires **two** stable snapshot observations after a quiesced baseline: exact four
+roots, same boot, `complete=true`, empty `errors`, distinct file identity, and a
+strictly later second `captured_at`. This document does not claim deployment or live
+verification yet.
 
 The helper walks `/proc` **without changing processes**. The snapshot includes
 `schema_version`, `boot_id`, `captured_at`, `roots`, `complete`, `errors`, and one
@@ -313,6 +322,8 @@ Fail-closed operator tool for durable per-agent runtime storage when
 - Tests: `scripts/operator/test_agent_scratch_cleanup.py` (`npm run test:agent-scratch-cleanup`)
 - Config: reads `agents.runtimeRoot` from a supplied config path (production:
   `/home/user/.paseo/config.json`)
+- Policy template: `scripts/operator/policy/AGENT_SCRATCH_CLEANUP_POLICY.md`
+  (live host, when installed: `/home/user/.paseo/AGENT_SCRATCH_CLEANUP_POLICY.md`)
 
 ### Scope
 
@@ -320,7 +331,25 @@ Manages **only** `{runtimeRoot}/scratch/<validated UUID>`. Never artifacts,
 quarantine, generic `/tmp`, worktrees, or arbitrary raw paths. Artifact and
 quarantine aggregate sizes are reported for observability; a timeout or unreadable
 aggregate walk still **blocks every scratch candidate** for that wake while reporting
-`bytes=null` and the exact error (never a silent `0`).
+`bytes=null` and the exact error (never a silent `0`). Artifacts and quarantine are
+permanent / report-only in this lane and **survive** scratch cleanup.
+
+### Explicit release (receipt only)
+
+Archive, close, tab close, age, and operator inference are **never** release.
+Release remains the existing `release_agent_scratch` receipt only (exact `agentId` +
+`generation`); this lane adds no CLI/RPC/daemon/auto-release path.
+
+- **Owner self-release:** after confirming the exact generation is rebuildable and
+  no longer needed, call `release_agent_scratch` for that pair, preferably before
+  close/archive. Hand the receipt/generation into finish notes.
+- **Foreign release:** an operator may release a foreign archived/closed owner only
+  with explicit authority, after exact directory/generation review and the same
+  rebuildability / no-longer-needed confirmation.
+- Generation mismatch fails closed. Never blanket-release old agents.
+- Release is receipt-only: it begins the existing **24-hour grace**. After grace,
+  all descendants/schedules/terminals/permissions/processes/detached owners/locks/
+  inventory gates still apply. Release never deletes files or archives the agent.
 
 ### Probe
 
@@ -333,7 +362,20 @@ aggregate walk still **blocks every scratch candidate** for that wake while repo
 - scratch inventory completeness (non-UUID entries under `scratch/` are reported and
   make the inventory incomplete, blocking all candidates);
 - every scratch UUID candidate classified `protected` / `blocked` / `eligible` with
-  exact reasons, a size walk capped at **60s**, and a candidate token when eligible.
+  exact reasons, a **per-candidate** size walk capped at **60s** (independent budget
+  so a slow peer cannot starve another), and a candidate token when eligible;
+- review metadata on **every** UUID candidate even under global blocks:
+  `agent_id`, `generation`, `manifest_lifecycle`, normalized `owner_state`,
+  `size_bytes`, and `reasons` (unknown size is `null`, never zero);
+- top-level `size_summary`: the only managed-scratch size aggregate. It
+  deterministically sums already-measured per-candidate `size_bytes`
+  (`candidate_count`, `known_count`, `unknown_count`, `bytes`). Never run a second
+  whole-root `du` or extra size walk. If any candidate size is unknown, aggregate
+  `bytes` is `null` / unknown; report exact counts and blockers.
+
+**Operator review list:** use probe output to produce exact rows with agent ID,
+generation, lifecycle, owner state, size, and blockers. Missing manifest and
+ambiguous owner remain protected / blocked as reported.
 
 Strict manifest requirements for eligibility: exact UUID directory/`agentId`, schema
 version `1`, generation UUID, lifecycle `released`, and `releasedAt` valid and at
@@ -429,7 +471,8 @@ Git, files, processes, services, schedules, agents, or Paseo state.
   (`npm run test:worktree-cleanup-probe`)
 - **Installed executable path (after exact-SHA review only):**
   `/home/user/.paseo/bin/worktree_cleanup_probe.py`
-- Policy (live host): `/home/user/.paseo/WORKTREE_CLEANUP_POLICY.md`
+- Policy template: `scripts/operator/policy/WORKTREE_CLEANUP_POLICY.md`
+  (live host, when installed: `/home/user/.paseo/WORKTREE_CLEANUP_POLICY.md`)
 - Managed root (production): `/home/user/.paseo/worktrees`
 
 Install is operator-owned: copy the reviewed repo file to the installed path only after
@@ -449,7 +492,8 @@ an exact-SHA review lands. Agents must not install, overwrite, or restart live
   ignored roots via exactly
   `git status --porcelain=v1 -z --ignored=matching -unormal`;
   unique commits / remote-default reachability and branch/default/base identity;
-  bounded **60s** `du` size walk.
+  bounded **60s** per-candidate `du` size walk (manual pins and all existing
+  gates unchanged).
 - Any process-census incompleteness **blocks every candidate** for that wake.
 
 ### Process proof (root snapshot consumer)
@@ -487,30 +531,51 @@ Main emits **one** well-formed JSON report (compatible keys retained where pract
 `schema_version`, `complete`, `fatal_errors`, `repo`, `managed_root`, `disks`,
 `remote_default`, `paseo`, `worktrees[]`, …) plus process snapshot fields
 `started_at`, `process_census.captured_at`, `process_census.boot_id`,
-`process_census.reasons`, and `process_census.status`. Unexpected failures exit
+`process_census.reasons`, and `process_census.status`. Top-level `size_summary` is
+the **only** aggregate for managed worktrees: it sums already-measured 60-second
+per-candidate `size_bytes` (`candidate_count`, `known_count`, `unknown_count`,
+`bytes`). Never run a second whole-root `du` or extra size walk; if any candidate
+size is unknown, aggregate `bytes` is `null` / unknown. Unexpected failures exit
 nonzero with a concise stderr line — do not rebuild porcelain/process/size inventory
 inline in schedule instructions; call this probe once per wake.
 
 ## Legacy /tmp recovery lane
 
-Explicit operator tool for **one** absolute direct child of `/tmp` at a time. It is
-not a daemon, DB, queue, automatic generic `/tmp` cleaner, or broad recursive target
-walker. No glob expansion inside the tool.
+Explicit operator tool for **one** absolute direct child of a configured source root
+at a time. It is not a daemon, DB, queue, automatic generic `/tmp` cleaner, or broad
+recursive target walker. No glob expansion inside the tool. **Default legacy `/tmp`
+behavior remains unchanged and is never automatic** — the recurring cleanup wake
+never deletes or quarantines generic `/tmp`.
 
 - Source: `scripts/operator/legacy-tmp-quarantine.py`
 - Tests: `scripts/operator/test_legacy_tmp_quarantine.py`
   (`npm run test:legacy-tmp-quarantine`)
-- Durable quarantine root (production):
+- Durable quarantine root (default profile, production):
   `/mnt/data/paseo-runtime/quarantine/legacy-tmp/<run-id>/` (mode `0700`; never
   auto-deleted)
 - Process census must include a `roots` entry covering the candidate (production unit
   adds `--root /tmp` for redacted path references only — no argv/env). Do **not** add a
   second timer.
 
-### Recognized producer prefixes (basename allowlist)
+### Profiles
 
-Only these basename prefixes are ever eligible (unknown roots are **reported**, never
-deleted):
+- **`legacy-tmp` (default):** exact absolute direct child of `/tmp` (test-injectable
+  root). Recognized basename prefixes only (below). Unchanged default path.
+- **`pre-runtime-scratch-layout` (closed):** accepts only exact basenames
+  `test-runner` and `verify` under fixed source root
+  `/mnt/data/paseo-runtime/scratch` and fixed quarantine root
+  `/mnt/data/paseo-runtime/quarantine/pre-runtime-scratch-layout`. Root overrides that
+  do not match those exact paths fail closed. Exact **absent** lock evidence is
+  required for eligibility (`/mnt/data/paseo-runtime/locks/<basename>.lock` must not
+  be present). Candidate token binds the protection fingerprint (owner/process/Paseo/
+  lock evidence). Each inventory walk is independently capped at **60s**. Quarantine
+  and finalize require **two** fresh complete matching owner/process/Paseo/lock
+  protection probes (matching candidate token and protection fingerprint).
+
+### Recognized producer prefixes (legacy-tmp basename allowlist)
+
+Only these basename prefixes are ever eligible under the default profile (unknown
+roots are **reported**, never deleted):
 
 - `shab-stage-runner-`
 - `warm-live-api-`
@@ -522,8 +587,8 @@ deleted):
 
 ### Candidate rules
 
-- Exact absolute path that is a **direct child** of the tmp root (default `/tmp`;
-  test-injectable).
+- Exact absolute path that is a **direct child** of the profile source root (default
+  `/tmp`; pre-runtime uses the fixed scratch root above).
 - Top-level symlink blocks. Support regular top-level files and directories.
 - Reject special files, mount crossings, hard-linked regular files, unreadable
   content, sockets/devices/FIFOs, escaping symlinks, and change races.
@@ -570,7 +635,8 @@ identity fields (including `st_dev`/`st_ino`), and inventory fingerprint.
 
 **`probe --source <abs-path>`** (never mutates): reports exact source path, recognized
 producer (or unknown), owner evidence, size, classification/reasons, candidate token
-when eligible, and free bytes for `/` and `/mnt/data`.
+when eligible, and free bytes for `/` and `/mnt/data`. Pre-runtime adds lock evidence
+and protection fingerprint binding.
 
 **`quarantine --source <abs-path> --candidate-token <token> --run-id <uuid>`**:
 
@@ -591,17 +657,43 @@ when eligible, and free bytes for `/` and `/mnt/data`.
    original source and the durable quarantine copy; return
    `status=quarantined_source_preserved` with exact paths/reasons; **never delete**.
 7. Only after post-publish revalidation: atomically rename the exact source to a
-   hidden tombstone direct child of the same tmp root. Inventory that tombstone and
+   hidden tombstone direct child of the same source root. Inventory that tombstone and
    require the same final inventory fingerprint plus root `st_dev`/`st_ino`, then
    delete **only** that tombstone without following symlinks.
 8. If tombstone inventory/identity/delete fails, the durable quarantine copy remains
    recovery authority and the response reports `status=quarantined_pending_removal`
-   with the exact `tombstone_path`. Never pretend success. Never touch another `/tmp`
-   entry.
+   with the exact `tombstone_path`. Never pretend success. Never touch another
+   sibling entry under the source root.
 9. `free_bytes_after` is measured only after the actual source outcome (removed,
    preserved, or tombstoned). Every structured post-copy status includes
    `manifest_path`, `size_bytes`, source/quarantine/tombstone paths, free before/after,
    and `recovery_authority` (durable quarantine path).
+
+**`finalize-existing`** (pre-runtime profile only) — attended finalize of a previously
+published quarantine copy. Does **not** create or delete quarantine content; reuses a
+verified published copy; supports only explicit historic pre-runtime evidence; tombstones
+and removes the source only after payload/source/manifest/token/fingerprint
+revalidation:
+
+```bash
+python3 /home/user/.paseo/bin/legacy-tmp-quarantine.py \
+  --profile pre-runtime-scratch-layout \
+  finalize-existing \
+  --source /mnt/data/paseo-runtime/scratch/<test-runner|verify> \
+  --candidate-token <exact-token> \
+  --run-id <existing-run-uuid>
+```
+
+Exact args: `--profile pre-runtime-scratch-layout` (required; other profiles refuse),
+`--source`, `--candidate-token`, `--run-id`. Flow: load and validate the existing
+manifest under the fixed pre-runtime quarantine root; verify payload against the
+manifest under a fresh 60s inventory bound; verify current source still matches
+manifest identity/inventory/size; run **two** fresh complete matching protection
+probes (token + protection fingerprint + inventory/identity); re-verify payload and
+source immediately before rename; tombstone then remove only that exact source after
+the same identity/fingerprint checks. Never creates a new quarantine copy, never
+mutates the durable quarantine tree, and never pretends success when tombstone
+removal fails (`quarantined_pending_removal` / `quarantined_source_preserved`).
 
 Quarantine root parents are created component-by-component as real directories only
 (no broad `os.makedirs`); symlink races and parent fsync/chmod failures fail closed.
@@ -616,3 +708,21 @@ This tool does **not** run a batch. The operator/custodian should:
 - re-census / re-evaluate free space between batches;
 - **stop** on any error or observed state change, or when root free space is
   **≥ 30 GiB**.
+
+## Cleanup custodian wake and policy templates
+
+Repo templates (checked into the fork; not a claim of live host install):
+
+| Template        | Path                                                      |
+| --------------- | --------------------------------------------------------- |
+| Worktree policy | `scripts/operator/policy/WORKTREE_CLEANUP_POLICY.md`      |
+| Scratch policy  | `scripts/operator/policy/AGENT_SCRATCH_CLEANUP_POLICY.md` |
+| Wake prompt     | `scripts/operator/policy/worktree-cleanup-wake.txt`       |
+
+Live host copies (when installed) remain under `/home/user/.paseo/`. The recurring
+wake stays one schedule ID **`aa27775d`**, at most **eight** exact cleanup actions
+per wake across worktree + managed-scratch lanes, no generic `/tmp`, and no new
+daemon/schedule/lock/policy engine. The SHAB controller's private checkout lifecycle
+is explicitly outside this custodian lane. Manual pins, release/grace gates,
+artifact/quarantine survival, and no-raw-delete rules are preserved in the templates.
+This document does not claim deployment or live verification of the wake yet.

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -24,6 +25,13 @@ STAGED_NAMES = (
     "paseo-process-census.service",
     "paseo-process-census",
     "operator-fork.md",
+)
+# Exact production unit roots (paseo-process-census.service --root flags).
+DEFAULT_CENSUS_ROOTS = (
+    "/home/user/.paseo/worktrees",
+    "/mnt/data/paseo-runtime",
+    "/mnt/data/shab/.git",
+    "/tmp",
 )
 
 
@@ -92,6 +100,7 @@ def write_census(
     complete: bool = True,
     errors: list | None = None,
     processes: list | None = None,
+    roots: list | None = None,
     extra: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +110,7 @@ def write_census(
         "complete": complete,
         "errors": [] if errors is None else errors,
         "processes": [] if processes is None else processes,
+        "roots": list(DEFAULT_CENSUS_ROOTS) if roots is None else list(roots),
     }
     if extra:
         payload.update(extra)
@@ -527,6 +537,268 @@ class CaptureIdentityTests(unittest.TestCase):
             errors=[],
         )
         self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+    def test_valid_identity_requires_exact_four_roots(self) -> None:
+        """Exact set of service roots accepted; missing/subset/duplicate/extra rejected."""
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:00Z",
+            boot_id=self.boot,
+            roots=list(DEFAULT_CENSUS_ROOTS),
+        )
+        self.assertTrue(self._valid_identity(self.census, self.boot))
+
+        # Order-independent: permutation of the same four still accepted.
+        perm = [
+            DEFAULT_CENSUS_ROOTS[2],
+            DEFAULT_CENSUS_ROOTS[0],
+            DEFAULT_CENSUS_ROOTS[3],
+            DEFAULT_CENSUS_ROOTS[1],
+        ]
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:01Z",
+            boot_id=self.boot,
+            roots=perm,
+        )
+        self.assertTrue(self._valid_identity(self.census, self.boot))
+
+        # Missing / subset.
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:02Z",
+            boot_id=self.boot,
+            roots=list(DEFAULT_CENSUS_ROOTS[:3]),
+        )
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+        # Duplicate (length 4 but not unique; not the exact set).
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:03Z",
+            boot_id=self.boot,
+            roots=[
+                DEFAULT_CENSUS_ROOTS[0],
+                DEFAULT_CENSUS_ROOTS[1],
+                DEFAULT_CENSUS_ROOTS[2],
+                DEFAULT_CENSUS_ROOTS[0],
+            ],
+        )
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+        # Extra root.
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:04Z",
+            boot_id=self.boot,
+            roots=[*DEFAULT_CENSUS_ROOTS, "/var/extra"],
+        )
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+        # Wrong set (same length, different member).
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:05Z",
+            boot_id=self.boot,
+            roots=[
+                DEFAULT_CENSUS_ROOTS[0],
+                DEFAULT_CENSUS_ROOTS[1],
+                DEFAULT_CENSUS_ROOTS[2],
+                "/var/wrong",
+            ],
+        )
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+        # Missing roots key entirely.
+        payload = {
+            "captured_at": "2026-08-01T00:00:06Z",
+            "boot_id": self.boot,
+            "complete": True,
+            "errors": [],
+            "processes": [],
+        }
+        self.census.write_text(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+    def test_valid_identity_rejects_malformed_unreadable(self) -> None:
+        self.census.parent.mkdir(parents=True, exist_ok=True)
+        self.census.write_text("{not-json\n", encoding="utf-8")
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+        self.census.write_text("", encoding="utf-8")
+        self.assertEqual(self._valid_identity(self.census, self.boot), "")
+
+        # Unreadable: mode 000 (owner also blocked for open in this process).
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:00Z",
+            boot_id=self.boot,
+        )
+        self.census.chmod(0o000)
+        try:
+            self.assertEqual(self._valid_identity(self.census, self.boot), "")
+        finally:
+            self.census.chmod(0o644)
+
+    def test_atomic_path_replacement_does_not_mix_generations(self) -> None:
+        """Observation is open-once: path swap after open cannot mix validate/identity gens.
+
+        Former bug: jq-validate path (gen A) then re-open path for identity (gen B).
+        Fixed path holds one fd, copies bytes, validates+hashes the private copy only.
+        """
+        gen_a = self.root / "gen-a.json"
+        gen_b = self.root / "gen-b.json"
+        path = self.root / "live.json"
+        write_census(
+            gen_a,
+            captured_at="2026-08-01T00:00:10Z",
+            boot_id=self.boot,
+            complete=True,
+            errors=[],
+            processes=[{"pid": 1, "comm": "gen-a"}],
+        )
+        # Gen B is incomplete / errors — must never be accepted as a validated identity.
+        write_census(
+            gen_b,
+            captured_at="2026-08-01T00:00:99Z",
+            boot_id=self.boot,
+            complete=False,
+            errors=[{"class": "permission"}],
+            processes=[{"pid": 2, "comm": "gen-b"}],
+        )
+        # Also a complete-looking B with wrong roots for a second swap case.
+        gen_b_bad_roots = self.root / "gen-b-bad-roots.json"
+        write_census(
+            gen_b_bad_roots,
+            captured_at="2026-08-01T00:00:99Z",
+            boot_id=self.boot,
+            complete=True,
+            errors=[],
+            roots=["/tmp"],
+            processes=[{"pid": 3, "comm": "gen-b-roots"}],
+        )
+
+        # 1) After open+copy of A, swap path to incomplete B; private copy stays A.
+        script = _source_helpers_prefix() + textwrap.dedent(
+            f"""\
+            set -euo pipefail
+            path={path.as_posix()!r}
+            gen_a={gen_a.as_posix()!r}
+            gen_b={gen_b.as_posix()!r}
+            boot={self.boot!r}
+            cp -f -- "$gen_a" "$path"
+            obs=$(census_open_snapshot_copy "$path")
+            [[ -n "$obs" ]] || {{ printf 'open-failed\\n' >&2; exit 2; }}
+            st=${{obs%%$'\\t'*}}
+            tmp=${{obs#*$'\\t'}}
+            # Atomic-ish path replacement while private copy is held.
+            cp -f -- "$gen_b" "$path"
+            # Re-reading the path must see incomplete B (would be wrongly "valid" under TOCTOU).
+            if jq -e --arg boot "$boot" '
+                .complete == true and
+                (.errors | type == "array") and
+                (.errors | length) == 0 and
+                .boot_id == $boot
+              ' "$path" >/dev/null 2>&1; then
+              printf 'path-still-valid\\n' >&2
+              rm -f -- "$tmp"
+              exit 3
+            fi
+            # Private copy must still be complete gen A — validate+hash the copy only.
+            if ! jq -e --arg boot "$boot" --argjson want "$CENSUS_REQUIRED_ROOTS_JSON" '
+                .complete == true and
+                (.errors | length) == 0 and
+                .boot_id == $boot and
+                (.captured_at == "2026-08-01T00:00:10Z") and
+                ((.roots | sort) == ($want | sort))
+              ' "$tmp" >/dev/null 2>&1; then
+              printf 'copy-invalid\\n' >&2
+              rm -f -- "$tmp"
+              exit 4
+            fi
+            sha=$(file_sha256 "$tmp")
+            cap=$(jq -r '.captured_at' "$tmp")
+            rm -f -- "$tmp"
+            # Full helper on path now (B) must reject incomplete/error bytes.
+            after=$(valid_census_capture_identity "$path" "$boot")
+            [[ -z "$after" ]] || {{
+              printf 'accepted-b:%s\\n' "$after" >&2
+              exit 5
+            }}
+            printf 'ok\\n'
+            printf 'held_cap=%s\\n' "$cap"
+            printf 'held_st=%s\\n' "$st"
+            printf 'held_sha=%s\\n' "$sha"
+            """
+        )
+        proc = _bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        lines = proc.stdout.strip().splitlines()
+        self.assertEqual(lines[0], "ok")
+        self.assertIn("held_cap=2026-08-01T00:00:10Z", lines)
+
+        # 2) Full helper never mixes: pure A accepted; pure B (bad roots) rejected.
+        shutil.copy2(gen_a, path)
+        id_a = self._valid_identity(path, self.boot)
+        self.assertTrue(id_a)
+        self.assertEqual(id_a.split("\t")[0], "2026-08-01T00:00:10Z")
+        shutil.copy2(gen_b_bad_roots, path)
+        self.assertEqual(self._valid_identity(path, self.boot), "")
+        shutil.copy2(gen_b, path)
+        self.assertEqual(self._valid_identity(path, self.boot), "")
+
+    def test_second_requires_strictly_later_captured_at(self) -> None:
+        """Distinct identity alone is not enough; second captured_at must be strictly later."""
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:10Z",
+            boot_id=self.boot,
+            processes=[{"pid": 1}],
+        )
+        first = self._valid_identity(self.census, self.boot)
+        self.assertTrue(first)
+
+        # Equal captured_at, different body/inode → ignore (not second).
+        self.census.unlink()
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:10Z",
+            boot_id=self.boot,
+            processes=[{"pid": 2}],
+        )
+        equal_cand = self._valid_identity(self.census, self.boot)
+        self.assertTrue(equal_cand)
+        self.assertNotEqual(equal_cand, first)
+        self.assertEqual(self._accept("", first, equal_cand), "ignore")
+
+        # Earlier captured_at → ignore.
+        self.census.unlink()
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:05Z",
+            boot_id=self.boot,
+            processes=[{"pid": 3}],
+        )
+        earlier = self._valid_identity(self.census, self.boot)
+        self.assertTrue(earlier)
+        self.assertEqual(self._accept("", first, earlier), "ignore")
+
+        # Strictly later + distinct → second.
+        self.census.unlink()
+        write_census(
+            self.census,
+            captured_at="2026-08-01T00:00:20Z",
+            boot_id=self.boot,
+            processes=[{"pid": 4}],
+        )
+        later = self._valid_identity(self.census, self.boot)
+        self.assertTrue(later)
+        step = self._accept("", first, later)
+        self.assertTrue(step.startswith("second:"))
+        self.assertEqual(step[len("second:") :], later)
 
     def test_preexisting_same_boot_snapshot_is_excluded(self) -> None:
         """Seed an old valid same-boot snapshot; it must not count as first/second."""

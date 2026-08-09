@@ -141,60 +141,133 @@ wait_service_inactive() {
   die "census service did not become inactive before quiescence deadline (state=${state:-empty})"
 }
 
-# Robust snapshot identity: captured_at + device/inode/size/mtime + content hash.
-# Replacement that preserves captured_at still changes inode and/or hash.
-# Prints empty string when the path is missing or unreadable for identity.
-census_file_identity() {
+# Exact service roots from paseo-process-census.service --root flags.
+# Proof requires set-equality (no missing/duplicate/extra); order is not semantic.
+readonly CENSUS_REQUIRED_ROOTS_JSON='["/home/user/.paseo/worktrees","/mnt/data/paseo-runtime","/mnt/data/shab/.git","/tmp"]'
+
+# Open $1 once; fstat the held fd; copy its bytes into a private temp file.
+# Prints "st\ttmp_path" on success (caller must rm tmp_path). Empty on failure.
+# Path replacement after open cannot change the observed generation (inode + bytes).
+census_open_snapshot_copy() {
   local path=$1
-  local st sha cap
+  local fd st tmp
   if [[ ! -f "$path" ]]; then
     printf ''
     return 0
   fi
-  st=$(stat -c '%d:%i:%s:%Y' -- "$path" 2>/dev/null) || {
+  tmp=$(mktemp) || {
     printf ''
     return 0
   }
-  sha=$(file_sha256 "$path" 2>/dev/null) || {
+  # Hold one open observation; fstat + read both target that open file.
+  exec {fd}<"$path" 2>/dev/null || {
+    rm -f -- "$tmp"
+    printf ''
+    return 0
+  }
+  # -L: fstat the open file description, not the /proc fd symlink metadata.
+  # Path replacement after open must not change this identity.
+  st=$(stat -L -c '%d:%i:%s:%Y' -- "/proc/self/fd/$fd" 2>/dev/null) || {
+    exec {fd}<&-
+    rm -f -- "$tmp"
+    printf ''
+    return 0
+  }
+  if ! cat <&"$fd" >"$tmp" 2>/dev/null; then
+    exec {fd}<&-
+    rm -f -- "$tmp"
+    printf ''
+    return 0
+  fi
+  exec {fd}<&-
+  printf '%s\t%s' "$st" "$tmp"
+}
+
+# Robust snapshot identity from one open observation:
+# captured_at + device/inode/size/mtime + content hash of the private copy.
+# Replacement that preserves captured_at still changes inode and/or hash.
+# Prints empty string when the path is missing or unreadable for identity.
+census_file_identity() {
+  local path=$1
+  local obs st tmp sha cap
+  obs=$(census_open_snapshot_copy "$path")
+  if [[ -z "$obs" ]]; then
+    printf ''
+    return 0
+  fi
+  st=${obs%%$'\t'*}
+  tmp=${obs#*$'\t'}
+  sha=$(file_sha256 "$tmp" 2>/dev/null) || {
+    rm -f -- "$tmp"
     printf ''
     return 0
   }
   cap=$(
     jq -r 'if ((.captured_at | type) == "string") then .captured_at else empty end' \
-      "$path" 2>/dev/null || true
+      "$tmp" 2>/dev/null || true
   )
+  rm -f -- "$tmp"
   printf '%s\t%s\t%s' "${cap}" "$st" "$sha"
 }
 
-# Identity of a complete, same-boot, empty-errors capture; empty if invalid.
+# Identity of a complete, same-boot, empty-errors, exact-roots capture.
+# JSON validation, SHA-256, captured_at, and stat metadata all come from one
+# private immutable copy of a single open — never validate generation A and
+# identify generation B after atomic path replacement. Empty if invalid.
 valid_census_capture_identity() {
   local path=$1
   local boot=$2
-  if [[ ! -f "$path" ]]; then
+  local obs st tmp sha cap
+  obs=$(census_open_snapshot_copy "$path")
+  if [[ -z "$obs" ]]; then
     printf ''
     return 0
   fi
-  if ! jq -e --arg boot "$boot" '
+  st=${obs%%$'\t'*}
+  tmp=${obs#*$'\t'}
+  # Fail closed on incomplete/error/wrong-boot/malformed/roots gaps — on the copy.
+  if ! jq -e --arg boot "$boot" --argjson want "$CENSUS_REQUIRED_ROOTS_JSON" '
       .complete == true and
       (.errors | type == "array") and
       (.errors | length) == 0 and
       .boot_id == $boot and
       (.captured_at | type == "string") and
-      (.captured_at | length) > 0
-    ' "$path" >/dev/null 2>&1; then
+      (.captured_at | length) > 0 and
+      (.roots | type == "array") and
+      (.roots | length) == ($want | length) and
+      (.roots | unique | length) == ($want | length) and
+      ((.roots | sort) == ($want | sort))
+    ' "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"
     printf ''
     return 0
   fi
-  census_file_identity "$path"
+  sha=$(file_sha256 "$tmp" 2>/dev/null) || {
+    rm -f -- "$tmp"
+    printf ''
+    return 0
+  }
+  cap=$(
+    jq -r 'if ((.captured_at | type) == "string") then .captured_at else empty end' \
+      "$tmp" 2>/dev/null || true
+  )
+  rm -f -- "$tmp"
+  if [[ -z "$cap" ]]; then
+    printf ''
+    return 0
+  fi
+  printf '%s\t%s\t%s' "$cap" "$st" "$sha"
 }
 
 # Classify a candidate identity relative to baseline and first post-restart id.
 # Prints: ignore | first:<id> | second:<id>
 # Pre-existing baseline is never accepted as first/second.
+# Second requires a distinct full identity AND strictly later captured_at.
 accept_capture_step() {
   local baseline=$1
   local first=$2
   local candidate=$3
+  local cand_at first_at
   if [[ -z "$candidate" ]]; then
     printf 'ignore\n'
     return 0
@@ -208,6 +281,13 @@ accept_capture_step() {
     return 0
   fi
   if [[ "$candidate" == "$first" ]]; then
+    printf 'ignore\n'
+    return 0
+  fi
+  cand_at=${candidate%%$'\t'*}
+  first_at=${first%%$'\t'*}
+  # ISO-8601 captured_at: lexicographic order matches chronological order.
+  if [[ -z "$cand_at" || -z "$first_at" || ! ( "$cand_at" > "$first_at" ) ]]; then
     printf 'ignore\n'
     return 0
   fi
@@ -402,8 +482,9 @@ process_census_install_main() {
     die "timer has no finite next trigger (rt=${next_rt:-empty} mono=${next_mono:-empty})"
   fi
 
-  # Bounded poll for two distinct complete same-boot empty-error captures with
-  # identities strictly subsequent to the quiesced baseline. Rebalanced budget.
+  # Bounded poll for two distinct complete same-boot empty-error exact-roots
+  # captures subsequent to the quiesced baseline; second requires a strictly
+  # later captured_at. Rebalanced budget.
   local first_identity second_identity poll_sleep candidate step remaining
   local first_at second_at
   poll_deadline=$total_deadline

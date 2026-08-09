@@ -13,7 +13,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent / "legacy-tmp-quarantine.py"
@@ -361,6 +361,95 @@ class PreRuntimeH(H):
             complete=complete,
             roots=roots if roots is not None else [str(self.scratch)],
             processes=processes,
+        )
+
+    def plant_quarantine(
+        self,
+        source: Path,
+        run_id: str = RUN,
+        *,
+        historic: bool = False,
+        candidate_token: str = "planted-token",
+        mutate_man: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[Path, dict[str, Any]]:
+        """Plant a durable final quarantine while leaving source in place."""
+        records, errs = M.dual_inventory(str(source))
+        if errs:
+            raise AssertionError(f"plant inventory failed: {errs}")
+        ident = M.identity_from_lstat(str(source))
+        inv_fp = M.inventory_fingerprint(records)
+        size_bytes = M.size_from_inventory(records)
+        final = self.qroot / run_id
+        final.mkdir(parents=True, exist_ok=False)
+        payload = final / "payload"
+        M.copy_candidate_tree(str(source), str(payload), time.monotonic() + M.INVENTORY_TIMEOUT_S)
+        man: dict[str, Any] = {
+            "schema_version": M.SCHEMA_VERSION,
+            "run_id": run_id,
+            "source_path": str(source),
+            "source_basename": source.name,
+            "recognized_producer": M.PRE_RUNTIME_PRODUCER,
+            "candidate_token": candidate_token,
+            "captured_at": iso(self.now),
+            "source_identity": {
+                k: ident[k]
+                for k in (
+                    "type",
+                    "mode",
+                    "uid",
+                    "gid",
+                    "size",
+                    "mtime_ns",
+                    "nlink",
+                    "dev",
+                    "ino",
+                )
+            },
+            "inventory": [
+                {k: v for k, v in r.items() if k not in ("dev", "ino")} for r in records
+            ],
+            "inventory_fingerprint": inv_fp,
+            "size_bytes": size_bytes,
+        }
+        if not historic:
+            man["profile"] = M.PROFILE_PRE_RUNTIME_SCRATCH
+            # Planted modern manifests carry a placeholder fingerprint string;
+            # finalize-existing does not re-bind the historic protection field.
+            man["protection_fingerprint"] = "planted-protection-fingerprint"
+        if mutate_man is not None:
+            mutate_man(man)
+        M.write_manifest(str(final / "manifest.json"), man)
+        M.verify_payload_against_manifest(
+            str(payload), man, time.monotonic() + M.INVENTORY_TIMEOUT_S
+        )
+        return final, man
+
+    def finalize(
+        self,
+        source: Path | str,
+        token: str,
+        run_id: str = RUN,
+        now_shift: float = 5.0,
+        *,
+        profile: str = M.PROFILE_PRE_RUNTIME_SCRATCH,
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> dict[str, Any]:
+        # Fresh complete census after started_at for each probe's same-boot proof.
+        self.write_census(captured_at=iso(self.now + timedelta(seconds=now_shift + 1)))
+        return M.run_finalize_existing(
+            source=str(source),
+            candidate_token=token,
+            run_id=run_id,
+            tmp_root=str(self.tmp_root),
+            quarantine_root=str(self.qroot),
+            census_path=str(self.census),
+            proc_root=str(self.proc),
+            runner=self.paseo,
+            now_fn=now_fn or (lambda: self.now + timedelta(seconds=now_shift)),
+            wait_s=0.0,
+            poll_s=0.01,
+            data_root=str(self.data_root),
+            profile=profile,
         )
 
 
@@ -1258,6 +1347,587 @@ class PreRuntimeTests(unittest.TestCase):
         r_boot = self.h.probe(src)
         self.assertEqual(r_boot["classification"], "blocked", r_boot)
         self.assertIsNone(r_boot.get("candidate_token") or r_boot["candidate_token"])
+
+
+class FinalizeExistingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.h = PreRuntimeH()
+
+    def tearDown(self) -> None:
+        self.h.close()
+
+    def _eligible_planted(
+        self,
+        name: str = "test-runner",
+        *,
+        historic: bool = False,
+        body: bytes = b"finalize-payload",
+        run_id: str = RUN,
+    ) -> tuple[Path, Path, dict[str, Any], str]:
+        src, probe = self.h.eligible(name, body=body)
+        self.assertEqual(probe["classification"], "eligible", probe)
+        final, man = self.h.plant_quarantine(src, run_id=run_id, historic=historic)
+        # Fresh probe after plant (source unchanged) for current candidate token.
+        self.h.write_census()
+        cur = self.h.probe(src)
+        self.assertEqual(cur["classification"], "eligible", cur)
+        token = cur["candidate_token"]
+        self.assertTrue(token)
+        return src, final, man, token
+
+    def test_historic_manifest_finalizes_existing(self) -> None:
+        src, final, man, token = self._eligible_planted(historic=True)
+        self.assertNotIn("profile", man)
+        self.assertNotIn("protection_fingerprint", man)
+        payload_bytes = (final / "payload" / "data.bin").read_bytes()
+        man_text = (final / "manifest.json").read_text(encoding="utf-8")
+
+        result = self.h.finalize(src, token)
+        self.assertEqual(result["status"], "finalized_existing", result)
+        self.assertFalse(src.exists())
+        self.assertTrue(final.is_dir())
+        self.assertTrue((final / "manifest.json").is_file())
+        self.assertTrue((final / "payload" / "data.bin").is_file())
+        self.assertEqual((final / "payload" / "data.bin").read_bytes(), payload_bytes)
+        self.assertEqual((final / "manifest.json").read_text(encoding="utf-8"), man_text)
+        self.assertEqual(result["quarantine_path"], str(final))
+        self.assertEqual(result["manifest_path"], str(final / "manifest.json"))
+        self.assertEqual(result["source_path"], str(src))
+        self.assertEqual(result["recovery_authority"], str(final))
+        self.assertIsNone(result["tombstone_path"])
+        self.assertIn("free_bytes_before", result)
+        self.assertIn("free_bytes_after", result)
+        self.assertEqual(result["size_bytes"], man["size_bytes"])
+        # Only the exact source was removed; no other scratch children introduced.
+        leftovers = [p for p in self.h.scratch.iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+
+    def test_current_profile_manifest_finalizes_existing(self) -> None:
+        src, final, man, token = self._eligible_planted(historic=False)
+        self.assertEqual(man["profile"], M.PROFILE_PRE_RUNTIME_SCRATCH)
+        self.assertTrue(man["protection_fingerprint"])
+        result = self.h.finalize(src, token)
+        self.assertEqual(result["status"], "finalized_existing", result)
+        self.assertFalse(src.exists())
+        self.assertTrue(final.is_dir())
+        self.assertTrue((final / "manifest.json").is_file())
+        self.assertIsNone(result["tombstone_path"])
+
+    def test_payload_hash_mismatch_blocks_before_rename(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        wfile(final / "payload" / "data.bin", b"tampered-payload-bytes")
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src, token)
+        self.assertIn("destination_mismatch", str(ctx.exception))
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+
+    def test_source_inventory_identity_size_mismatch_blocks(self) -> None:
+        src, final, man, token = self._eligible_planted(historic=True)
+        # Inventory/fingerprint change.
+        wfile(src / "extra-mut", b"x")
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src, token)
+        self.assertTrue(
+            "inventory" in str(ctx.exception).lower()
+            or "fingerprint" in str(ctx.exception).lower()
+            or "identity" in str(ctx.exception).lower(),
+            ctx.exception,
+        )
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+
+        # Root mtime change alters both inventory fingerprint and source_identity.
+        src_i, final_i, _man_i, token_i = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"ident-check"
+        )
+        os.utime(src_i, ns=(1_000_000_000, 9_000_000_000))
+        with self.assertRaises(M.ToolError) as ctx2:
+            self.h.finalize(src_i, token_i, run_id=final_i.name)
+        msg2 = str(ctx2.exception).lower()
+        self.assertTrue(
+            "identity" in msg2 or "fingerprint" in msg2 or "inventory" in msg2,
+            ctx2.exception,
+        )
+        self.assertTrue(src_i.exists())
+
+        # Size mismatch via manifest field alone.
+        def bad_size(m: dict[str, Any]) -> None:
+            m["size_bytes"] = int(man["size_bytes"]) + 99
+
+        src2 = self.h.put_candidate("test-runner", body=b"size-check-unique")
+        # Ensure clean tree for size-check plant under a fresh run id.
+        for child in list(src2.iterdir()):
+            if child.is_file() or child.is_symlink():
+                child.unlink()
+            elif child.is_dir():
+                for p in sorted(child.rglob("*"), reverse=True):
+                    if p.is_file() or p.is_symlink():
+                        p.unlink()
+                    elif p.is_dir():
+                        p.rmdir()
+                child.rmdir()
+        wfile(src2 / "data.bin", b"size-check-unique")
+        wfile(src2 / "nested" / "x.txt", b"nested")
+        rid2 = str(uuid.uuid4())
+        final2, _ = self.h.plant_quarantine(src2, run_id=rid2, historic=True, mutate_man=bad_size)
+        self.h.write_census()
+        p2 = self.h.probe(src2)
+        with self.assertRaises(M.ToolError) as ctx3:
+            self.h.finalize(src2, p2["candidate_token"], run_id=rid2)
+        self.assertIn("size", str(ctx3.exception).lower())
+        self.assertTrue(src2.exists())
+        self.assertTrue(final2.is_dir())
+
+    def test_wrong_source_run_profile_producer_block(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        other = self.h.put_candidate("verify", body=b"other")
+        self.h.write_census()
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(other, token)
+        self.assertTrue(
+            "source_path" in str(ctx.exception) or "mismatch" in str(ctx.exception).lower(),
+            ctx.exception,
+        )
+        self.assertTrue(src.exists())
+        self.assertTrue(other.exists())
+
+        with self.assertRaises(M.ToolError) as ctx2:
+            self.h.finalize(src, token, run_id=str(uuid.uuid4()))
+        self.assertIn("missing", str(ctx2.exception).lower())
+
+        with self.assertRaises(M.ToolError) as ctx3:
+            self.h.finalize(src, token, profile=M.PROFILE_LEGACY_TMP)
+        self.assertIn("pre-runtime-scratch-layout", str(ctx3.exception))
+
+        # Wrong producer in planted historic-shaped manifest.
+        src_p = self.h.put_candidate("test-runner", body=b"prod")
+        self.h.write_census()
+
+        def bad_prod(m: dict[str, Any]) -> None:
+            m["recognized_producer"] = "paseo-"
+
+        rid = str(uuid.uuid4())
+        self.h.plant_quarantine(src_p, run_id=rid, historic=True, mutate_man=bad_prod)
+        self.h.write_census()
+        tp = self.h.probe(src_p)["candidate_token"]
+        with self.assertRaises(M.ToolError) as ctx4:
+            self.h.finalize(src_p, tp, run_id=rid)
+        self.assertIn("recognized_producer", str(ctx4.exception))
+        self.assertTrue(src_p.exists())
+        del final
+
+    def test_bad_missing_symlink_manifest_payload_block(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        man_path = final / "manifest.json"
+        # Malformed JSON
+        man_path.write_text("{not-json", encoding="utf-8")
+        with self.assertRaises(M.ToolError):
+            self.h.finalize(src, token)
+        self.assertTrue(src.exists())
+
+        # Restore then replace with symlink
+        src2, final2, man2, token2 = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"sym-man"
+        )
+        mp2 = final2 / "manifest.json"
+        real = final2 / "manifest.real.json"
+        real.write_text(mp2.read_text(encoding="utf-8"), encoding="utf-8")
+        mp2.unlink()
+        os.symlink(str(real), mp2)
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src2, token2, run_id=final2.name)
+        self.assertIn("symlink", str(ctx.exception).lower())
+        self.assertTrue(src2.exists())
+
+        # Missing payload
+        src3, final3, _m3, token3 = self._eligible_planted(
+            "test-runner", historic=True, run_id=str(uuid.uuid4()), body=b"no-payload"
+        )
+        # Replace source name collision: plant uses test-runner which may already be gone from earlier finalize attempts
+        # (src still exists from first case). Use unique run and ensure payload removal only.
+        import shutil
+
+        payload = final3 / "payload"
+        if payload.is_dir():
+            shutil.rmtree(payload)
+        elif payload.exists():
+            payload.unlink()
+        with self.assertRaises(M.ToolError) as ctx2:
+            self.h.finalize(src3, token3, run_id=final3.name)
+        self.assertIn("payload", str(ctx2.exception).lower())
+        self.assertTrue(src3.exists())
+
+        # Missing manifest
+        src4, final4, _m4, token4 = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"no-man"
+        )
+        (final4 / "manifest.json").unlink()
+        with self.assertRaises(M.ToolError) as ctx3:
+            self.h.finalize(src4, token4, run_id=final4.name)
+        self.assertIn("manifest", str(ctx3.exception).lower())
+        self.assertTrue(src4.exists())
+        del man2
+
+    def test_token_mismatch_blocks(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src, "0" * 64)
+        self.assertIn("token", str(ctx.exception).lower())
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+        self.assertNotEqual(token, "0" * 64)
+
+    def test_first_probe_noneligible_blocks(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        lock = self.h.locks / "test-runner.lock"
+        lock.mkdir()
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src, token)
+        self.assertIn("not eligible", str(ctx.exception).lower())
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+        lock.rmdir()
+
+    def test_second_probe_noneligible_blocks(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        calls = {"n": 0}
+        real_classify = M.classify_source
+
+        def classify_then_lock(**kwargs: Any) -> dict[str, Any]:
+            calls["n"] += 1
+            out = real_classify(**kwargs)
+            if calls["n"] == 1:
+                (self.h.locks / "test-runner.lock").mkdir()
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=classify_then_lock):
+            with self.assertRaises(M.ToolError) as ctx:
+                self.h.finalize(src, token)
+        self.assertIn("second", str(ctx.exception).lower())
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+        lock = self.h.locks / "test-runner.lock"
+        if lock.exists():
+            lock.rmdir()
+
+    def test_unequal_or_empty_protection_fingerprints_block(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        real_classify = M.classify_source
+        calls = {"n": 0}
+
+        def flip_prot(**kwargs: Any) -> dict[str, Any]:
+            calls["n"] += 1
+            out = real_classify(**kwargs)
+            if out.get("classification") == "eligible":
+                if calls["n"] == 1:
+                    out = dict(out)
+                    out["protection_fingerprint"] = "fp-aaaa"
+                else:
+                    out = dict(out)
+                    out["protection_fingerprint"] = "fp-bbbb"
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=flip_prot):
+            with self.assertRaises(M.ToolError) as ctx:
+                self.h.finalize(src, token)
+        self.assertIn("protection_fingerprint", str(ctx.exception))
+        self.assertTrue(src.exists())
+
+        def empty_prot(**kwargs: Any) -> dict[str, Any]:
+            out = real_classify(**kwargs)
+            if out.get("classification") == "eligible":
+                out = dict(out)
+                out["protection_fingerprint"] = ""
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=empty_prot):
+            with self.assertRaises(M.ToolError) as ctx2:
+                self.h.finalize(src, token)
+        self.assertIn("protection_fingerprint", str(ctx2.exception))
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+
+    def test_mutation_between_probes_blocks(self) -> None:
+        real_classify = M.classify_source
+
+        # Source content mutation between probes.
+        src, final, _man, token = self._eligible_planted(
+            "test-runner", historic=True, run_id=str(uuid.uuid4()), body=b"mut-src"
+        )
+        calls = {"n": 0}
+
+        def mutate_source_between(**kwargs: Any) -> dict[str, Any]:
+            calls["n"] += 1
+            out = real_classify(**kwargs)
+            if calls["n"] == 1:
+                wfile(src / "between-probes", b"mut")
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=mutate_source_between):
+            with self.assertRaises(M.ToolError):
+                self.h.finalize(src, token, run_id=final.name)
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+
+        # Process protection appears between probes (fresh plant — prior mtime noise free).
+        src_p, final_p, _mp, token_p = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"mut-proc"
+        )
+        calls2 = {"n": 0}
+
+        def proc_between(**kwargs: Any) -> dict[str, Any]:
+            calls2["n"] += 1
+            if calls2["n"] == 2:
+                self.h.processes.append(
+                    {
+                        "pid": 88,
+                        "start_time_ticks": 12,
+                        "name": "worker",
+                        "scope_complete": True,
+                        "references": [{"kind": "cwd", "path": str(src_p)}],
+                    }
+                )
+                self.h.write_census(
+                    captured_at=iso(self.h.now + timedelta(seconds=10)),
+                )
+            return real_classify(**kwargs)
+
+        with mock.patch.object(M, "classify_source", side_effect=proc_between):
+            with self.assertRaises(M.ToolError) as ctx:
+                self.h.finalize(src_p, token_p, run_id=final_p.name, now_shift=5.0)
+        self.assertIn("not eligible", str(ctx.exception).lower())
+        self.assertTrue(src_p.exists())
+        self.assertTrue(final_p.is_dir())
+
+        # Paseo agent protection between probes.
+        self.h.processes = [
+            {
+                "pid": 1,
+                "start_time_ticks": 10,
+                "name": "init",
+                "scope_complete": True,
+                "references": [],
+            }
+        ]
+        src_a, final_a, _ma, token_a = self._eligible_planted(
+            "test-runner", historic=True, run_id=str(uuid.uuid4()), body=b"mut-paseo"
+        )
+        # Clean leftover test-runner content from earlier mutation plant if reused.
+        calls3 = {"n": 0}
+
+        def paseo_between(**kwargs: Any) -> dict[str, Any]:
+            calls3["n"] += 1
+            out = real_classify(**kwargs)
+            if calls3["n"] == 1:
+                self.h.mark_agent(A, cwd=str(src_a))
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=paseo_between):
+            with self.assertRaises(M.ToolError) as ctx_a:
+                self.h.finalize(src_a, token_a, run_id=final_a.name)
+        self.assertIn("not eligible", str(ctx_a.exception).lower())
+        self.assertTrue(src_a.exists())
+        self.h.paseo = FakePaseo()
+
+        # Lock appears between probes.
+        src_l, final_l, _ml, token_l = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"mut-lock"
+        )
+        calls4 = {"n": 0}
+        lock = self.h.locks / "verify.lock"
+
+        def lock_between(**kwargs: Any) -> dict[str, Any]:
+            calls4["n"] += 1
+            out = real_classify(**kwargs)
+            if calls4["n"] == 1 and not (lock.exists() or lock.is_symlink()):
+                lock.mkdir()
+            return out
+
+        with mock.patch.object(M, "classify_source", side_effect=lock_between):
+            with self.assertRaises(M.ToolError) as ctx_l:
+                self.h.finalize(src_l, token_l, run_id=final_l.name)
+        self.assertIn("not eligible", str(ctx_l.exception).lower())
+        self.assertTrue(src_l.exists())
+        if lock.exists():
+            lock.rmdir()
+
+    def test_source_special_symlink_hardlink_mount_unreadable_block(self) -> None:
+        # Root symlink: finalize must refuse before source mutation.
+        link_src = self.h.scratch / "test-runner"
+        if link_src.exists() or link_src.is_symlink():
+            if link_src.is_dir() and not link_src.is_symlink():
+                for p in sorted(link_src.rglob("*"), reverse=True):
+                    if p.is_file() or p.is_symlink():
+                        p.unlink()
+                    elif p.is_dir():
+                        p.rmdir()
+                link_src.rmdir()
+            else:
+                link_src.unlink()
+        os.symlink(str(self.h.root / "outside"), link_src)
+        rid_link = str(uuid.uuid4())
+        final_link = self.h.qroot / rid_link
+        final_link.mkdir(parents=True, exist_ok=False)
+        (final_link / "payload").mkdir()
+        wfile(final_link / "manifest.json", b'{"schema_version":1}\n')
+        with self.assertRaises(M.ToolError):
+            self.h.finalize(link_src, "x" * 64, run_id=rid_link)
+        self.assertTrue(link_src.is_symlink())
+        link_src.unlink()
+
+        # Hard link inside real candidate (verify basename).
+        src2, final2, _m, token2 = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"hard"
+        )
+        try:
+            os.link(src2 / "data.bin", src2 / "hard.bin")
+        except OSError:
+            self.skipTest("hard links not supported on this filesystem")
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src2, token2, run_id=final2.name)
+        self.assertTrue(
+            "hard_link" in str(ctx.exception)
+            or "inventory" in str(ctx.exception).lower()
+            or "fingerprint" in str(ctx.exception).lower(),
+            ctx.exception,
+        )
+        self.assertTrue(src2.exists())
+        self.assertTrue(final2.is_dir())
+        # Remove hard link so later verify plants are clean.
+        if (src2 / "hard.bin").exists():
+            (src2 / "hard.bin").unlink()
+
+        # Special FIFO under test-runner (plant first, then add fifo).
+        src3, final3, _m3, _t3 = self._eligible_planted(
+            "test-runner", historic=True, run_id=str(uuid.uuid4()), body=b"fifo-base"
+        )
+        os.mkfifo(src3 / "f.fifo")
+        self.h.write_census()
+        with self.assertRaises(M.ToolError):
+            self.h.finalize(src3, "a" * 64, run_id=final3.name)
+        self.assertTrue(src3.exists())
+        self.assertTrue(final3.is_dir())
+        (src3 / "f.fifo").unlink()
+
+        # Unreadable nested file under a fresh verify plant.
+        src4, final4, _m4, _t4 = self._eligible_planted(
+            "verify", historic=True, run_id=str(uuid.uuid4()), body=b"unreadable-bytes"
+        )
+        secret = src4 / "data.bin"
+        os.chmod(secret, 0o000)
+        try:
+            with self.assertRaises(M.ToolError):
+                self.h.finalize(src4, "b" * 64, run_id=final4.name)
+            self.assertTrue(src4.exists())
+            self.assertTrue(final4.is_dir())
+        finally:
+            os.chmod(secret, 0o644)
+
+    def test_removal_failure_pending_preserves_quarantine(self) -> None:
+        src, final, man, token = self._eligible_planted(historic=True)
+        payload_bytes = (final / "payload" / "data.bin").read_bytes()
+
+        def boom(root: str, expected: os.stat_result) -> None:
+            raise M.ToolError("simulated removal failure")
+
+        with mock.patch.object(M, "remove_tree_nofollow", side_effect=boom):
+            result = self.h.finalize(src, token)
+        self.assertEqual(result["status"], "quarantined_pending_removal", result)
+        self.assertIsNotNone(result["tombstone_path"])
+        tp = Path(result["tombstone_path"])
+        self.assertTrue(tp.exists())
+        self.assertTrue(str(tp).startswith(str(self.h.scratch)))
+        self.assertEqual(result["quarantine_path"], str(final))
+        self.assertEqual(result["manifest_path"], str(final / "manifest.json"))
+        self.assertEqual(result["recovery_authority"], str(final))
+        self.assertTrue(final.is_dir())
+        self.assertEqual((final / "payload" / "data.bin").read_bytes(), payload_bytes)
+        self.assertFalse(src.exists())
+        self.assertEqual(result["size_bytes"], man["size_bytes"])
+        self.assertIn("free_bytes_before", result)
+        self.assertIn("free_bytes_after", result)
+
+    def test_legacy_profile_and_root_overrides_rejected(self) -> None:
+        src, _final, _man, token = self._eligible_planted(historic=True)
+        with self.assertRaises(M.ToolError) as ctx:
+            M.run_finalize_existing(
+                source=str(src),
+                candidate_token=token,
+                run_id=RUN,
+                tmp_root=str(self.h.tmp_root),
+                quarantine_root=str(self.h.qroot),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.0,
+                poll_s=0.01,
+                data_root=str(self.h.data_root),
+                profile=M.PROFILE_LEGACY_TMP,
+            )
+        self.assertIn("pre-runtime-scratch-layout", str(ctx.exception))
+        with self.assertRaises(M.ToolError):
+            M.run_finalize_existing(
+                source=str(src),
+                candidate_token=token,
+                run_id=RUN,
+                tmp_root="/tmp",
+                quarantine_root=str(self.h.qroot),
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.0,
+                poll_s=0.01,
+                data_root=str(self.h.data_root),
+                profile=M.PROFILE_PRE_RUNTIME_SCRATCH,
+            )
+        with self.assertRaises(M.ToolError):
+            M.run_finalize_existing(
+                source=str(src),
+                candidate_token=token,
+                run_id=RUN,
+                tmp_root=str(self.h.tmp_root),
+                quarantine_root="/tmp/wrong-q",
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.0,
+                poll_s=0.01,
+                data_root=str(self.h.data_root),
+                profile=M.PROFILE_PRE_RUNTIME_SCRATCH,
+            )
+        self.assertTrue(src.exists())
+
+    def test_wrong_profile_field_in_manifest_blocks(self) -> None:
+        src = self.h.put_candidate("test-runner", body=b"prof")
+        self.h.write_census()
+        rid = str(uuid.uuid4())
+
+        def bad_profile(m: dict[str, Any]) -> None:
+            m["profile"] = M.PROFILE_LEGACY_TMP
+            m["protection_fingerprint"] = "x"
+
+        self.h.plant_quarantine(src, run_id=rid, historic=False, mutate_man=bad_profile)
+        self.h.write_census()
+        token = self.h.probe(src)["candidate_token"]
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src, token, run_id=rid)
+        self.assertIn("profile", str(ctx.exception).lower())
+        self.assertTrue(src.exists())
+
+    def test_reused_partial_blocks(self) -> None:
+        src, final, _man, token = self._eligible_planted(historic=True)
+        partial = self.h.qroot / f".partial-{RUN}"
+        partial.mkdir()
+        with self.assertRaises(M.ToolError) as ctx:
+            self.h.finalize(src, token)
+        self.assertIn("partial", str(ctx.exception).lower())
+        self.assertTrue(src.exists())
+        self.assertTrue(final.is_dir())
+        partial.rmdir()
 
 
 if __name__ == "__main__":

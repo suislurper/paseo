@@ -1282,6 +1282,389 @@ def run_quarantine(
         free_before=free_before,
         free_after=free_after,
     )
+
+
+def _require_manifest_str(man: dict[str, Any], key: str) -> str:
+    val = man.get(key)
+    if not isinstance(val, str) or not val:
+        raise ToolError(f"manifest missing or invalid {key}")
+    return val
+
+
+def _require_manifest_int(man: dict[str, Any], key: str) -> int:
+    val = man.get(key)
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ToolError(f"manifest missing or invalid {key}")
+    return val
+
+
+def load_and_validate_existing_manifest(
+    *,
+    source: str,
+    run_id: str,
+    quarantine_root: str,
+    profile: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Load a previously published final quarantine manifest (fail closed).
+
+    Historic pre-runtime manifests may omit additive ``profile`` and
+    ``protection_fingerprint`` only when ``recognized_producer`` is exactly
+    ``pre-runtime-scratch-layout``. This is the explicit finalized-old-evidence
+    path, not a compatibility alias for other producers/profiles.
+    """
+    if profile != PROFILE_PRE_RUNTIME_SCRATCH:
+        raise ToolError(
+            f"finalize-existing requires profile {PROFILE_PRE_RUNTIME_SCRATCH}"
+        )
+    if not is_uuid(run_id):
+        raise ToolError("run-id must be a UUID")
+    validate_profile_tmp_root(profile, PRE_RUNTIME_SOURCE_ROOT)
+    validate_profile_quarantine_root(profile, quarantine_root)
+    source = resolve_source(source, PRE_RUNTIME_SOURCE_ROOT)
+    basename = os.path.basename(source)
+
+    partial = os.path.join(quarantine_root, f".partial-{run_id}")
+    final = os.path.join(quarantine_root, run_id)
+    if os.path.lexists(partial):
+        raise ToolError(f"refusing reused or existing partial path: {partial}")
+    if not os.path.lexists(final):
+        raise ToolError(f"final quarantine path missing: {final}")
+    if os.path.islink(final):
+        raise ToolError(f"final quarantine path is a symlink: {final}")
+    ensure_no_symlink_components(final, "final quarantine")
+    if not os.path.isdir(final):
+        raise ToolError(f"final quarantine path is not a directory: {final}")
+
+    man_path = os.path.join(final, "manifest.json")
+    if not os.path.lexists(man_path):
+        raise ToolError(f"manifest missing: {man_path}")
+    if os.path.islink(man_path):
+        raise ToolError(f"manifest is a symlink: {man_path}")
+    ensure_no_symlink_components(man_path, "manifest")
+    try:
+        st = os.lstat(man_path)
+    except OSError as exc:
+        raise ToolError(f"manifest unreadable: {man_path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ToolError(f"manifest is not a regular file: {man_path}")
+    try:
+        raw = Path(man_path).read_text(encoding="utf-8")
+        man = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ToolError(f"manifest malformed: {man_path}: {exc}") from exc
+    if not isinstance(man, dict):
+        raise ToolError(f"manifest is not a JSON object: {man_path}")
+
+    schema = man.get("schema_version")
+    if schema != SCHEMA_VERSION:
+        raise ToolError(f"manifest schema_version mismatch: {schema!r}")
+    man_run = _require_manifest_str(man, "run_id")
+    if man_run != run_id:
+        raise ToolError(f"manifest run_id mismatch: {man_run}")
+    man_source = norm(_require_manifest_str(man, "source_path"))
+    if man_source != norm(source):
+        raise ToolError(f"manifest source_path mismatch: {man_source}")
+    man_base = _require_manifest_str(man, "source_basename")
+    if man_base != basename:
+        raise ToolError(f"manifest source_basename mismatch: {man_base}")
+    producer = _require_manifest_str(man, "recognized_producer")
+    if producer != PRE_RUNTIME_PRODUCER:
+        raise ToolError(f"manifest recognized_producer mismatch: {producer}")
+
+    # Additive fields: present → must match; absent only for this producer.
+    if "profile" in man:
+        man_profile = man.get("profile")
+        if man_profile != PROFILE_PRE_RUNTIME_SCRATCH:
+            raise ToolError(f"manifest profile mismatch: {man_profile!r}")
+    else:
+        if producer != PRE_RUNTIME_PRODUCER:
+            raise ToolError("manifest missing profile for non-pre-runtime producer")
+    if "protection_fingerprint" in man:
+        pfp = man.get("protection_fingerprint")
+        if not isinstance(pfp, str) or not pfp:
+            raise ToolError("manifest protection_fingerprint invalid")
+    else:
+        if producer != PRE_RUNTIME_PRODUCER:
+            raise ToolError(
+                "manifest missing protection_fingerprint for non-pre-runtime producer"
+            )
+
+    _require_manifest_str(man, "candidate_token")
+    _require_manifest_str(man, "inventory_fingerprint")
+    _require_manifest_int(man, "size_bytes")
+    if not isinstance(man.get("inventory"), list):
+        raise ToolError("manifest inventory missing")
+    src_ident = man.get("source_identity")
+    if not isinstance(src_ident, dict):
+        raise ToolError("manifest source_identity missing")
+    for k in ("type", "mode", "uid", "gid", "size", "mtime_ns", "nlink", "dev", "ino"):
+        if k not in src_ident:
+            raise ToolError(f"manifest source_identity missing {k}")
+
+    payload = os.path.join(final, "payload")
+    if not os.path.lexists(payload):
+        raise ToolError(f"payload missing: {payload}")
+    if os.path.islink(payload):
+        raise ToolError(f"payload is a symlink: {payload}")
+    ensure_no_symlink_components(payload, "payload")
+    try:
+        p_st = os.lstat(payload)
+    except OSError as exc:
+        raise ToolError(f"payload unreadable: {payload}: {exc}") from exc
+    if not (stat.S_ISREG(p_st.st_mode) or stat.S_ISDIR(p_st.st_mode)):
+        raise ToolError(f"payload is not a regular file or directory: {payload}")
+
+    return final, man_path, man
+
+
+def verify_source_matches_manifest(source: str, man: dict[str, Any]) -> dict[str, Any]:
+    """Dual-inventory current source against durable manifest (fresh 60s each walk)."""
+    records, errs = dual_inventory(source)
+    if errs:
+        raise ToolError(
+            f"source inventory blocked: {','.join(sorted(set(errs)))}"
+        )
+    inv_fp = inventory_fingerprint(records)
+    if inv_fp != man.get("inventory_fingerprint"):
+        raise ToolError("source inventory_fingerprint mismatch vs manifest")
+    try:
+        ident = identity_from_lstat(source)
+    except OSError as exc:
+        raise ToolError(f"source unreadable: {exc}") from exc
+    man_ident = man["source_identity"]
+    if not identities_match(ident, man_ident):
+        raise ToolError("source identity mismatch vs manifest")
+    size_bytes = size_from_inventory(records)
+    if size_bytes != man.get("size_bytes"):
+        raise ToolError("source size_bytes mismatch vs manifest")
+    return {
+        "records": records,
+        "identity": ident,
+        "inventory_fingerprint": inv_fp,
+        "size_bytes": size_bytes,
+    }
+
+
+def run_finalize_existing(
+    *,
+    source: str,
+    candidate_token: str,
+    run_id: str,
+    tmp_root: str,
+    quarantine_root: str,
+    census_path: str,
+    proc_root: str,
+    runner: Callable[[list[str]], tuple[int, str, str]],
+    now_fn: Callable[[], datetime],
+    wait_s: float = SNAPSHOT_WAIT_S,
+    poll_s: float = 0.25,
+    data_root: str = DEFAULT_DATA_ROOT,
+    profile: str = DEFAULT_PROFILE,
+) -> dict[str, Any]:
+    """Attended finalize of a previously published pre-runtime quarantine copy.
+
+    Never creates another quarantine copy. Never mutates/deletes the durable
+    quarantine. Source tombstone/removal only after two fresh matching protection
+    probes and full recovery re-verification.
+    """
+    if not candidate_token:
+        raise ToolError("candidate-token is required")
+    if profile != PROFILE_PRE_RUNTIME_SCRATCH:
+        raise ToolError(
+            f"finalize-existing requires profile {PROFILE_PRE_RUNTIME_SCRATCH}"
+        )
+    if norm(tmp_root) != norm(PRE_RUNTIME_SOURCE_ROOT):
+        raise ToolError(
+            f"profile {PROFILE_PRE_RUNTIME_SCRATCH} requires source root "
+            f"{PRE_RUNTIME_SOURCE_ROOT}"
+        )
+    if norm(quarantine_root) != norm(PRE_RUNTIME_QUARANTINE_ROOT):
+        raise ToolError(
+            f"profile {PROFILE_PRE_RUNTIME_SCRATCH} requires quarantine root "
+            f"{PRE_RUNTIME_QUARANTINE_ROOT}"
+        )
+
+    free_before = measure_free(data_root)
+    final, man_path, man = load_and_validate_existing_manifest(
+        source=source,
+        run_id=run_id,
+        quarantine_root=quarantine_root,
+        profile=profile,
+    )
+    source = resolve_source(source, tmp_root)
+    payload = os.path.join(final, "payload")
+    tomb = os.path.join(tmp_root, f".legacy-tmp-tombstone-{run_id}")
+    if os.path.lexists(tomb):
+        raise ToolError(f"refusing reused or existing tombstone path: {tomb}")
+
+    # Independent payload verification under a fresh 60s bound. Never mutate quarantine.
+    verify_payload_against_manifest(
+        payload, man, time.monotonic() + INVENTORY_TIMEOUT_S
+    )
+
+    # Current source must still match durable inventory/identity/size exactly.
+    src_state = verify_source_matches_manifest(source, man)
+    inv_fp = src_state["inventory_fingerprint"]
+    ident = src_state["identity"]
+    size_bytes = src_state["size_bytes"]
+
+    def classify_once() -> dict[str, Any]:
+        started = now_fn()
+        return classify_source(
+            source=source,
+            tmp_root=tmp_root,
+            census_path=census_path,
+            proc_root=proc_root,
+            runner=runner,
+            now_fn=now_fn,
+            wait_s=wait_s,
+            poll_s=poll_s,
+            started_at=started,
+            data_root=data_root,
+            profile=profile,
+        )
+
+    def require_matching_probe(classified: dict[str, Any], label: str) -> str:
+        if classified.get("classification") != "eligible":
+            raise ToolError(
+                f"{label} probe not eligible: "
+                f"{classified.get('classification')}: "
+                f"{','.join(classified.get('reasons') or [])}"
+            )
+        token = classified.get("candidate_token")
+        if token != candidate_token:
+            raise ToolError(f"{label} candidate token mismatch")
+        prot_fp = classified.get("protection_fingerprint")
+        if not isinstance(prot_fp, str) or not prot_fp:
+            raise ToolError(f"{label} protection_fingerprint empty or missing")
+        if classified.get("profile") != profile:
+            raise ToolError(f"{label} profile mismatch")
+        src_info = classified.get("source") if isinstance(classified.get("source"), dict) else {}
+        if norm(str(src_info.get("path") or "")) != norm(source):
+            raise ToolError(f"{label} source path mismatch")
+        if src_info.get("recognized_producer") != PRE_RUNTIME_PRODUCER:
+            raise ToolError(f"{label} producer mismatch")
+        if classified.get("inventory_fingerprint") != inv_fp:
+            raise ToolError(f"{label} inventory_fingerprint mismatch")
+        probe_ident = classified.get("_identity")
+        if not isinstance(probe_ident, dict) or not identities_match(probe_ident, ident):
+            raise ToolError(f"{label} source identity mismatch")
+        return prot_fp
+
+    # Two sequential full classify_source probes; each gets its own started_at.
+    c1 = classify_once()
+    prot1 = require_matching_probe(c1, "first")
+    c2 = classify_once()
+    prot2 = require_matching_probe(c2, "second")
+    if prot1 != prot2:
+        raise ToolError("protection_fingerprint mismatch between probes")
+
+    # Immediate pre-rename reverify of recovery, source, token binding, no tombstone.
+    verify_payload_against_manifest(
+        payload, man, time.monotonic() + INVENTORY_TIMEOUT_S
+    )
+    src_state2 = verify_source_matches_manifest(source, man)
+    if src_state2["inventory_fingerprint"] != inv_fp:
+        raise ToolError("source inventory changed before rename")
+    if not identities_match(src_state2["identity"], ident):
+        raise ToolError("source identity changed before rename")
+    if src_state2["size_bytes"] != size_bytes:
+        raise ToolError("source size changed before rename")
+    if candidate_token != c2.get("candidate_token"):
+        raise ToolError("candidate token mismatch before rename")
+    if os.path.lexists(tomb):
+        raise ToolError(f"tombstone path appeared before rename: {tomb}")
+    ensure_no_symlink_components(tomb, "tombstone")
+    try:
+        if not identities_match(ident, identity_from_lstat(source)):
+            raise ToolError("source root identity changed before tombstone rename")
+    except OSError as exc:
+        raise ToolError(f"source unreadable before tombstone: {exc}") from exc
+
+    try:
+        os.rename(source, tomb)
+    except OSError as exc:
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_source_preserved",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=None,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=f"atomic source tombstone rename failed: {exc}",
+            reasons=["tombstone_rename_failed"],
+        )
+
+    def pending(msg: str, reasons: list[str] | None = None) -> dict[str, Any]:
+        free_after = measure_free(data_root)
+        return post_copy_status(
+            status="quarantined_pending_removal",
+            run_id=run_id,
+            source_path=source,
+            quarantine_path=final,
+            tombstone_path=tomb,
+            size_bytes=size_bytes,
+            free_before=free_before,
+            free_after=free_after,
+            error=msg,
+            reasons=reasons,
+        )
+
+    try:
+        t_st = os.lstat(tomb)
+    except OSError as exc:
+        return pending(f"tombstone missing after rename: {exc}", ["tombstone_missing"])
+    if t_st.st_ino != ident["ino"] or t_st.st_dev != ident["dev"] or stat.S_ISLNK(t_st.st_mode):
+        return pending(
+            "tombstone root identity mismatch after rename",
+            ["tombstone_identity_mismatch"],
+        )
+
+    try:
+        tomb_records, tomb_errs = dual_inventory(tomb)
+    except Exception as exc:  # noqa: BLE001 — never pretend success
+        return pending(f"tombstone inventory failed: {exc}", ["tombstone_inventory_failed"])
+    if tomb_errs:
+        return pending(
+            f"tombstone inventory errors: {','.join(sorted(set(tomb_errs)))}",
+            sorted(set(tomb_errs)),
+        )
+    if inventory_fingerprint(tomb_records) != inv_fp:
+        return pending(
+            "tombstone inventory fingerprint mismatch",
+            ["tombstone_fingerprint_mismatch"],
+        )
+    try:
+        tomb_ident = identity_from_lstat(tomb)
+    except OSError as exc:
+        return pending(f"tombstone unreadable before delete: {exc}", ["tombstone_unreadable"])
+    if tomb_ident.get("dev") != ident["dev"] or tomb_ident.get("ino") != ident["ino"]:
+        return pending(
+            "tombstone root dev/ino mismatch before delete",
+            ["tombstone_identity_mismatch"],
+        )
+
+    try:
+        remove_tree_nofollow(tomb, t_st)
+    except Exception as exc:  # noqa: BLE001 — durable copy remains recovery authority
+        return pending(str(exc), ["tombstone_delete_failed"])
+
+    free_after = measure_free(data_root)
+    return post_copy_status(
+        status="finalized_existing",
+        run_id=run_id,
+        source_path=source,
+        quarantine_path=final,
+        tombstone_path=None,
+        size_bytes=size_bytes,
+        free_before=free_before,
+        free_after=free_after,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Probe or quarantine exactly one legacy /tmp producer candidate."
@@ -1308,6 +1691,16 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--source", required=True)
     q.add_argument("--candidate-token", required=True)
     q.add_argument("--run-id", required=True)
+    fe = sub.add_parser(
+        "finalize-existing",
+        help=(
+            "Finalize source removal for a previously published "
+            "pre-runtime-scratch-layout quarantine copy (no new copy)."
+        ),
+    )
+    fe.add_argument("--source", required=True)
+    fe.add_argument("--candidate-token", required=True)
+    fe.add_argument("--run-id", required=True)
     return p
 
 
@@ -1316,11 +1709,15 @@ def main(argv: list[str] | None = None) -> int:
     runner = default_paseo_runner(args.paseo_bin)
     now_fn = lambda: datetime.now(timezone.utc)
     try:
+        if args.command == "finalize-existing" and args.profile != PROFILE_PRE_RUNTIME_SCRATCH:
+            raise ToolError(
+                f"finalize-existing requires --profile {PROFILE_PRE_RUNTIME_SCRATCH}"
+            )
         tmp_root, quarantine_root = resolve_profile_roots(
             args.profile,
             args.tmp_root,
             args.quarantine_root,
-            require_quarantine=(args.command == "quarantine"),
+            require_quarantine=(args.command in ("quarantine", "finalize-existing")),
         )
         if args.command == "probe":
             result = run_probe(
@@ -1337,6 +1734,22 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "quarantine":
             result = run_quarantine(
+                source=args.source,
+                candidate_token=args.candidate_token,
+                run_id=args.run_id,
+                tmp_root=tmp_root,
+                quarantine_root=quarantine_root,
+                census_path=args.census_path,
+                proc_root=args.proc_root,
+                runner=runner,
+                now_fn=now_fn,
+                wait_s=args.wait_seconds,
+                poll_s=args.poll_seconds,
+                data_root=args.data_root,
+                profile=args.profile,
+            )
+        elif args.command == "finalize-existing":
+            result = run_finalize_existing(
                 source=args.source,
                 candidate_token=args.candidate_token,
                 run_id=args.run_id,

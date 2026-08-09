@@ -1181,7 +1181,7 @@ class InjectedFailureCleanupTests(unittest.TestCase):
             dest.write_bytes(b"previous\n")
             good_sha = hashlib.sha256(b"good\n").hexdigest()
             user = os.environ.get("USER") or "user"
-            # Inject failure by making fsync fail via a python wrapper on PATH? 
+            # Inject failure by making fsync fail via a python wrapper on PATH?
             # Simpler: wrong owner expectation after copy — use expect_user that cannot match.
             script = _source_helpers_prefix() + textwrap.dedent(
                 f"""\

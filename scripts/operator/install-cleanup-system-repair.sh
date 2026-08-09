@@ -22,7 +22,7 @@ readonly EXPECTED_HELPER_SHA=6241954df045e75cbd669d3136718b83395fb9a71f218bd5888
 readonly EXPECTED_DOC_SHA=e88df8a832fd4d514b96885c8ee607744751aed9c9fb6bde5453d23da1a57a7c
 readonly EXPECTED_WORKTREE_PROBE_SHA=d2173ef4183e62d906b42a06f9ea3cff02f0081bcbcf9255fba764c66f281aa7
 readonly EXPECTED_AGENT_SCRATCH_SHA=814facdbabce625f8c905fdb148cd2d29686f159037aad947806efa7ec22910d
-readonly EXPECTED_LEGACY_TMP_SHA=7dbb2efec2cb95675680591bf0d58a762ed350e6f0fd720db5e18d45215ebe45
+readonly EXPECTED_LEGACY_TMP_SHA=4fc6873e0778f8a70f4169f40ff52d158548ee1888ea9a06b7781cbd82bf48bf
 readonly EXPECTED_WORKTREE_POLICY_SHA=be850445170660520aee687d7c1891196316d5f9e8da836631601ec2b9586e6c
 readonly EXPECTED_SCRATCH_POLICY_SHA=a5b16e918dbf33336b7139ad07b648a10d1f0f42d958cb8c4397156e93b1e51d
 readonly EXPECTED_WAKE_TXT_SHA=93580f3e80d671ce6f8eac974927eab1cccb5b50af198bdf141d88f0d259b48c
@@ -167,7 +167,8 @@ PY
 }
 
 # Atomically install reviewed src → dest with mode; owner must end as expect_user:expect_user.
-# Same-directory temp + fsync + rename + parent fsync. Cleans exact temp on failure.
+# Same-directory temp + pre-publish temp hash + fsync + rename + parent fsync.
+# Cleans exact temp on failure; never renames when temp bytes != expected_sha.
 # Args: src dest mode expected_sha [expect_user]
 atomic_install_user_file() {
   local src=$1
@@ -200,6 +201,14 @@ atomic_install_user_file() {
   owner_mode=$(stat -c '%U:%G:%a' -- "$tmp")
   [[ "$owner_mode" == "${expect_user}:${expect_user}:${mode}" ]] ||
     _atomic_die "temp owner/mode mismatch for $dest: got $owner_mode want ${expect_user}:${expect_user}:${mode}"
+
+  # Hash the completed temp before fsync/rename so a source change during/after
+  # the preflight source hash cannot publish wrong bytes over the live target.
+  [[ -f "$tmp" && ! -L "$tmp" ]] ||
+    _atomic_die "temp is not a regular file before publish for $dest"
+  actual=$(file_sha256 "$tmp")
+  [[ "$actual" == "$expected_sha" ]] ||
+    _atomic_die "pre-publish temp sha mismatch for $dest: got $actual want $expected_sha"
 
   fsync_file_and_parent "$tmp" || _atomic_die "fsync temp failed for $dest"
   if ! mv -f -- "$tmp" "$dest"; then

@@ -327,6 +327,62 @@ class AtomicInstallTests(unittest.TestCase):
             self.assertTrue(dest.is_symlink())
             self.assertEqual(real.read_bytes(), b"other\n")
 
+    def test_atomic_install_source_change_during_copy_refuses_before_rename(self) -> None:
+        """Wrong bytes at copy time must fail on temp hash before rename.
+
+        Simulates a post-preflight source substitution by injecting a PATH ``cp``
+        that writes tampered payload into the staging temp. Pre-publish temp
+        SHA must refuse; prior live destination bytes/mode must remain exact;
+        installer-owned temps must be cleaned.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+            fake_cp = bin_dir / "cp"
+            # Substitute tampered bytes into the copy destination (last arg).
+            fake_cp.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    dest="${@: -1}"
+                    printf 'TAMPERED-DURING-COPY\\n' >"$dest"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_cp.chmod(0o755)
+
+            src = base / "src.py"
+            dest = base / "dest.py"
+            good = b"reviewed-good-bytes\n"
+            prior = b"prior-live-destination-bytes\n"
+            src.write_bytes(good)
+            dest.write_bytes(prior)
+            dest.chmod(0o644)
+            prior_mode = stat.S_IMODE(dest.stat().st_mode)
+            digest = hashlib.sha256(good).hexdigest()
+            tampered_sha = hashlib.sha256(b"TAMPERED-DURING-COPY\n").hexdigest()
+            self.assertNotEqual(digest, tampered_sha)
+            user = os.environ.get("USER") or "user"
+            path_env = f"{bin_dir.as_posix()}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+            script = _source_helpers_prefix() + textwrap.dedent(
+                f"""\
+                atomic_install_user_file {src.as_posix()!r} {dest.as_posix()!r} 755 {digest!r} {user!r}
+                """
+            )
+            proc = _bash(script, env={"PATH": path_env})
+            self.assertNotEqual(proc.returncode, 0)
+            err = proc.stderr + proc.stdout
+            self.assertIn("pre-publish temp sha mismatch", err)
+            # Must not have published tampered bytes; prior destination intact.
+            self.assertEqual(dest.read_bytes(), prior)
+            self.assertEqual(stat.S_IMODE(dest.stat().st_mode), prior_mode)
+            self.assertNotEqual(dest.read_bytes(), b"TAMPERED-DURING-COPY\n")
+            leftovers = list(base.glob(".dest.py.tmp.*"))
+            self.assertEqual(leftovers, [])
+
 
 class BackupInventoryTests(unittest.TestCase):
     def test_backup_preserves_preinstall_and_inventory(self) -> None:

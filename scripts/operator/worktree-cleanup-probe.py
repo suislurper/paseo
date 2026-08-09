@@ -610,6 +610,30 @@ def size_bytes(path: str) -> tuple[int | None, str | None]:
     return int(first), None
 
 
+def candidate_size_summary(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive size totals only from already-measured candidate size_bytes fields.
+
+    No filesystem walks. bytes is the integer sum only when every candidate size is
+    known; otherwise null. Never reports 0 for unknown sizes.
+    """
+    known = 0
+    unknown = 0
+    total = 0
+    for item in candidates:
+        measured = item.get("size_bytes")
+        if measured is None:
+            unknown += 1
+        else:
+            known += 1
+            total += int(measured)
+    return {
+        "candidate_count": len(candidates),
+        "known_count": known,
+        "unknown_count": unknown,
+        "bytes": total if unknown == 0 else None,
+    }
+
+
 IGNORED_STATUS_ARGV = [
     "git",
     "status",
@@ -857,6 +881,12 @@ def run_probe(
             "boot_id": None,
         },
         "worktrees": [],
+        "size_summary": {
+            "candidate_count": 0,
+            "known_count": 0,
+            "unknown_count": 0,
+            "bytes": 0,
+        },
     }
     try:
         output["disks"] = [disk_free(repo_n), disk_free(managed_n)]
@@ -913,6 +943,7 @@ def run_probe(
         output["complete"] = True
     except (ProbeError, OSError, ValueError, ToolError) as exc:
         output["fatal_errors"].append(str(exc))
+    output["size_summary"] = candidate_size_summary(output["worktrees"])
     return output
 
 

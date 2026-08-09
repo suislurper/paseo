@@ -592,7 +592,171 @@ class Tests(unittest.TestCase):
             return real_ds(path, deadline)
 
         with mock.patch.object(M, "dir_size_capped", side_effect=fake_ds):
-            self.assertIn("size_walk_timeout", self.cand()["reasons"])
+            c = self.cand()
+            self.assertIn("size_walk_timeout", c["reasons"])
+            self.assertIsNone(c["size_bytes"])
+
+    def test_size_summary_sums_known_candidate_sizes(self) -> None:
+        self.h.put_scratch(A, body=b"aaaa")
+        self.h.put_scratch(B, body=b"bbbbbb")
+        self.h.mark_archived(A)
+        self.h.mark_archived(B)
+        self.h.write_census()
+        probe = self.h.probe()
+        summary = probe["size_summary"]
+        sizes = [c["size_bytes"] for c in probe["candidates"]]
+        self.assertTrue(all(isinstance(s, int) for s in sizes), sizes)
+        self.assertEqual(summary["candidate_count"], 2)
+        self.assertEqual(summary["known_count"], 2)
+        self.assertEqual(summary["unknown_count"], 0)
+        self.assertEqual(summary["bytes"], sum(sizes))
+        # Pure derivation from measured fields — no extra sizing walk.
+        summary2 = M.candidate_size_summary(probe["candidates"])
+        self.assertEqual(summary2, summary)
+
+    def test_size_summary_null_when_any_unknown(self) -> None:
+        self.h.put_scratch(A)
+        self.h.put_scratch(B)
+        self.h.mark_archived(A)
+        self.h.mark_archived(B)
+        self.h.write_census()
+        real_ds = M.dir_size_capped
+
+        def fake_ds(path: str, deadline: float) -> tuple[int | None, str | None]:
+            if path.rstrip("/").endswith(f"/scratch/{A}"):
+                return None, "size_walk_timeout"
+            return real_ds(path, deadline)
+
+        with mock.patch.object(M, "dir_size_capped", side_effect=fake_ds):
+            probe = self.h.probe()
+        summary = probe["size_summary"]
+        by_id = {c["agent_id"]: c for c in probe["candidates"]}
+        self.assertIsNone(by_id[A]["size_bytes"])
+        self.assertIsInstance(by_id[B]["size_bytes"], int)
+        self.assertEqual(summary["candidate_count"], 2)
+        self.assertEqual(summary["known_count"], 1)
+        self.assertEqual(summary["unknown_count"], 1)
+        self.assertIsNone(summary["bytes"])
+        self.assertNotEqual(summary["bytes"], 0)
+
+    def test_size_summary_no_extra_sizing_calls(self) -> None:
+        walk_calls: list[str] = []
+
+        def forbidden(path: str, deadline: float) -> tuple[int | None, str | None]:
+            walk_calls.append(path)
+            return 1, None
+
+        with mock.patch.object(M, "dir_size_capped", side_effect=forbidden):
+            summary = M.candidate_size_summary(
+                [{"size_bytes": 10}, {"size_bytes": None}, {"size_bytes": 5}]
+            )
+        self.assertEqual(walk_calls, [])
+        self.assertEqual(summary["known_count"], 2)
+        self.assertEqual(summary["unknown_count"], 1)
+        self.assertIsNone(summary["bytes"])
+
+    def test_active_manifest_under_global_blocker_retains_metadata(self) -> None:
+        self.h.put_scratch(lifecycle="active")
+        self.h.mark_archived()
+        # Global schedule gate blocks eligibility for every candidate.
+        self.h.paseo.schedules.append(
+            {"id": "s-new", "status": "active", "target": "new-agent:claude"}
+        )
+        self.h.paseo.schedule_identity["s-new"] = {
+            "id": "s-new",
+            "cadence": {"type": "every", "everyMs": 60_000},
+            "target": {"type": "new-agent", "config": {"provider": "claude"}},
+            "status": "active",
+            "expiresAt": None,
+        }
+        self.h.write_census()
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("active_new_agent_schedule", c["reasons"])
+        self.assertNotEqual(c["classification"], "eligible")
+        self.assertEqual(c["generation"], G)
+        self.assertEqual(c["manifest_lifecycle"], "active")
+        self.assertEqual(c["owner_state"], "archived_or_closed")
+        self.assertIsInstance(c["size_bytes"], int)
+        self.assertGreaterEqual(c["size_bytes"], 1)
+
+    def test_malformed_manifest_fail_closed_with_safe_metadata(self) -> None:
+        sdir = self.h.runtime / "scratch" / A
+        sdir.mkdir(parents=True)
+        # Structurally readable but fail-closed for eligibility (wrong schema).
+        wjson(
+            sdir / "manifest.json",
+            {
+                "schemaVersion": 99,
+                "agentId": A,
+                "generation": G,
+                "lifecycle": "active",
+                "createdAt": iso(self.h.now),
+            },
+        )
+        wfile(sdir / "tmp.dat", b"x")
+        self.h.mark_archived()
+        self.h.write_census()
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertIn("manifest_schema", c["reasons"])
+        self.assertEqual(c["generation"], G)
+        self.assertEqual(c["manifest_lifecycle"], "active")
+        self.assertEqual(c["owner_state"], "archived_or_closed")
+        self.assertIsInstance(c["size_bytes"], int)
+
+    def test_inventory_incomplete_still_measures_candidate_metadata(self) -> None:
+        self.h.put_scratch(lifecycle="active")
+        self.h.mark_archived()
+        self.h.write_census()
+        junk = self.h.runtime / "scratch" / "not-a-uuid"
+        junk.mkdir()
+        wfile(junk / "x", b"1")
+        c = self.cand()
+        self.assertEqual(c["classification"], "blocked")
+        self.assertTrue(any("unknown_scratch_entry" in r for r in c["reasons"]))
+        self.assertEqual(c["generation"], G)
+        self.assertEqual(c["manifest_lifecycle"], "active")
+        self.assertEqual(c["owner_state"], "archived_or_closed")
+        self.assertIsInstance(c["size_bytes"], int)
+
+    def test_per_candidate_size_deadlines_are_independent(self) -> None:
+        self.h.put_scratch(A)
+        self.h.put_scratch(B)
+        self.h.mark_archived(A)
+        self.h.mark_archived(B)
+        self.h.write_census()
+
+        mono = {"t": 1000.0}
+        deadlines: list[float] = []
+        real_ds = M.dir_size_capped
+
+        def fake_mono() -> float:
+            return mono["t"]
+
+        def fake_ds(path: str, deadline: float) -> tuple[int | None, str | None]:
+            # Only record UUID scratch candidate walks (not report aggregates).
+            if f"/scratch/{A}" in path or path.rstrip("/").endswith(f"/scratch/{A}"):
+                deadlines.append(deadline)
+                mono["t"] += 30.0  # consume budget without affecting next candidate start
+                return None, "size_walk_timeout"
+            if f"/scratch/{B}" in path or path.rstrip("/").endswith(f"/scratch/{B}"):
+                deadlines.append(deadline)
+                return real_ds(path, deadline)
+            return real_ds(path, deadline)
+
+        with mock.patch.object(M.time, "monotonic", side_effect=fake_mono), mock.patch.object(
+            M, "dir_size_capped", side_effect=fake_ds
+        ):
+            probe = self.h.probe()
+        self.assertEqual(len(deadlines), 2, deadlines)
+        # Each candidate starts its own SIZE_WALK_TIMEOUT_S window from call-time mono.
+        self.assertEqual(deadlines[0], 1000.0 + M.SIZE_WALK_TIMEOUT_S)
+        self.assertEqual(deadlines[1], 1030.0 + M.SIZE_WALK_TIMEOUT_S)
+        by_id = {c["agent_id"]: c for c in probe["candidates"]}
+        self.assertIsNone(by_id[A]["size_bytes"])
+        self.assertIsInstance(by_id[B]["size_bytes"], int)
+        self.assertIsNone(probe["size_summary"]["bytes"])
 
     def test_aggregate_timeout_unknown_not_zero(self) -> None:
         self.h.eligible_setup()

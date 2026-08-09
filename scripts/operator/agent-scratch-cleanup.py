@@ -259,6 +259,30 @@ def report_aggregate(runtime_root: str, name: str, deadline: float) -> dict[str,
     return {"bytes": int(size or 0), "status": "ok", "error": None}
 
 
+def candidate_size_summary(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive size totals only from already-measured candidate size_bytes fields.
+
+    No filesystem walks. bytes is the integer sum only when every candidate size is
+    known; otherwise null. Never reports 0 for unknown sizes.
+    """
+    known = 0
+    unknown = 0
+    total = 0
+    for item in candidates:
+        measured = item.get("size_bytes")
+        if measured is None:
+            unknown += 1
+        else:
+            known += 1
+            total += int(measured)
+    return {
+        "candidate_count": len(candidates),
+        "known_count": known,
+        "unknown_count": unknown,
+        "bytes": total if unknown == 0 else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------
@@ -267,6 +291,44 @@ def report_aggregate(runtime_root: str, name: str, deadline: float) -> dict[str,
 def read_json_file(path: str) -> Any:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def soft_manifest_fields(scratch_dir: str) -> dict[str, Any]:
+    """Best-effort generation/lifecycle/releasedAt from a structurally readable manifest.
+
+    Safe for review metadata only. Does not authorize release or eligibility.
+    """
+    fields: dict[str, Any] = {}
+    if os.path.islink(scratch_dir) or not os.path.isdir(scratch_dir):
+        return fields
+    man_path = os.path.join(scratch_dir, MANIFEST_NAME)
+    if not os.path.lexists(man_path) or os.path.islink(man_path):
+        return fields
+    try:
+        raw = read_json_file(man_path)
+    except (OSError, json.JSONDecodeError):
+        return fields
+    if not isinstance(raw, dict):
+        return fields
+    gen = raw.get("generation")
+    if isinstance(gen, str) and is_uuid(gen):
+        fields["generation"] = gen
+    life = raw.get("lifecycle")
+    if isinstance(life, str) and life:
+        fields["manifest_lifecycle"] = life
+    released_at = raw.get("releasedAt")
+    if isinstance(released_at, str) and released_at.strip():
+        fields["released_at"] = released_at
+    return fields
+
+
+def apply_soft_manifest_fields(out: dict[str, Any], fields: dict[str, Any]) -> None:
+    if "generation" in fields:
+        out["generation"] = fields["generation"]
+    if "manifest_lifecycle" in fields:
+        out["manifest_lifecycle"] = fields["manifest_lifecycle"]
+    if "released_at" in fields:
+        out["released_at"] = fields["released_at"]
 
 
 def classify_manifest(
@@ -310,6 +372,27 @@ def classify_manifest(
     if (now - rel_dt).total_seconds() < RELEASE_GRACE_S:
         return "protected", ["release_grace"], raw
     return "ok", [], raw
+
+
+def resolve_owner_state(
+    runner: Callable[[list[str]], tuple[int, str, str]], agent_id: str
+) -> tuple[str, list[str]]:
+    """Normalize Paseo owner inspect evidence to a small deterministic set.
+
+    Does not reinterpret archive/close as scratch release.
+    Returns (owner_state, gate_reasons_for_active_or_failure).
+    """
+    try:
+        info = inspect_agent(runner, agent_id)
+    except ToolError as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "exit" in msg:
+            return "unknown", ["agent_unknown"]
+        return "inspect_failed", ["agent_inspect_failed"]
+    ok_arch, arch_reasons = agent_is_archived_or_closed(info)
+    if ok_arch:
+        return "archived_or_closed", []
+    return "active", arch_reasons or ["agent_not_archived_or_closed"]
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1549,6 @@ def classify_candidate(
     process_ok: bool,
     process_reasons: list[str],
     by_pid: dict[int, dict[str, Any]],
-    size_deadline: float,
     holding_lock_for: str | None = None,
     inventory_incomplete: bool = False,
     inventory_reasons: list[str] | None = None,
@@ -1479,12 +1561,39 @@ def classify_candidate(
         "reasons": [],
         "size_bytes": None,
         "generation": None,
+        "manifest_lifecycle": None,
+        "owner_state": "unknown",
         "released_at": None,
         "candidate_token": None,
         "inventory_fingerprint": None,
     }
     reasons: list[str] = []
 
+    # Always collect safe review metadata before global-gate returns.
+    apply_soft_manifest_fields(out, soft_manifest_fields(scratch_dir))
+    hint, man_reasons, manifest = classify_manifest(scratch_dir, agent_id, now)
+    if manifest is not None:
+        gen = manifest.get("generation")
+        if isinstance(gen, str) and is_uuid(gen):
+            out["generation"] = gen
+        life = manifest.get("lifecycle")
+        if isinstance(life, str) and life:
+            out["manifest_lifecycle"] = life
+        released_at = manifest.get("releasedAt")
+        if isinstance(released_at, str) and released_at.strip():
+            out["released_at"] = released_at
+
+    # Fresh per-candidate size budget — a slow/timeout peer cannot consume this one.
+    size_deadline = time.monotonic() + SIZE_WALK_TIMEOUT_S
+    size, size_err = dir_size_capped(scratch_dir, size_deadline)
+    if size_err is None:
+        out["size_bytes"] = size
+    # size_err leaves size_bytes None (never report 0 for unknown).
+
+    owner_state, owner_gate_reasons = resolve_owner_state(runner, agent_id)
+    out["owner_state"] = owner_state
+
+    # Global gates: still blocked/not eligible, but metadata is retained above.
     if inventory_incomplete:
         reasons.extend(inventory_reasons or ["scratch_inventory_incomplete"])
         out["reasons"] = reasons
@@ -1495,15 +1604,12 @@ def classify_candidate(
         out["reasons"] = reasons
         return out
 
-    hint, man_reasons, manifest = classify_manifest(scratch_dir, agent_id, now)
     reasons.extend(man_reasons)
 
-    size, size_err = dir_size_capped(scratch_dir, size_deadline)
     if size_err:
         reasons.append(size_err)
         out["reasons"] = reasons
         return out
-    out["size_bytes"] = size
 
     if holding_lock_for != agent_id:
         held, lock_reason = lock_present(runtime_root, agent_id)
@@ -1513,20 +1619,16 @@ def classify_candidate(
             out["classification"] = "protected"
             return out
 
-    try:
-        info = inspect_agent(runner, agent_id)
-    except ToolError as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "exit" in msg:
-            reasons.append("agent_unknown")
-        else:
-            reasons.append("agent_inspect_failed")
+    if owner_state == "unknown":
+        reasons.append("agent_unknown")
         out["reasons"] = reasons
         return out
-
-    ok_arch, arch_reasons = agent_is_archived_or_closed(info)
-    if not ok_arch:
-        reasons.extend(arch_reasons)
+    if owner_state == "inspect_failed":
+        reasons.append("agent_inspect_failed")
+        out["reasons"] = reasons
+        return out
+    if owner_state == "active":
+        reasons.extend(owner_gate_reasons or ["agent_not_archived_or_closed"])
         out["reasons"] = reasons
         out["classification"] = "protected"
         return out
@@ -1578,9 +1680,6 @@ def classify_candidate(
     if hint != "ok" or manifest is None:
         out["reasons"] = reasons or man_reasons or ["manifest_blocked"]
         out["classification"] = "blocked" if hint == "blocked" else "protected"
-        if manifest:
-            out["generation"] = manifest.get("generation")
-            out["released_at"] = manifest.get("releasedAt")
         return out
 
     inv_deadline = time.monotonic() + INVENTORY_TIMEOUT_S
@@ -1631,15 +1730,17 @@ def run_probe(
         p = os.path.join(runtime_root, name)
         if os.path.lexists(p):
             ensure_no_symlink_components(p, name)
-    size_deadline = time.monotonic() + SIZE_WALK_TIMEOUT_S
+    # Report-only aggregates keep a shared wake budget; UUID candidates get
+    # independent per-candidate size deadlines inside classify_candidate.
+    report_deadline = time.monotonic() + SIZE_WALK_TIMEOUT_S
 
     free = {
         "root": free_bytes("/"),
         "runtime_root": free_bytes(runtime_root),
     }
     report = {
-        "artifacts": report_aggregate(runtime_root, "artifacts", size_deadline),
-        "quarantine": report_aggregate(runtime_root, "quarantine", size_deadline),
+        "artifacts": report_aggregate(runtime_root, "artifacts", report_deadline),
+        "quarantine": report_aggregate(runtime_root, "quarantine", report_deadline),
     }
     report_blockers: list[str] = []
     for key, agg in report.items():
@@ -1709,7 +1810,6 @@ def run_probe(
                 process_ok=process_ok,
                 process_reasons=process_reasons,
                 by_pid=by_pid,
-                size_deadline=size_deadline,
                 holding_lock_for=holding_lock_for,
                 inventory_incomplete=inventory_incomplete,
                 inventory_reasons=inventory_reasons,
@@ -1741,6 +1841,7 @@ def run_probe(
             "boot_id": None if snap is None else snap.get("boot_id"),
         },
         "candidates": candidates,
+        "size_summary": candidate_size_summary(candidates),
     }
 
 

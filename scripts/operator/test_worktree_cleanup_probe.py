@@ -710,6 +710,55 @@ class InspectAndSourceTests(unittest.TestCase):
         self.assertFalse(any(b.startswith("process-census-incomplete") for b in result["blockers"]))
         self.assertFalse(any(b.startswith("processes:") for b in result["blockers"]))
 
+    def test_size_summary_sums_known_candidate_sizes(self) -> None:
+        summary = M.candidate_size_summary(
+            [
+                {"size_bytes": 100},
+                {"size_bytes": 250},
+                {"size_bytes": 0},
+            ]
+        )
+        self.assertEqual(
+            summary,
+            {
+                "candidate_count": 3,
+                "known_count": 3,
+                "unknown_count": 0,
+                "bytes": 350,
+            },
+        )
+
+    def test_size_summary_null_bytes_when_any_unknown(self) -> None:
+        summary = M.candidate_size_summary(
+            [
+                {"size_bytes": 100},
+                {"size_bytes": None, "size_error": "timeout:du:60s"},
+                {"size_bytes": 50},
+            ]
+        )
+        self.assertEqual(summary["candidate_count"], 3)
+        self.assertEqual(summary["known_count"], 2)
+        self.assertEqual(summary["unknown_count"], 1)
+        self.assertIsNone(summary["bytes"])
+        # Never report 0 for unknown aggregate.
+        self.assertNotEqual(summary["bytes"], 0)
+
+    def test_size_summary_uses_measured_fields_only(self) -> None:
+        walk_calls: list[str] = []
+
+        def forbidden_size(path: str) -> tuple[int | None, str | None]:
+            walk_calls.append(path)
+            return 1, None
+
+        with mock.patch.object(M, "size_bytes", side_effect=forbidden_size):
+            summary = M.candidate_size_summary(
+                [{"size_bytes": 10}, {"size_bytes": 20}, {"size_bytes": None}]
+            )
+        self.assertEqual(walk_calls, [])
+        self.assertEqual(summary["known_count"], 2)
+        self.assertEqual(summary["unknown_count"], 1)
+        self.assertIsNone(summary["bytes"])
+
     def test_ignored_command_and_du_timeout_in_source(self) -> None:
         src = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('--ignored=matching', src)

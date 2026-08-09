@@ -209,7 +209,13 @@ class H:
         if not any(x.get("id") == agent_id for x in self.paseo.unarchived):
             self.paseo.unarchived.append({"id": agent_id, "status": "running"})
 
-    def probe(self, source: Path | str, started_offset: float = -1.0) -> dict[str, Any]:
+    def probe(
+        self,
+        source: Path | str,
+        started_offset: float = -1.0,
+        *,
+        profile: str = M.DEFAULT_PROFILE,
+    ) -> dict[str, Any]:
         return M.run_probe(
             source=str(source),
             tmp_root=str(self.tmp_root),
@@ -221,9 +227,15 @@ class H:
             poll_s=0.01,
             started_at=self.now + timedelta(seconds=started_offset),
             data_root=str(self.data_root),
+            profile=profile,
         )
 
-    def classify(self, source: Path | str) -> dict[str, Any]:
+    def classify(
+        self,
+        source: Path | str,
+        *,
+        profile: str = M.DEFAULT_PROFILE,
+    ) -> dict[str, Any]:
         return M.classify_source(
             source=str(source),
             tmp_root=str(self.tmp_root),
@@ -235,6 +247,7 @@ class H:
             poll_s=0.01,
             started_at=self.now - timedelta(seconds=1),
             data_root=str(self.data_root),
+            profile=profile,
         )
 
     def quarantine(
@@ -243,6 +256,8 @@ class H:
         token: str,
         run_id: str = RUN,
         now_shift: float = 5.0,
+        *,
+        profile: str = M.DEFAULT_PROFILE,
     ) -> dict[str, Any]:
         # Fresh post-start census for second complete proof.
         self.write_census(captured_at=iso(self.now + timedelta(seconds=now_shift + 1)))
@@ -259,6 +274,7 @@ class H:
             wait_s=0.0,
             poll_s=0.01,
             data_root=str(self.data_root),
+            profile=profile,
         )
 
     def eligible(self, name: str = "paseo-legacy-a", **kwargs: Any) -> tuple[Path, dict[str, Any]]:
@@ -266,6 +282,86 @@ class H:
         self.write_census()
         result = self.probe(src)
         return src, result
+
+
+class PreRuntimeH(H):
+    """Fixture for closed pre-runtime-scratch-layout profile (patched exact roots)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scratch = self.root / "mnt" / "data" / "paseo-runtime" / "scratch"
+        self.locks = self.root / "mnt" / "data" / "paseo-runtime" / "locks"
+        self.qroot = (
+            self.root
+            / "mnt"
+            / "data"
+            / "paseo-runtime"
+            / "quarantine"
+            / "pre-runtime-scratch-layout"
+        )
+        self.tmp_root = self.scratch
+        for p in (self.scratch, self.locks, self.qroot):
+            p.mkdir(parents=True, exist_ok=True)
+        self._patches = [
+            mock.patch.object(M, "PRE_RUNTIME_SOURCE_ROOT", str(self.scratch)),
+            mock.patch.object(M, "PRE_RUNTIME_QUARANTINE_ROOT", str(self.qroot)),
+            mock.patch.object(M, "PRE_RUNTIME_LOCK_ROOT", str(self.locks)),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def close(self) -> None:
+        for p in reversed(self._patches):
+            p.stop()
+        super().close()
+
+    def put_candidate(
+        self,
+        name: str = "test-runner",
+        *,
+        body: bytes = b"legacy-payload",
+        as_file: bool = False,
+    ) -> Path:
+        return super().put_candidate(name, body=body, as_file=as_file)
+
+    def probe(self, source: Path | str, started_offset: float = -1.0, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("profile", M.PROFILE_PRE_RUNTIME_SCRATCH)
+        return super().probe(source, started_offset, **kwargs)
+
+    def classify(self, source: Path | str, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("profile", M.PROFILE_PRE_RUNTIME_SCRATCH)
+        return super().classify(source, **kwargs)
+
+    def quarantine(
+        self,
+        source: Path | str,
+        token: str,
+        run_id: str = RUN,
+        now_shift: float = 5.0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        kwargs.setdefault("profile", M.PROFILE_PRE_RUNTIME_SCRATCH)
+        return super().quarantine(source, token, run_id=run_id, now_shift=now_shift, **kwargs)
+
+    def eligible(self, name: str = "test-runner", **kwargs: Any) -> tuple[Path, dict[str, Any]]:
+        src = self.put_candidate(name, **kwargs)
+        self.write_census(roots=[str(self.scratch)])
+        result = self.probe(src)
+        return src, result
+
+    def write_census(
+        self,
+        captured_at: str | None = None,
+        complete: bool = True,
+        roots: list[str] | None = None,
+        processes: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().write_census(
+            captured_at=captured_at,
+            complete=complete,
+            roots=roots if roots is not None else [str(self.scratch)],
+            processes=processes,
+        )
 
 
 class Tests(unittest.TestCase):
@@ -862,6 +958,306 @@ class Tests(unittest.TestCase):
         result = self.h.probe(src)
         self.assertEqual(result["classification"], "blocked")
         self.assertIn("process_new", result["reasons"])
+
+    def test_legacy_profile_lock_not_applicable_and_protection_on_eligible(self) -> None:
+        src, result = self.h.eligible("paseo-prot")
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["profile"], M.PROFILE_LEGACY_TMP)
+        self.assertEqual(result["lock_evidence"]["status"], "not_applicable")
+        self.assertIsNotNone(result["protection_fingerprint"])
+        self.assertIsNotNone(result["protection_evidence"])
+        self.assertEqual(result["protection_evidence"]["lock"]["status"], "not_applicable")
+        self.assertEqual(result["protection_evidence"]["process_references"], [])
+        self.assertEqual(result["protection_evidence"]["paseo_protection_reasons"], [])
+        self.assertEqual(result["protection_evidence"]["boot_id"], BOOT)
+        # Volatile captured_at must not be part of the fingerprint payload.
+        self.assertNotIn("captured_at", result["protection_evidence"])
+        self.assertNotIn("captured_at", result["protection_evidence"]["process_proof"])
+        del src
+
+    def test_dual_inventory_fresh_deadline_per_walk(self) -> None:
+        """Each of the two inventory walks receives a fresh absolute 60s bound."""
+        src = self.h.put_candidate("paseo-deadline")
+        self.h.write_census()
+        deadlines: list[float] = []
+        mono = {"t": 1000.0}
+        real_inv = M.candidate_inventory
+
+        def capture_inv(root: str, deadline: float):
+            deadlines.append(deadline)
+            # Simulate first walk consuming most of a shared budget.
+            if len(deadlines) == 1:
+                mono["t"] = 1050.0
+            return real_inv(root, deadline)
+
+        with mock.patch.object(M.time, "monotonic", side_effect=lambda: mono["t"]):
+            with mock.patch.object(M, "candidate_inventory", side_effect=capture_inv):
+                r1, e1 = M.dual_inventory(str(src))
+        self.assertEqual(e1, [])
+        self.assertTrue(r1)
+        self.assertEqual(len(deadlines), 2)
+        self.assertEqual(deadlines[0], 1000.0 + M.INVENTORY_TIMEOUT_S)
+        # Second walk must not inherit remaining budget from the first.
+        self.assertEqual(deadlines[1], 1050.0 + M.INVENTORY_TIMEOUT_S)
+        self.assertEqual(deadlines[1] - deadlines[0], 50.0)
+
+    def test_protection_fingerprint_stable_across_captured_at(self) -> None:
+        src = self.h.put_candidate("paseo-fp-stable")
+        self.h.write_census(captured_at=iso(self.h.now - timedelta(seconds=2)))
+        r1 = self.h.probe(src, started_offset=-30.0)
+        self.assertEqual(r1["classification"], "eligible", r1)
+        fp1 = r1["protection_fingerprint"]
+        token1 = r1["candidate_token"]
+        # Fresh captured_at, same boot and protections → same protection fingerprint.
+        self.h.write_census(captured_at=iso(self.h.now - timedelta(seconds=10)))
+        r2 = self.h.probe(src, started_offset=-30.0)
+        self.assertEqual(r2["classification"], "eligible", r2)
+        self.assertEqual(r2["protection_fingerprint"], fp1)
+        self.assertEqual(r2["candidate_token"], token1)
+        self.assertNotEqual(r1["process_census"]["captured_at"], r2["process_census"]["captured_at"])
+
+    def test_protection_fingerprint_changes_with_owner(self) -> None:
+        src, r1 = self.h.eligible("paseo-fp-owner")
+        fp1 = r1["protection_fingerprint"]
+        token1 = r1["candidate_token"]
+        # Mutate root owner evidence (mtime) without changing tree inventory content.
+        os.utime(src, ns=(1_000_000_000, 2_000_000_000))
+        self.h.write_census()
+        r2 = self.h.probe(src)
+        self.assertEqual(r2["classification"], "eligible", r2)
+        self.assertNotEqual(r2["owner_evidence"]["mtime_ns"], r1["owner_evidence"]["mtime_ns"])
+        self.assertNotEqual(r2["protection_fingerprint"], fp1)
+        self.assertNotEqual(r2["candidate_token"], token1)
+
+
+class PreRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.h = PreRuntimeH()
+
+    def tearDown(self) -> None:
+        self.h.close()
+
+    def test_accepts_only_exact_basenames(self) -> None:
+        for name in ("test-runner", "verify"):
+            with self.subTest(name=name):
+                h = PreRuntimeH()
+                try:
+                    src, result = h.eligible(name)
+                    self.assertEqual(result["classification"], "eligible", result)
+                    self.assertEqual(result["profile"], M.PROFILE_PRE_RUNTIME_SCRATCH)
+                    self.assertEqual(
+                        result["source"]["recognized_producer"],
+                        M.PRE_RUNTIME_PRODUCER,
+                    )
+                    self.assertEqual(result["lock_evidence"]["status"], "absent")
+                    self.assertTrue(result["protection_fingerprint"])
+                    self.assertEqual(
+                        result["protection_evidence"]["lock"]["status"], "absent"
+                    )
+                    self.assertTrue(src.exists())
+                finally:
+                    h.close()
+
+    def test_rejects_other_basenames_and_generic_tmp(self) -> None:
+        for name in (
+            "build",
+            "package",
+            "review-fix",
+            str(uuid.uuid4()),
+            "paseo-legacy-a",
+            "scratch-other",
+        ):
+            with self.subTest(name=name):
+                src = self.h.put_candidate(name)
+                self.h.write_census()
+                result = self.h.probe(src)
+                self.assertEqual(result["classification"], "unknown", result)
+                self.assertIn("unknown_producer", result["reasons"])
+                self.assertIsNone(result["candidate_token"])
+                self.assertEqual(result["profile"], M.PROFILE_PRE_RUNTIME_SCRATCH)
+                self.assertTrue(src.exists())
+
+        # Generic /tmp path is not a direct child of the closed scratch root.
+        other = self.h.root / "tmp-generic" / "paseo-x"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.mkdir()
+        with self.assertRaises(M.ToolError):
+            self.h.probe(other)
+
+    def test_root_override_fail_closed(self) -> None:
+        src = self.h.put_candidate("test-runner")
+        self.h.write_census()
+        with self.assertRaises(M.ToolError) as ctx:
+            M.run_probe(
+                source=str(src),
+                tmp_root="/tmp",
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.0,
+                poll_s=0.01,
+                started_at=self.h.now - timedelta(seconds=1),
+                data_root=str(self.h.data_root),
+                profile=M.PROFILE_PRE_RUNTIME_SCRATCH,
+            )
+        self.assertIn("requires source root", str(ctx.exception))
+        with self.assertRaises(M.ToolError) as ctx2:
+            M.run_quarantine(
+                source=str(src),
+                candidate_token="x" * 64,
+                run_id=RUN,
+                tmp_root=str(self.h.scratch),
+                quarantine_root="/tmp/not-the-profile-root",
+                census_path=str(self.h.census),
+                proc_root=str(self.h.proc),
+                runner=self.h.paseo,
+                now_fn=lambda: self.h.now,
+                wait_s=0.0,
+                poll_s=0.01,
+                data_root=str(self.h.data_root),
+                profile=M.PROFILE_PRE_RUNTIME_SCRATCH,
+            )
+        self.assertIn("requires quarantine root", str(ctx2.exception))
+        # resolve_profile_roots rejects non-exact CLI overrides.
+        with self.assertRaises(M.ToolError):
+            M.resolve_profile_roots(
+                M.PROFILE_PRE_RUNTIME_SCRATCH, "/tmp", None, require_quarantine=False
+            )
+        with self.assertRaises(M.ToolError):
+            M.resolve_profile_roots(
+                M.PROFILE_PRE_RUNTIME_SCRATCH,
+                None,
+                "/tmp/wrong-q",
+                require_quarantine=True,
+            )
+
+    def test_absent_lock_permits_present_blocks(self) -> None:
+        src, result = self.h.eligible("test-runner")
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["lock_evidence"]["status"], "absent")
+        lock = self.h.locks / "test-runner.lock"
+        cases: list[tuple[str, Any]] = [
+            ("dir", lambda p: p.mkdir()),
+            ("file", lambda p: wfile(p, b"lock")),
+            ("symlink", lambda p: os.symlink("/nonexistent-lock-target", p)),
+            ("special", lambda p: os.mkfifo(p)),
+        ]
+        for entry_type, maker in cases:
+            with self.subTest(entry_type=entry_type):
+                if lock.exists() or lock.is_symlink():
+                    if lock.is_dir() and not lock.is_symlink():
+                        lock.rmdir()
+                    else:
+                        lock.unlink()
+                maker(lock)
+                before = list(lock.parent.iterdir()) if lock.parent.exists() else []
+                self.h.write_census()
+                r = self.h.probe(src)
+                self.assertEqual(r["classification"], "protected", r)
+                self.assertIn("lock_present", r["reasons"])
+                self.assertEqual(r["lock_evidence"]["status"], "present")
+                self.assertEqual(r["lock_evidence"]["entry_type"], entry_type)
+                self.assertIsNone(r["candidate_token"])
+                # No lock mutation.
+                self.assertTrue(lock.exists() or lock.is_symlink())
+                after = list(lock.parent.iterdir())
+                self.assertEqual(sorted(x.name for x in after), sorted(x.name for x in before))
+                if lock.is_dir() and not lock.is_symlink():
+                    lock.rmdir()
+                else:
+                    lock.unlink()
+
+        # Unreadable entry: present dir we cannot lstat (chmod 000 parent of lock path).
+        # Create lock then make parent unreadable — lexists may still work; use a path
+        # that lexists but lstat fails via patched lstat.
+        real_lstat = os.lstat
+        real_lexists = os.path.lexists
+
+        def fake_lexists(path: str) -> bool:
+            if path == str(lock):
+                return True
+            return real_lexists(path)
+
+        def fake_lstat(path: str, *a: Any, **k: Any) -> os.stat_result:
+            if path == str(lock):
+                raise OSError("simulated unreadable lock")
+            return real_lstat(path, *a, **k)
+
+        with mock.patch.object(os.path, "lexists", side_effect=fake_lexists):
+            with mock.patch.object(os, "lstat", side_effect=fake_lstat):
+                self.h.write_census()
+                r_un = self.h.probe(src)
+        self.assertEqual(r_un["classification"], "protected", r_un)
+        self.assertIn("lock_present", r_un["reasons"])
+        self.assertEqual(r_un["lock_evidence"]["entry_type"], "unreadable")
+
+    def test_protection_fingerprint_and_token_bind_protections(self) -> None:
+        src = self.h.put_candidate("verify")
+        self.h.write_census(captured_at=iso(self.h.now - timedelta(seconds=2)))
+        r1 = self.h.probe(src, started_offset=-30.0)
+        self.assertEqual(r1["classification"], "eligible", r1)
+        fp1 = r1["protection_fingerprint"]
+        token1 = r1["candidate_token"]
+        self.h.write_census(captured_at=iso(self.h.now - timedelta(seconds=8)))
+        r2 = self.h.probe(src, started_offset=-30.0)
+        self.assertEqual(r2["classification"], "eligible", r2)
+        self.assertEqual(r2["protection_fingerprint"], fp1)
+        self.assertEqual(r2["candidate_token"], token1)
+
+        # Process hit protects and prevents token.
+        self.h.processes.append(
+            {
+                "pid": 55,
+                "start_time_ticks": 11,
+                "name": "worker",
+                "scope_complete": True,
+                "references": [{"kind": "cwd", "path": str(src)}],
+            }
+        )
+        self.h.write_census()
+        r_proc = self.h.probe(src)
+        self.assertEqual(r_proc["classification"], "protected")
+        self.assertIn("process_reference_under_candidate", r_proc["reasons"])
+        self.assertIsNone(r_proc["candidate_token"])
+
+        # Clear process hit; Paseo agent cwd protects.
+        self.h.processes = [
+            {
+                "pid": 1,
+                "start_time_ticks": 10,
+                "name": "init",
+                "scope_complete": True,
+                "references": [],
+            }
+        ]
+        self.h.mark_agent(A, cwd=str(src))
+        self.h.write_census()
+        r_paseo = self.h.probe(src)
+        self.assertEqual(r_paseo["classification"], "protected")
+        self.assertIn("agent_cwd_under_candidate", r_paseo["reasons"])
+        self.assertIsNone(r_paseo["candidate_token"])
+
+        # Clear Paseo; present lock alters/blocks.
+        self.h.paseo = FakePaseo()
+        lock = self.h.locks / "verify.lock"
+        lock.mkdir()
+        self.h.write_census()
+        r_lock = self.h.probe(src)
+        self.assertEqual(r_lock["classification"], "protected")
+        self.assertIn("lock_present", r_lock["reasons"])
+        lock.rmdir()
+
+        # Boot id change blocks same-boot proof (no eligible token with old fingerprint).
+        self.h.write_census()
+        census = json.loads(self.h.census.read_text(encoding="utf-8"))
+        census["boot_id"] = "boot-other"
+        wjson(self.h.census, census)
+        self.h.seed_proc()
+        # boot_id mismatch vs live proc boot_id should block.
+        r_boot = self.h.probe(src)
+        self.assertEqual(r_boot["classification"], "blocked", r_boot)
+        self.assertIsNone(r_boot.get("candidate_token") or r_boot["candidate_token"])
 
 
 if __name__ == "__main__":

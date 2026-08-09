@@ -51,23 +51,197 @@ for _n in (
     globals()[_n] = getattr(_asc, _n)
 
 SCHEMA_VERSION = 1
+PROFILE_LEGACY_TMP = "legacy-tmp"
+PROFILE_PRE_RUNTIME_SCRATCH = "pre-runtime-scratch-layout"
+DEFAULT_PROFILE = PROFILE_LEGACY_TMP
 DEFAULT_TMP_ROOT = "/tmp"
 DEFAULT_QUARANTINE_ROOT = "/mnt/data/paseo-runtime/quarantine/legacy-tmp"
 DEFAULT_DATA_ROOT = "/mnt/data"
-PRODUCER_PREFIXES = ("shab-stage-runner-","warm-live-api-","grok-run-","ask-expert-","expert-mcp-","cxc-","paseo-")
+PRODUCER_PREFIXES = (
+    "shab-stage-runner-",
+    "warm-live-api-",
+    "grok-run-",
+    "ask-expert-",
+    "expert-mcp-",
+    "cxc-",
+    "paseo-",
+)
+# Closed pre-runtime profile: exact roots and basenames only (no overrides).
+PRE_RUNTIME_SOURCE_ROOT = "/mnt/data/paseo-runtime/scratch"
+PRE_RUNTIME_QUARANTINE_ROOT = (
+    "/mnt/data/paseo-runtime/quarantine/pre-runtime-scratch-layout"
+)
+PRE_RUNTIME_LOCK_ROOT = "/mnt/data/paseo-runtime/locks"
+PRE_RUNTIME_ALLOWED_BASENAMES = frozenset({"test-runner", "verify"})
+PRE_RUNTIME_PRODUCER = PROFILE_PRE_RUNTIME_SCRATCH
+KNOWN_PROFILES = frozenset({PROFILE_LEGACY_TMP, PROFILE_PRE_RUNTIME_SCRATCH})
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def mtime_ns_of(st: os.stat_result) -> int:
     return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+
+
 def producer_for(name: str) -> str | None:
     for prefix in PRODUCER_PREFIXES:
         if name.startswith(prefix):
             return prefix
     return None
+
+
+def producer_for_profile(profile: str, basename: str) -> str | None:
+    if profile == PROFILE_PRE_RUNTIME_SCRATCH:
+        if basename in PRE_RUNTIME_ALLOWED_BASENAMES:
+            return PRE_RUNTIME_PRODUCER
+        return None
+    return producer_for(basename)
+
+
+def profile_default_roots(profile: str) -> tuple[str, str]:
+    if profile == PROFILE_PRE_RUNTIME_SCRATCH:
+        return PRE_RUNTIME_SOURCE_ROOT, PRE_RUNTIME_QUARANTINE_ROOT
+    return DEFAULT_TMP_ROOT, DEFAULT_QUARANTINE_ROOT
+
+
+def resolve_profile_roots(
+    profile: str,
+    tmp_root: str | None,
+    quarantine_root: str | None,
+    *,
+    require_quarantine: bool = False,
+) -> tuple[str, str]:
+    """Resolve roots for a profile. Pre-runtime fails closed on any override mismatch."""
+    if profile not in KNOWN_PROFILES:
+        raise ToolError(f"unknown profile: {profile}")
+    default_tmp, default_q = profile_default_roots(profile)
+    if profile == PROFILE_PRE_RUNTIME_SCRATCH:
+        resolved_tmp = default_tmp if tmp_root is None else tmp_root
+        resolved_q = default_q if quarantine_root is None else quarantine_root
+        if norm(resolved_tmp) != norm(PRE_RUNTIME_SOURCE_ROOT):
+            raise ToolError(
+                f"profile {PROFILE_PRE_RUNTIME_SCRATCH} requires source root "
+                f"{PRE_RUNTIME_SOURCE_ROOT}"
+            )
+        if require_quarantine or quarantine_root is not None:
+            if norm(resolved_q) != norm(PRE_RUNTIME_QUARANTINE_ROOT):
+                raise ToolError(
+                    f"profile {PROFILE_PRE_RUNTIME_SCRATCH} requires quarantine root "
+                    f"{PRE_RUNTIME_QUARANTINE_ROOT}"
+                )
+        return norm(resolved_tmp), norm(resolved_q)
+    resolved_tmp = DEFAULT_TMP_ROOT if tmp_root is None else tmp_root
+    resolved_q = DEFAULT_QUARANTINE_ROOT if quarantine_root is None else quarantine_root
+    return resolved_tmp, resolved_q
+
+
+def validate_profile_tmp_root(profile: str, tmp_root: str) -> None:
+    if profile not in KNOWN_PROFILES:
+        raise ToolError(f"unknown profile: {profile}")
+    if profile == PROFILE_PRE_RUNTIME_SCRATCH:
+        if norm(tmp_root) != norm(PRE_RUNTIME_SOURCE_ROOT):
+            raise ToolError(
+                f"profile {PROFILE_PRE_RUNTIME_SCRATCH} requires source root "
+                f"{PRE_RUNTIME_SOURCE_ROOT}"
+            )
+
+
+def validate_profile_quarantine_root(profile: str, quarantine_root: str) -> None:
+    if profile == PROFILE_PRE_RUNTIME_SCRATCH:
+        if norm(quarantine_root) != norm(PRE_RUNTIME_QUARANTINE_ROOT):
+            raise ToolError(
+                f"profile {PROFILE_PRE_RUNTIME_SCRATCH} requires quarantine root "
+                f"{PRE_RUNTIME_QUARANTINE_ROOT}"
+            )
+
+
 def is_direct_child(path: str, parent: str) -> bool:
     p, r = norm(path), norm(parent)
     base = os.path.basename(p)
     return os.path.dirname(p) == r and bool(base) and base not in (".", "..") and os.sep not in base
+
+
+def lock_path_for(profile: str, basename: str) -> str | None:
+    if profile != PROFILE_PRE_RUNTIME_SCRATCH:
+        return None
+    return norm(os.path.join(PRE_RUNTIME_LOCK_ROOT, f"{basename}.lock"))
+
+
+def inspect_lock_evidence(profile: str, basename: str) -> dict[str, Any]:
+    """Exact candidate lock evidence. Never follows, breaks, or mutates locks."""
+    if profile != PROFILE_PRE_RUNTIME_SCRATCH:
+        return {"status": "not_applicable"}
+    path = lock_path_for(profile, basename)
+    assert path is not None
+    if not os.path.lexists(path):
+        return {"status": "absent", "path": path}
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return {"status": "present", "path": path, "entry_type": "unreadable"}
+    if stat.S_ISLNK(st.st_mode):
+        entry_type = "symlink"
+    elif stat.S_ISDIR(st.st_mode):
+        entry_type = "dir"
+    elif stat.S_ISREG(st.st_mode):
+        entry_type = "file"
+    else:
+        entry_type = "special"
+    return {"status": "present", "path": path, "entry_type": entry_type}
+
+
+def normalize_owner_for_protection(owner_evidence: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(owner_evidence, dict):
+        return None
+    return {
+        "uid": owner_evidence.get("uid"),
+        "gid": owner_evidence.get("gid"),
+        "mode": owner_evidence.get("mode"),
+        "mtime_ns": owner_evidence.get("mtime_ns"),
+        "nlink": owner_evidence.get("nlink"),
+    }
+
+
+def normalize_lock_for_protection(lock: dict[str, Any]) -> dict[str, Any]:
+    status = lock.get("status")
+    if status == "not_applicable":
+        return {"status": "not_applicable"}
+    out: dict[str, Any] = {"status": status, "path": lock.get("path")}
+    if status == "present":
+        out["entry_type"] = lock.get("entry_type")
+    return out
+
+
+def build_protection_evidence(
+    *,
+    owner_evidence: dict[str, Any] | None,
+    boot_id: str | None,
+    process_status: str,
+    process_reasons: list[str],
+    process_reference_pids: list[int],
+    paseo_reasons: list[str],
+    lock: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministic protection snapshot. Excludes volatile captured_at."""
+    return {
+        "owner": normalize_owner_for_protection(owner_evidence),
+        "boot_id": boot_id,
+        "process_proof": {
+            "status": process_status,
+            "reasons": list(process_reasons),
+        },
+        "process_references": sorted(int(p) for p in process_reference_pids),
+        "paseo_protection_reasons": list(paseo_reasons),
+        "lock": normalize_lock_for_protection(lock),
+    }
+
+
+def protection_fingerprint(evidence: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 def agent_cwd(info: dict[str, Any], label: str) -> str:
     cwd = info.get("Cwd") if isinstance(info.get("Cwd"), str) else info.get("cwd")
     if not isinstance(cwd, str) or not cwd.strip() or cwd == "-":
@@ -331,8 +505,14 @@ def inventory_fingerprint(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(
         json.dumps(slim, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-def make_token(source: str, producer: str, inv_fp: str, identity: dict[str, Any]) -> str:
-    parts = [norm(source), producer, inv_fp]
+def make_token(
+    source: str,
+    producer: str,
+    inv_fp: str,
+    identity: dict[str, Any],
+    prot_fp: str,
+) -> str:
+    parts = [norm(source), producer, inv_fp, prot_fp]
     parts.extend(
         str(identity.get(k))
         for k in ("type", "mode", "uid", "gid", "size", "mtime_ns", "nlink", "dev", "ino")
@@ -372,16 +552,18 @@ def resolve_source(source: str, tmp_root: str) -> str:
         raise ToolError(f"source must be an absolute direct child of {tmp_root}")
     return norm(source)
 def dual_inventory(source: str) -> tuple[list[dict[str, Any]], list[str]]:
-    deadline = time.monotonic() + INVENTORY_TIMEOUT_S
-    r1, e1 = candidate_inventory(source, deadline)
+    # Each deterministic walk receives its own absolute INVENTORY_TIMEOUT_S bound.
+    r1, e1 = candidate_inventory(source, time.monotonic() + INVENTORY_TIMEOUT_S)
     if e1:
         return [], e1
-    r2, e2 = candidate_inventory(source, deadline)
+    r2, e2 = candidate_inventory(source, time.monotonic() + INVENTORY_TIMEOUT_S)
     if e2:
         return [], e2
     if inventory_fingerprint(r1) != inventory_fingerprint(r2):
         return [], ["tree_changed"]
     return r2, []
+
+
 def classify_source(
     *,
     source: str,
@@ -394,14 +576,19 @@ def classify_source(
     poll_s: float,
     started_at: datetime | None = None,
     data_root: str = DEFAULT_DATA_ROOT,
+    profile: str = DEFAULT_PROFILE,
 ) -> dict[str, Any]:
     started = started_at or now_fn()
+    if profile not in KNOWN_PROFILES:
+        raise ToolError(f"unknown profile: {profile}")
+    validate_profile_tmp_root(profile, tmp_root)
     source = resolve_source(source, tmp_root)
     basename = os.path.basename(source)
-    producer = producer_for(basename)
+    producer = producer_for_profile(profile, basename)
     free = {"root": free_bytes("/"), "mnt_data": free_bytes(data_root)}
     out: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "profile": profile,
         "started_at": started.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "source": {
             "path": source,
@@ -416,8 +603,11 @@ def classify_source(
         "reasons": [],
         "candidate_token": None,
         "inventory_fingerprint": None,
+        "protection_evidence": None,
+        "protection_fingerprint": None,
         "free_bytes": free,
         "process_census": {"status": "blocked", "reasons": [], "captured_at": None, "boot_id": None},
+        "lock_evidence": inspect_lock_evidence(profile, basename),
     }
     if producer is None:
         out["classification"] = "unknown"
@@ -504,9 +694,15 @@ def classify_source(
         out["classification"] = "blocked" if global_block else "protected"
         out["reasons"] = paseo_reasons
         return out
-    if processes_touching(by_pid, source):
+    proc_hits = processes_touching(by_pid, source)
+    if proc_hits:
         out["classification"] = "protected"
         out["reasons"] = ["process_reference_under_candidate"]
+        return out
+    lock = out["lock_evidence"]
+    if lock.get("status") == "present":
+        out["classification"] = "protected"
+        out["reasons"] = ["lock_present"]
         return out
     records, inv_errors = dual_inventory(source)
     if inv_errors:
@@ -519,15 +715,49 @@ def classify_source(
     except OSError:
         out["reasons"] = ["path_changed"]
         return out
+    # Refresh lock evidence after inventory; still never mutates.
+    lock = inspect_lock_evidence(profile, basename)
+    out["lock_evidence"] = lock
+    if lock.get("status") == "present":
+        out["classification"] = "protected"
+        out["reasons"] = ["lock_present"]
+        return out
     fp = inventory_fingerprint(records)
+    boot_id = out["process_census"].get("boot_id")
+    if not isinstance(boot_id, str) or not boot_id:
+        out["reasons"] = ["process_census_missing_boot_id"]
+        return out
+    prot = build_protection_evidence(
+        owner_evidence=out["owner_evidence"],
+        boot_id=boot_id,
+        process_status="ok",
+        process_reasons=[],
+        process_reference_pids=[],
+        paseo_reasons=[],
+        lock=lock,
+    )
+    # Eligibility requires empty process refs, empty Paseo reasons, and non-present lock.
+    if prot["process_references"] or prot["paseo_protection_reasons"]:
+        out["classification"] = "protected"
+        out["reasons"] = ["protection_evidence_nonempty"]
+        return out
+    if prot["lock"].get("status") == "present":
+        out["classification"] = "protected"
+        out["reasons"] = ["lock_present"]
+        return out
+    prot_fp = protection_fingerprint(prot)
     out["source"]["size_bytes"] = size_from_inventory(records)
     out["inventory_fingerprint"] = fp
-    out["candidate_token"] = make_token(source, producer, fp, ident)
+    out["protection_evidence"] = prot
+    out["protection_fingerprint"] = prot_fp
+    out["candidate_token"] = make_token(source, producer, fp, ident, prot_fp)
     out["classification"] = "eligible"
     out["reasons"] = []
     out["_inventory"] = records
     out["_identity"] = ident
     return out
+
+
 def run_probe(**kwargs: Any) -> dict[str, Any]:
     return {k: v for k, v in classify_source(**kwargs).items() if not k.startswith("_")}
 def ensure_quarantine_root(qroot: str) -> None:
@@ -794,11 +1024,16 @@ def run_quarantine(
     wait_s: float = SNAPSHOT_WAIT_S,
     poll_s: float = 0.25,
     data_root: str = DEFAULT_DATA_ROOT,
+    profile: str = DEFAULT_PROFILE,
 ) -> dict[str, Any]:
     if not candidate_token:
         raise ToolError("candidate-token is required")
     if not is_uuid(run_id):
         raise ToolError("run-id must be a UUID")
+    if profile not in KNOWN_PROFILES:
+        raise ToolError(f"unknown profile: {profile}")
+    validate_profile_tmp_root(profile, tmp_root)
+    validate_profile_quarantine_root(profile, quarantine_root)
     source = resolve_source(source, tmp_root)
     ensure_quarantine_root(quarantine_root)
     partial = os.path.join(quarantine_root, f".partial-{run_id}")
@@ -819,6 +1054,7 @@ def run_quarantine(
         poll_s=poll_s,
         started_at=now_fn(),
         data_root=data_root,
+        profile=profile,
     )
     if classified.get("classification") != "eligible":
         raise ToolError(
@@ -850,10 +1086,12 @@ def run_quarantine(
     man = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
+        "profile": profile,
         "source_path": source,
         "source_basename": os.path.basename(source),
         "recognized_producer": producer,
         "candidate_token": candidate_token,
+        "protection_fingerprint": classified.get("protection_fingerprint"),
         "captured_at": utc_now_iso(),
         "source_identity": {
             k: ident[k]
@@ -889,6 +1127,7 @@ def run_quarantine(
         poll_s=poll_s,
         started_at=now_fn(),
         data_root=data_root,
+        profile=profile,
     )
     post_class = post.get("classification")
     post_token = post.get("candidate_token")
@@ -1047,8 +1286,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Probe or quarantine exactly one legacy /tmp producer candidate."
     )
-    p.add_argument("--tmp-root", default=DEFAULT_TMP_ROOT)
-    p.add_argument("--quarantine-root", default=DEFAULT_QUARANTINE_ROOT)
+    p.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE,
+        choices=sorted(KNOWN_PROFILES),
+        help="Candidate profile (default: legacy-tmp).",
+    )
+    # None → profile default; pre-runtime rejects any non-exact override.
+    p.add_argument("--tmp-root", default=None)
+    p.add_argument("--quarantine-root", default=None)
     p.add_argument("--data-root", default=DEFAULT_DATA_ROOT, help=argparse.SUPPRESS)
     p.add_argument("--paseo-bin", default=os.environ.get("PASEO_BIN", "paseo"))
     p.add_argument("--census-path", default=DEFAULT_CENSUS)
@@ -1063,15 +1309,23 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--candidate-token", required=True)
     q.add_argument("--run-id", required=True)
     return p
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = default_paseo_runner(args.paseo_bin)
     now_fn = lambda: datetime.now(timezone.utc)
     try:
+        tmp_root, quarantine_root = resolve_profile_roots(
+            args.profile,
+            args.tmp_root,
+            args.quarantine_root,
+            require_quarantine=(args.command == "quarantine"),
+        )
         if args.command == "probe":
             result = run_probe(
                 source=args.source,
-                tmp_root=args.tmp_root,
+                tmp_root=tmp_root,
                 census_path=args.census_path,
                 proc_root=args.proc_root,
                 runner=runner,
@@ -1079,14 +1333,15 @@ def main(argv: list[str] | None = None) -> int:
                 wait_s=args.wait_seconds,
                 poll_s=args.poll_seconds,
                 data_root=args.data_root,
+                profile=args.profile,
             )
         elif args.command == "quarantine":
             result = run_quarantine(
                 source=args.source,
                 candidate_token=args.candidate_token,
                 run_id=args.run_id,
-                tmp_root=args.tmp_root,
-                quarantine_root=args.quarantine_root,
+                tmp_root=tmp_root,
+                quarantine_root=quarantine_root,
                 census_path=args.census_path,
                 proc_root=args.proc_root,
                 runner=runner,
@@ -1094,6 +1349,7 @@ def main(argv: list[str] | None = None) -> int:
                 wait_s=args.wait_seconds,
                 poll_s=args.poll_seconds,
                 data_root=args.data_root,
+                profile=args.profile,
             )
         else:
             raise ToolError(f"unknown command {args.command}")
@@ -1106,5 +1362,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"legacy-tmp-quarantine: {exc}", file=sys.stderr)
         return 1
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -180,9 +180,12 @@ paths themselves.
     developer machines. **Late activation is the attended proof** for this rollout;
     a live reboot is not required to validate the timer.
 - Installed executable path: `/usr/local/libexec/paseo-process-census`
-- Fixed roots (production unit — exact four): `/home/user/.paseo/worktrees`,
-  `/mnt/data/paseo-runtime`, `/mnt/data/shab/.git`, and `/tmp`
+- Fixed roots (production unit — exact five): `/home/user/.paseo/worktrees`,
+  `/mnt/data/paseo-runtime`, `/mnt/data/shab/.git`,
+  `/home/user/.local/lib/shab-control`, and `/tmp`
   (`/mnt/data/shab/.git` covers administrative Git paths for linked worktrees;
+  `/home/user/.local/lib/shab-control` covers installed exact controller bundles
+  for the attended low-disk activation proof;
   the `/tmp` root exists so the legacy `/tmp` recovery lane can require a covering
   `roots` entry; it still emits only redacted in-root path references — never
   argv/env)
@@ -195,7 +198,7 @@ immediately after every successful capture and consumers never see the snapshot.
 
 Installer validation (when the operator runs the attended cleanup-system repair
 installer, which invokes the census reboot-trigger child once) requires **two**
-stable snapshot observations after a quiesced baseline: exact four roots, same boot,
+stable snapshot observations after a quiesced baseline: exact five roots, same boot,
 `complete=true`, empty `errors`, distinct file identity, and a strictly later second
 `captured_at`. This document does not claim deployment or live verification yet.
 

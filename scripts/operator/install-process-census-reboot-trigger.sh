@@ -17,9 +17,9 @@ set -euo pipefail
 readonly SOURCE_COMMIT=83bf0839c16ed73191f097ccd905aa81ee6acd14
 readonly EXPECTED_FORK_BASE='https://github.com/suislurper/paseo'
 readonly EXPECTED_TIMER_SHA=c6ae90d72818c12fff69ce6e120f21bfb25cea564d3bedbd314fe5588b2dc6d0
-readonly EXPECTED_SERVICE_SHA=0eb3a9e3bb537cb2ede2cede371784e3c7882ccf623e2c35baa4cf37cc5919d6
+readonly EXPECTED_SERVICE_SHA=08e3b5ed7b79779023bc2dbd0dd3cec946ad8a698da7bf31baee27153713fab1
 readonly EXPECTED_HELPER_SHA=6241954df045e75cbd669d3136718b83395fb9a71f218bd58884da56a33daf92
-readonly EXPECTED_DOC_SHA=e88df8a832fd4d514b96885c8ee607744751aed9c9fb6bde5453d23da1a57a7c
+readonly EXPECTED_DOC_SHA=4aa650bb30133771ed9c9a968c07dee0bc0fab7cb76b254171d55917c7f6e18e
 
 readonly DEST_HELPER=/usr/local/libexec/paseo-process-census
 readonly DEST_SERVICE=/etc/systemd/system/paseo-process-census.service
@@ -143,7 +143,7 @@ wait_service_inactive() {
 
 # Exact service roots from paseo-process-census.service --root flags.
 # Proof requires set-equality (no missing/duplicate/extra); order is not semantic.
-readonly CENSUS_REQUIRED_ROOTS_JSON='["/home/user/.paseo/worktrees","/mnt/data/paseo-runtime","/mnt/data/shab/.git","/tmp"]'
+readonly CENSUS_REQUIRED_ROOTS_JSON='["/home/user/.paseo/worktrees","/mnt/data/paseo-runtime","/mnt/data/shab/.git","/home/user/.local/lib/shab-control","/tmp"]'
 
 # Open $1 once; fstat the held fd; copy its bytes into a private temp file.
 # Prints "st\ttmp_path" on success (caller must rm tmp_path). Empty on failure.

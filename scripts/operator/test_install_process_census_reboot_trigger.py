@@ -31,6 +31,7 @@ DEFAULT_CENSUS_ROOTS = (
     "/home/user/.paseo/worktrees",
     "/mnt/data/paseo-runtime",
     "/mnt/data/shab/.git",
+    "/home/user/.local/lib/shab-control",
     "/tmp",
 )
 
@@ -538,7 +539,7 @@ class CaptureIdentityTests(unittest.TestCase):
         )
         self.assertEqual(self._valid_identity(self.census, self.boot), "")
 
-    def test_valid_identity_requires_exact_four_roots(self) -> None:
+    def test_valid_identity_requires_exact_five_roots(self) -> None:
         """Exact set of service roots accepted; missing/subset/duplicate/extra rejected."""
         write_census(
             self.census,
@@ -548,12 +549,13 @@ class CaptureIdentityTests(unittest.TestCase):
         )
         self.assertTrue(self._valid_identity(self.census, self.boot))
 
-        # Order-independent: permutation of the same four still accepted.
+        # Order-independent: permutation of the same five still accepted.
         perm = [
             DEFAULT_CENSUS_ROOTS[2],
             DEFAULT_CENSUS_ROOTS[0],
-            DEFAULT_CENSUS_ROOTS[3],
+            DEFAULT_CENSUS_ROOTS[4],
             DEFAULT_CENSUS_ROOTS[1],
+            DEFAULT_CENSUS_ROOTS[3],
         ]
         write_census(
             self.census,
@@ -572,7 +574,7 @@ class CaptureIdentityTests(unittest.TestCase):
         )
         self.assertEqual(self._valid_identity(self.census, self.boot), "")
 
-        # Duplicate (length 4 but not unique; not the exact set).
+        # Duplicate (length 5 but not unique; not the exact set).
         write_census(
             self.census,
             captured_at="2026-08-01T00:00:03Z",
@@ -581,6 +583,7 @@ class CaptureIdentityTests(unittest.TestCase):
                 DEFAULT_CENSUS_ROOTS[0],
                 DEFAULT_CENSUS_ROOTS[1],
                 DEFAULT_CENSUS_ROOTS[2],
+                DEFAULT_CENSUS_ROOTS[3],
                 DEFAULT_CENSUS_ROOTS[0],
             ],
         )
@@ -604,6 +607,7 @@ class CaptureIdentityTests(unittest.TestCase):
                 DEFAULT_CENSUS_ROOTS[0],
                 DEFAULT_CENSUS_ROOTS[1],
                 DEFAULT_CENSUS_ROOTS[2],
+                DEFAULT_CENSUS_ROOTS[3],
                 "/var/wrong",
             ],
         )

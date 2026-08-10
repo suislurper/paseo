@@ -480,6 +480,14 @@ class ProcessCensusTests(unittest.TestCase):
         unit = SERVICE_UNIT.read_text(encoding="utf-8")
         self.assertIn("RuntimeDirectory=paseo", unit)
         self.assertIn("RuntimeDirectoryPreserve=yes", unit)
+        for root in (
+            "/home/user/.paseo/worktrees",
+            "/mnt/data/paseo-runtime",
+            "/mnt/data/shab/.git",
+            "/home/user/.local/lib/shab-control",
+            "/tmp",
+        ):
+            self.assertEqual(unit.count(f"--root {root}"), 1)
 
     def test_timer_cadence_supports_bounded_process_retry(self) -> None:
         timer = TIMER_UNIT.read_text(encoding="utf-8")

@@ -2,10 +2,16 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
+import { getCheckoutStatus } from "../utils/checkout-git.js";
 
 import { DaemonClient } from "./test-utils/index.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
+
+vi.mock("../utils/checkout-git.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../utils/checkout-git.js")>();
+  return { ...original, getCheckoutStatus: vi.fn(original.getCheckoutStatus) };
+});
 
 // The reshaped workspace.create.request forwards its worktree `source`
 // (action/refName/githubPrNumber/worktreeSlug) verbatim into createWorktreeCore.
@@ -31,6 +37,60 @@ function createGitRepoWithBranch(): { repoDir: string; tempRoot: string } {
   execFileSync("git", ["branch", "feature/existing-branch"], { cwd: repoDir, stdio: "pipe" });
   return { repoDir, tempRoot };
 }
+
+test.each(["directory", "worktree"] as const)(
+  "workspace.create %s responds while full Git status is pending",
+  async (kind) => {
+    const daemon = await createTestPaseoDaemon();
+    const { repoDir, tempRoot } = createGitRepoWithBranch();
+    const client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      appVersion: "0.1.82",
+    });
+    let releaseStatus = () => {};
+    const statusGate = new Promise<void>((resolve) => {
+      releaseStatus = resolve;
+    });
+    const original = await vi.importActual<typeof import("../utils/checkout-git.js")>(
+      "../utils/checkout-git.js",
+    );
+    vi.mocked(getCheckoutStatus).mockImplementation(async (...args) => {
+      await statusGate;
+      return original.getCheckoutStatus(...args);
+    });
+    try {
+      await client.connect();
+      const added = await client.addProject(repoDir);
+      expect(added.error).toBeNull();
+      if (!added.project) throw new Error("Expected project to be created");
+      const projectId = added.project.projectId;
+      const source =
+        kind === "directory"
+          ? { kind, path: repoDir, projectId }
+          : {
+              kind,
+              cwd: repoDir,
+              projectId,
+              action: "branch-off" as const,
+              worktreeSlug: "responsive-worktree",
+              baseBranch: "main",
+            };
+      const result = await client.createWorkspace({ source });
+      expect(result.error).toBeNull();
+      expect(result.workspace?.projectId).toBe(projectId);
+      expect(result.workspace?.workspaceKind).toBe(
+        kind === "directory" ? "local_checkout" : "worktree",
+      );
+    } finally {
+      releaseStatus();
+      vi.mocked(getCheckoutStatus).mockImplementation(original.getCheckoutStatus);
+      await client.close();
+      await daemon.close();
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  },
+  15000,
+);
 
 test("workspace.create worktree source forwards action=checkout + refName into the real worktree", async () => {
   const daemon = await createTestPaseoDaemon();

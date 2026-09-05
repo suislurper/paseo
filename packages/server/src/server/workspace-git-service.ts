@@ -14,6 +14,7 @@ import {
   type CheckoutDiffCompare,
   type CheckoutDiffResult,
   getCheckoutDiff,
+  getCheckoutIdentity,
   getCheckoutSnapshotFacts,
   getCheckoutShortstat,
   getCheckoutStatus,
@@ -251,6 +252,7 @@ type WorkspaceGitRefreshState =
     };
 
 interface WorkspaceGitServiceDependencies {
+  getCheckoutIdentity: typeof getCheckoutIdentity;
   watch: typeof watch;
   readdir: typeof readdir;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
@@ -358,6 +360,7 @@ function buildDefaultWorkspaceGitServiceDeps(): WorkspaceGitServiceDependencies 
     watch,
     readdir,
     getCheckoutSnapshotFacts,
+    getCheckoutIdentity,
     getCheckoutStatus,
     getCheckoutShortstat,
     getCheckoutDiff,
@@ -482,7 +485,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
     const normalizedCwd = resolve(cwd);
-    const status = await this.deps.getCheckoutStatus(normalizedCwd, {
+    const status = await this.deps.getCheckoutIdentity(normalizedCwd, {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
@@ -626,15 +629,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     );
   }
 
-  async resolveRepoRoot(cwd: string, options?: WorkspaceGitReadOptions): Promise<string> {
-    const snapshot = await this.getSnapshot(cwd, options);
-    if (!snapshot.git.isGit) {
+  async resolveRepoRoot(cwd: string, _options?: WorkspaceGitReadOptions): Promise<string> {
+    const checkout = await this.getCheckout(cwd);
+    if (!checkout.isGit) {
       throw new Error("Create worktree requires a git repository");
     }
 
-    return snapshot.git.isPaseoOwnedWorktree
-      ? (snapshot.git.mainRepoRoot ?? snapshot.git.repoRoot ?? resolve(cwd))
-      : (snapshot.git.repoRoot ?? resolve(cwd));
+    return checkout.isPaseoOwnedWorktree ? checkout.mainRepoRoot : checkout.worktreeRoot;
   }
 
   async resolveDefaultBranch(

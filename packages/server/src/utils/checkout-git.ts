@@ -1981,6 +1981,43 @@ async function resolvePullRequestLookupTargetFromPushConfig(
   });
 }
 
+export type CheckoutIdentity =
+  | CheckoutStatus
+  | Pick<
+      CheckoutStatusGit,
+      "isGit" | "repoRoot" | "mainRepoRoot" | "currentBranch" | "remoteUrl" | "isPaseoOwnedWorktree"
+    >;
+
+// Workspace placement must not wait for dirty scans, history comparisons or remote queries.
+export async function getCheckoutIdentity(
+  cwd: string,
+  context?: CheckoutContext,
+): Promise<CheckoutIdentity> {
+  const inspected = await inspectCheckoutContext(cwd, context);
+  if (!inspected) return { isGit: false };
+
+  const mainRepoRoot = await getMainRepoRootFromCommonDir(
+    cwd,
+    inspected.gitCommonDir,
+    context,
+  ).catch(() => null);
+  const isPaseoOwnedWorktree = inspected.paseoWorktree.isPaseoOwnedWorktree;
+  let resolvedMainRepoRoot = mainRepoRoot;
+  if (isPaseoOwnedWorktree) {
+    resolvedMainRepoRoot = mainRepoRoot ?? inspected.worktreeRoot;
+  } else if (mainRepoRoot && resolve(mainRepoRoot) === resolve(inspected.worktreeRoot)) {
+    resolvedMainRepoRoot = null;
+  }
+  return {
+    isGit: true,
+    repoRoot: inspected.worktreeRoot,
+    mainRepoRoot: resolvedMainRepoRoot,
+    currentBranch: inspected.currentBranch,
+    remoteUrl: inspected.remoteUrl,
+    isPaseoOwnedWorktree,
+  };
+}
+
 export async function getCheckoutSnapshotFacts(
   cwd: string,
   context?: CheckoutContext,

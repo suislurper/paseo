@@ -62,6 +62,11 @@ server to capability-aware sessions. It deliberately does not use the broad recu
 watcher or the per-session Git observer: those are checkout/status mechanisms and intentionally do
 not retain non-Git directories.
 
+Local workspace creation and New Worktree repository-root resolution use fresh local checkout
+identity. They must not await a full Git snapshot: dirty-file scans and history comparisons can
+exceed the workspace RPC deadline in large repositories. Full Git status and worktree setup
+continue through the existing background update paths after creation.
+
 **Key modules:**
 
 | Module                          | Responsibility                                                               |

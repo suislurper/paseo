@@ -124,6 +124,41 @@ const CODEX_NON_ORIGINATING_APP_SERVER_CLIENT_INFO = {
   title: "Codex App Server Daemon",
   version: "0.0.0",
 } as const;
+const ORDINARY_COLLABORATION_MODE_UNAVAILABLE_ERROR =
+  "Codex cannot start a non-Plan turn because the collaboration catalog has no ordinary mode (default/code). Enable Plan, or use a Codex version that advertises an ordinary collaboration mode.";
+
+interface CodexCollaborationMode {
+  name: string;
+  mode?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  developer_instructions?: string | null;
+}
+
+function collaborationModeIdentity(mode: string | null | undefined): string | null {
+  if (typeof mode !== "string") {
+    return null;
+  }
+  const identity = mode.trim().toLowerCase();
+  return identity.length > 0 ? identity : null;
+}
+
+function isOrdinaryCollaborationIdentity(identity: string): boolean {
+  return identity === "code" || identity === "default" || identity === "auto";
+}
+
+function isPlanCollaborationIdentity(identity: string): boolean {
+  return identity === "plan";
+}
+
+function collaborationModeNameLooksLikePlan(name: string): boolean {
+  return name.includes("plan") || name.includes("read");
+}
+
+function collaborationModeNameLooksLikeOrdinary(name: string): boolean {
+  return name.includes("code") || name.includes("auto") || name.includes("default");
+}
+
 const ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN = "\n\n---\n\n";
 const MAX_PENDING_SUB_AGENT_THREADS = 32;
 const MAX_PENDING_SUB_AGENT_NOTIFICATIONS_PER_THREAD = 128;
@@ -3360,13 +3395,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private unpairedCompactionNotificationCompletions = 0;
   private unpairedCompactionItemCompletions = 0;
   private connected = false;
-  private collaborationModes: Array<{
-    name: string;
-    mode?: string | null;
-    model?: string | null;
-    reasoning_effort?: string | null;
-    developer_instructions?: string | null;
-  }> = [];
+  private collaborationModes: CodexCollaborationMode[] = [];
   private resolvedCollaborationMode: {
     mode: string;
     settings: Record<string, unknown>;
@@ -3530,30 +3559,49 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private findCollaborationMode(target: "code" | "plan"): {
-    name: string;
-    mode?: string | null;
-    model?: string | null;
-    reasoning_effort?: string | null;
-    developer_instructions?: string | null;
-  } | null {
-    if (this.collaborationModes.length === 0) return null;
-    const findByName = (predicate: (name: string) => boolean) =>
-      this.collaborationModes.find((entry) => predicate(entry.name.toLowerCase()));
-
-    if (target === "plan") {
-      return findByName((name) => name.includes("plan") || name.includes("read")) ?? null;
+  private findCollaborationMode(target: "code" | "plan"): CodexCollaborationMode | null {
+    if (this.collaborationModes.length === 0) {
+      return null;
     }
 
-    return (
-      findByName((name) => name.includes("auto") || name.includes("code")) ??
-      this.collaborationModes.find((entry) => {
-        const name = entry.name.toLowerCase();
-        return !name.includes("plan") && !name.includes("read");
-      }) ??
-      this.collaborationModes[0] ??
-      null
-    );
+    const byIdentity = this.collaborationModes.find((entry) => {
+      const identity = collaborationModeIdentity(entry.mode);
+      if (!identity) {
+        return false;
+      }
+      if (target === "plan") {
+        return isPlanCollaborationIdentity(identity);
+      }
+      return isOrdinaryCollaborationIdentity(identity);
+    });
+    if (byIdentity) {
+      return byIdentity;
+    }
+
+    const byName = this.collaborationModes.find((entry) => {
+      if (collaborationModeIdentity(entry.mode)) {
+        return false;
+      }
+      const name = entry.name.toLowerCase();
+      if (target === "plan") {
+        return collaborationModeNameLooksLikePlan(name);
+      }
+      if (collaborationModeNameLooksLikePlan(name)) {
+        return false;
+      }
+      return collaborationModeNameLooksLikeOrdinary(name);
+    });
+    return byName ?? null;
+  }
+
+  private assertOrdinaryCollaborationModeAvailable(): void {
+    if (this.planModeEnabled || this.collaborationModes.length === 0) {
+      return;
+    }
+    if (this.resolvedCollaborationMode) {
+      return;
+    }
+    throw new Error(ORDINARY_COLLABORATION_MODE_UNAVAILABLE_ERROR);
   }
 
   private hasPlanCollaborationMode(): boolean {
@@ -4027,6 +4075,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     } else {
       await this.ensureThread();
     }
+
+    this.assertOrdinaryCollaborationModeAvailable();
 
     const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
 

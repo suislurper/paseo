@@ -32,6 +32,24 @@ const TEST_COLLABORATION_MODES: CollaborationModeRecord[] = [
   },
 ];
 
+const PLAN_ONLY_COLLABORATION_MODES: CollaborationModeRecord[] = [
+  {
+    name: "Plan",
+    mode: "plan",
+    developer_instructions: "Built-in plan mode",
+  },
+];
+
+const ORDINARY_COLLABORATION_MODE_UNAVAILABLE_ERROR =
+  "Codex cannot start a non-Plan turn because the collaboration catalog has no ordinary mode (default/code). Enable Plan, or use a Codex version that advertises an ordinary collaboration mode.";
+
+interface CodexFeaturesHarnessOptions {
+  logger?: pino.Logger;
+  collaborationModes?: CollaborationModeRecord[];
+  collaborationModeListError?: Error;
+  turnStarts?: unknown[];
+}
+
 type CodexFeaturesTestSession = AgentSession;
 
 interface CapturedLogEntry {
@@ -65,14 +83,28 @@ function createConfig(overrides: Partial<AgentSessionConfig> = {}): AgentSession
 
 function createSessionHarness(
   configOverrides: Partial<AgentSessionConfig> = {},
-  options: { logger?: pino.Logger } = {},
+  options: CodexFeaturesHarnessOptions = {},
 ): {
   session: CodexFeaturesTestSession;
   appServer: FakeCodexAppServer;
 } {
   const config = createConfig(configOverrides);
+  const turnStarts = options.turnStarts;
   const appServer = createFakeCodexAppServer({
-    "collaborationMode/list": () => ({ data: TEST_COLLABORATION_MODES }),
+    "collaborationMode/list": async () => {
+      if (options.collaborationModeListError) {
+        throw options.collaborationModeListError;
+      }
+      return { data: options.collaborationModes ?? TEST_COLLABORATION_MODES };
+    },
+    ...(turnStarts
+      ? {
+          "turn/start": (params: unknown) => {
+            turnStarts.push(params);
+            return {};
+          },
+        }
+      : {}),
   });
   const session = new CodexAppServerAgentSession(
     { ...config, provider: CODEX_PROVIDER },
@@ -85,7 +117,7 @@ function createSessionHarness(
 
 async function createConnectedSession(
   configOverrides: Partial<AgentSessionConfig> = {},
-  options: { logger?: pino.Logger } = {},
+  options: CodexFeaturesHarnessOptions = {},
 ): Promise<{
   session: CodexFeaturesTestSession;
   appServer: FakeCodexAppServer;
@@ -344,6 +376,154 @@ describe("Codex app-server provider features", () => {
       collaborationMode: expect.objectContaining({
         mode: "plan",
       }),
+    });
+  });
+
+  test("ordinary startTurn fails before turn/start when the catalog only has Plan", async () => {
+    const turnStarts: unknown[] = [];
+    const { session } = await createConnectedSession(
+      {},
+      { collaborationModes: PLAN_ONLY_COLLABORATION_MODES, turnStarts },
+    );
+
+    await expect(session.startTurn("hello")).rejects.toThrow(
+      ORDINARY_COLLABORATION_MODE_UNAVAILABLE_ERROR,
+    );
+    expect(turnStarts).toEqual([]);
+  });
+
+  test("explicit Plan still starts when the catalog only has Plan", async () => {
+    const { session, appServer } = await createConnectedSession(
+      { featureValues: { plan_mode: true } },
+      { collaborationModes: PLAN_ONLY_COLLABORATION_MODES },
+    );
+
+    await session.startTurn("hello");
+
+    await expect(appServer.waitForTurnStart()).resolves.toMatchObject({
+      collaborationMode: expect.objectContaining({
+        mode: "plan",
+      }),
+    });
+  });
+
+  test("ordinary startTurn selects code from a Plan-first catalog and keeps model/effort overrides", async () => {
+    const { session, appServer } = await createConnectedSession(
+      { thinkingOptionId: "medium" },
+      {
+        collaborationModes: [
+          {
+            name: "Plan",
+            mode: "plan",
+            model: "plan-model",
+            reasoning_effort: "high",
+            developer_instructions: "Built-in plan mode",
+          },
+          {
+            name: "Code",
+            mode: "code",
+            model: "code-model",
+            reasoning_effort: "low",
+            developer_instructions: "Built-in code mode",
+          },
+        ],
+      },
+    );
+
+    await session.startTurn("hello");
+
+    await expect(appServer.waitForTurnStart()).resolves.toMatchObject({
+      model: "gpt-5.4",
+      effort: "medium",
+      collaborationMode: {
+        mode: "code",
+        settings: expect.objectContaining({
+          model: "gpt-5.4",
+          reasoning_effort: "medium",
+        }),
+      },
+    });
+  });
+
+  test("ordinary startTurn selects default and auto identities ahead of Plan", async () => {
+    const { session: defaultSession, appServer: defaultServer } = await createConnectedSession(
+      {},
+      {
+        collaborationModes: [
+          { name: "Plan", mode: "plan" },
+          { name: "Default", mode: "default" },
+          { name: "Code", mode: "code" },
+        ],
+      },
+    );
+    await defaultSession.startTurn("hello");
+    await expect(defaultServer.waitForTurnStart()).resolves.toMatchObject({
+      collaborationMode: expect.objectContaining({ mode: "default" }),
+    });
+
+    const { session: autoSession, appServer: autoServer } = await createConnectedSession(
+      {},
+      {
+        collaborationModes: [
+          { name: "Plan", mode: "plan" },
+          { name: "Auto", mode: "auto" },
+          { name: "Default", mode: "default" },
+        ],
+      },
+    );
+    await autoSession.startTurn("hello");
+    await expect(autoServer.waitForTurnStart()).resolves.toMatchObject({
+      collaborationMode: expect.objectContaining({ mode: "auto" }),
+    });
+  });
+
+  test("protocol identity wins over misleading collaboration-mode names", async () => {
+    const misleadingCatalog: CollaborationModeRecord[] = [
+      { name: "Code", mode: "plan", developer_instructions: "Built-in plan mode" },
+      { name: "Plan", mode: "code", developer_instructions: "Built-in code mode" },
+    ];
+
+    const { session: ordinarySession, appServer: ordinaryServer } = await createConnectedSession(
+      {},
+      { collaborationModes: misleadingCatalog },
+    );
+    await ordinarySession.startTurn("hello");
+    await expect(ordinaryServer.waitForTurnStart()).resolves.toMatchObject({
+      collaborationMode: expect.objectContaining({ mode: "code" }),
+    });
+
+    const { session: planSession, appServer: planServer } = await createConnectedSession(
+      { featureValues: { plan_mode: true } },
+      { collaborationModes: misleadingCatalog },
+    );
+    await planSession.startTurn("hello");
+    await expect(planServer.waitForTurnStart()).resolves.toMatchObject({
+      collaborationMode: expect.objectContaining({ mode: "plan" }),
+    });
+  });
+
+  test("ordinary startTurn omits collaborationMode when Codex does not advertise modes", async () => {
+    const { session, appServer } = await createConnectedSession({}, { collaborationModes: [] });
+
+    await session.startTurn("hello");
+
+    const turnStart = await appServer.waitForTurnStart();
+    expect(turnStart).not.toMatchObject({
+      collaborationMode: expect.anything(),
+    });
+  });
+
+  test("ordinary startTurn omits collaborationMode when the catalog request fails", async () => {
+    const { session, appServer } = await createConnectedSession(
+      {},
+      { collaborationModeListError: new Error("collaborationMode/list unavailable") },
+    );
+
+    await session.startTurn("hello");
+
+    const turnStart = await appServer.waitForTurnStart();
+    expect(turnStart).not.toMatchObject({
+      collaborationMode: expect.anything(),
     });
   });
 });

@@ -58,9 +58,11 @@ Agent-scoped `create_agent` defaults `notifyOnFinish` to true. Set it to `false`
 
 Ordinary read-only research uses this contract. Other Paseo skills reference it instead of restating it. Keep worktree, CLI, schedule, and loop surfaces for those requested workflows.
 
+Exploration resolves `providers.research`. Advisory skills resolve their own configured role. Common placement, settings, read-only scope, and cleanup still apply.
+
 Delegation is discretionary: spawn only when a bounded independent investigation improves coverage, speed, or confidence. At most three children. No recursive delegation. Do not enter Plan because the parent is in Plan.
 
-1. Read `~/.paseo/orchestration-preferences.json` and resolve `providers.research`. Effort comes from that policy (currently high). Confirm provider, model, mode, thinking option, and features with `inspect_provider` (and `list_models` if needed) before launch. If every configured research route is unavailable, continue the investigation locally. Do not silently substitute a native subagent.
+1. Read `~/.paseo/orchestration-preferences.json` and resolve the role for this launch (exploration: `providers.research`; advisory skills: their configured role). Effort comes from that policy. Confirm provider, model, mode, thinking option, and features with `inspect_provider` (and `list_models` if needed) before launch. If every configured route for that role is unavailable, continue the investigation locally. Do not silently substitute a native subagent.
 
 2. Launch via MCP `create_agent`. Do not use `paseo run`, a schedule, a loop, or a new workspace/worktree for one-off exploration. Failed attachment is not permission to create a workspace.
 

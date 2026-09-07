@@ -863,7 +863,6 @@ export class Session {
         })
       : null;
     this.daemonConfigStore = daemonConfigStore;
-    this.terminalManager = terminalManager;
     this.terminalController = new TerminalSessionController({
       terminalManager,
       emit: (msg) => this.emit(msg),

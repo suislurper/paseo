@@ -42,6 +42,11 @@ const SERVER_MARKERS = [
   ["PASEO_AGENT_ARTIFACT_DIR", "managed per-agent runtime storage (95c63c3c5)"],
   ["release_agent_scratch", "explicit scratch-release receipt (95c63c3c5)"],
   ["minimumFreeBytes", "disk-pressure worktree admission (95c63c3c5)"],
+  ["collaboration catalog has no ordinary mode", "ordinary Codex mode catalog safety (827eb7861)"],
+  [
+    "Failed to clean up unused directory workspace after launch failure",
+    "failed directory launch cleanup (2089c093e)",
+  ],
 ];
 
 // Sources whose changes must be reflected in the Expo export before packaging.

@@ -48,6 +48,9 @@ const requiredHistory = [
     "95c63c3c5b3b9cf56f66a17954a782cbbafb508e",
     "managed agent runtime storage, fail-closed cleanup probes, and disk admission",
   ],
+  ["827eb78613b46328f34dbb22d22676bbb7abde2c", "ordinary Codex mode"],
+  ["0a43b62fdbf96a7bd857b80a284206a565b51c39", "canonical exploration lifecycle skills"],
+  ["2089c093e4343886f2fcc0182f45f507d2d8280f", "Session/CLI/MCP launch cleanup integration"],
 ];
 
 function isAncestor(commit, descendant) {

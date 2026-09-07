@@ -17,6 +17,9 @@ The fork carries required behavior that is not optional during upstream updates:
 - workspace-sidebar landed-to-default status, refreshed against the remote default branch
 - fail-closed archive checks that distinguish landed work from unpushed or unknown work
 - optional fail-closed free-space admission for **new** Paseo worktree creation only
+- ordinary-mode catalog safety for Codex collaboration modes
+- failed directory launch cleanup that archives unused request-owned metadata
+- canonical managed exploration guidance in bundled Paseo skills
 
 ## Worktree free-space admission
 

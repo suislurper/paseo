@@ -90,8 +90,11 @@ command owns the launch so a failed provider or mode does not leave an unused
 active record. Directory create does not inherit the parent workspace. If that
 agent never lands and nothing else references the new id — managed or persisted
 agents, including partial registration, or a terminal — the daemon archives only
-that metadata record and leaves the directory files in place. Explicit workspace
-ids, `workspace: { kind: "current" | "existing" }`, import attachments, and new
+that metadata record and leaves the directory files in place. If reference
+inspection is unavailable or fails, the daemon conservatively preserves the
+record and logs the workspace ID. Cleanup is metadata archival only; it does
+not delete historical files. Explicit workspace ids, `workspace: { kind:
+"current" | "existing" }`, import attachments, and new
 terminals retain a provisional workspace before they can be archived, so an
 independent attach cannot be cleaned up from under them. Bare `paseo run` does
 not mint a directory workspace before `createAgent`; Session owns that

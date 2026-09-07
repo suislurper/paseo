@@ -14,10 +14,12 @@ Transfer the current task — context, decisions, failed attempts, constraints �
 
 Read the **paseo** skill. Before choosing a provider, read `~/.paseo/orchestration-preferences.json` unless the user explicitly named a provider in this request. Do not create the receiving agent until you have read it.
 
+Handoffs are detached siblings, not research children. Do not apply the research launch contract, and do not turn handoffs into temporary research children. Workspace reuse is the default; create a new worktree when the user explicitly asks for an independent worktree, or when applicable repository isolation/single-writer rules require one.
+
 ## Parsing arguments
 
 1. **Provider** — explicit user request first; otherwise resolve from `impl` preference (or `ui` if the task is styling-only).
-2. **Worktree** — "in a worktree" / "worktree" → create a worktree via Paseo with a short branch name derived from the task, based on the current branch.
+2. **Worktree** — "in a worktree" / "worktree" / "independent worktree", or applicable repository isolation/single-writer rules, → create a worktree via Paseo with a short branch name derived from the task, based on the current branch.
 3. **Task description** — anything else the user said.
 
 ## The handoff prompt
@@ -54,12 +56,12 @@ The receiving agent has zero context. Include:
 
 ## Launch
 
-Create the agent via Paseo with a `[Handoff] <task>` title, the briefing as initial prompt, and `relationship: { kind: "detached" }`.
+Create the agent via Paseo with a `[Handoff] <task>` title, the briefing as initial prompt, and `relationship: { kind: "detached" }`. Set an explicit permission mode; never inherit a provider default.
 
 Use `workspace` for placement:
 
-- No worktree: `workspace: { kind: "current" }`.
-- Worktree: `workspace: { kind: "create", source: { kind: "worktree", target: { kind: "branch-off", worktreeSlug: "<short-task-slug>", branchName: "fix/<short-task-slug>" } } }`.
+- Default reuse (no independent worktree requested, and isolation/single-writer rules do not require one): `workspace: { kind: "current" }`.
+- New worktree when the user explicitly asks, or when applicable repository isolation/single-writer rules require it: `workspace: { kind: "create", source: { kind: "worktree", target: { kind: "branch-off", worktreeSlug: "<short-task-slug>", branchName: "fix/<short-task-slug>" } } }`.
 - Existing worktree already created by `create_worktree`: `workspace: { kind: "existing", workspaceId: "<returned-workspace-id>" }`.
 
 Do not use `workspace: { kind: "current", cwd: "<worktreePath>" }` to place a handoff in a worktree; that keeps the agent in the caller's workspace with only a different runtime cwd.

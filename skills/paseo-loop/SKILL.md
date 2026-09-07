@@ -14,7 +14,7 @@ A loop is a worker/verifier cycle: launch a worker → check verification → re
 
 Read the **paseo** skill. Before choosing worker or verifier providers, read `~/.paseo/orchestration-preferences.json` unless the user explicitly named providers in this request. Do not start the loop until you have read it.
 
-Loops are a CLI primitive: `paseo loop run`. Manage with `paseo loop ls`, `paseo loop inspect <id>`, `paseo loop logs <id>`, `paseo loop stop <id>`.
+Loops are a CLI primitive: `paseo loop run`. Manage with `paseo loop ls`, `paseo loop inspect <id>`, `paseo loop logs <id>`, `paseo loop stop <id>`. Do not use a loop as a substitute for one-off exploration; that belongs to the **paseo** skill **Research launch contract**.
 
 ## Your job
 
@@ -29,6 +29,12 @@ Loops are a CLI primitive: `paseo loop run`. Manage with `paseo loop ls`, `paseo
 6. **Stops** — set a sensible `--max-iterations` and/or `--max-time`. Open-ended loops are how runaways happen.
 7. **Archive** — `--archive` keeps agents after each iteration for inspection.
 8. Launch with `paseo loop run`.
+
+## Helper lanes vs implementation workers
+
+If an iteration is investigation-only (trace a failure, inspect logs, gather evidence), launch that helper with the research launch contract: same workspace, explicit permission mode, no Plan, archive after consuming the result. Do not create a worktree, schedule, or nested loop for that lookup.
+
+Implementation workers follow the repository's ownership rules (isolated writer checkout, owned paths, no shared-service mutation). They are not research children.
 
 ## Common shapes
 

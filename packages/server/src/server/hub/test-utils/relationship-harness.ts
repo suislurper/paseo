@@ -35,6 +35,12 @@ import { createTestAgentClients } from "../../test-utils/fake-agent-client.js";
 import { DaemonClient } from "../../test-utils/daemon-client.js";
 import { AgentStorage } from "../../agent/agent-storage.js";
 import { AgentManager } from "../../agent/agent-manager.js";
+import {
+  createPersistedProjectRecord,
+  createPersistedWorkspaceRecord,
+  FileBackedProjectRegistry,
+  FileBackedWorkspaceRegistry,
+} from "../../workspace-registry.js";
 import { DaemonExecutions } from "../daemon-executions.js";
 import {
   createAgentCommand,
@@ -1189,6 +1195,38 @@ export class HubRelationshipHarness {
     execFileSync("git", ["-C", this.root, "commit", "--allow-empty", "-m", "initial"], {
       stdio: "ignore",
     });
+    const timestamp = "2026-09-07T00:00:00.000Z";
+    const projectRegistry = new FileBackedProjectRegistry(
+      path.join(this.paseoHome, "projects", "projects.json"),
+      pino({ level: "silent" }),
+    );
+    const workspaceRegistry = new FileBackedWorkspaceRegistry(
+      path.join(this.paseoHome, "projects", "workspaces.json"),
+      pino({ level: "silent" }),
+    );
+    await projectRegistry.initialize();
+    await workspaceRegistry.initialize();
+    await projectRegistry.upsert(
+      createPersistedProjectRecord({
+        projectId: "prj_hub_test",
+        rootPath: this.root,
+        kind: "git",
+        displayName: "hub-test",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "hub-workspace",
+        projectId: "prj_hub_test",
+        cwd: this.root,
+        kind: "directory",
+        displayName: "hub-workspace",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
     this.config = {
       listen: "0.0.0.0:0",
       paseoHome: this.paseoHome,
@@ -1371,6 +1409,7 @@ export class HubRelationshipHarness {
   }
 
   private executionsForReconstruction(manager: AgentManager, storage: AgentStorage) {
+    const cwd = this.root;
     return new DaemonExecutions({
       daemonId: this.relationshipFile()!.relationship.daemonId,
       agentManager: manager,
@@ -1382,6 +1421,14 @@ export class HubRelationshipHarness {
             agentStorage: storage,
             logger: pino({ level: "silent" }),
             providerSnapshotManager: providerCatalog,
+            mcpLaunchProvisioning: {
+              async allocateDirectoryWorkspaceForLaunch() {
+                throw new Error("hub reconstruction tests pass an explicit workspaceId");
+              },
+              async requireExistingWorkspaceForLaunch() {
+                return { cwd };
+              },
+            },
           },
           input,
         ),

@@ -171,8 +171,10 @@ import {
 import {
   createWorkspaceProvisioningService,
   WorkspaceProvisioningError,
+  type DirectoryWorkspaceLaunch,
   type WorkspaceProvisioningService,
 } from "./session/workspace-provisioning/workspace-provisioning-service.js";
+import { inspectDirectoryWorkspaceLaunchReferences } from "./session/workspace-provisioning/directory-workspace-launch-references.js";
 import {
   createWorkspaceRecoveryService,
   type WorkspaceRecoveryService,
@@ -718,11 +720,18 @@ export class Session {
       logger: this.sessionLogger,
     });
     this.workspaceAutoName = workspaceAutoName;
+    this.terminalManager = terminalManager;
     this.workspaceProvisioning = createWorkspaceProvisioningService({
       workspaceRegistry: this.workspaceRegistry,
       projectRegistry: this.projectRegistry,
       workspaceGitService: this.workspaceGitService,
       logger: this.sessionLogger,
+      inspectDirectoryWorkspaceLaunchReferences: (workspaceId) =>
+        inspectDirectoryWorkspaceLaunchReferences(workspaceId, {
+          listManagedAgents: () => this.agentManager.listAgents(),
+          listPersistedAgents: () => this.agentStorage.list(),
+          terminalManager: this.terminalManager,
+        }),
     });
     this.workspaceRecovery = createWorkspaceRecoveryService({
       paseoHome: this.paseoHome,
@@ -854,7 +863,6 @@ export class Session {
         })
       : null;
     this.daemonConfigStore = daemonConfigStore;
-    this.terminalManager = terminalManager;
     this.terminalController = new TerminalSessionController({
       terminalManager,
       emit: (msg) => this.emit(msg),
@@ -2817,7 +2825,11 @@ export class Session {
 
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
+    let directoryLaunch: DirectoryWorkspaceLaunch | null = null;
     try {
+      if (msg.workspaceId && !worktree) {
+        await this.workspaceProvisioning.requireExistingWorkspaceForLaunch(msg.workspaceId);
+      }
       const requestedCwd = resolve(config.cwd);
       if (!(await this.filesystem.isDirectory(requestedCwd))) {
         throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
@@ -2843,15 +2855,19 @@ export class Session {
       const createAgentConfig: AgentSessionConfig = createdWorktree
         ? { ...config, cwd: createdWorktree.workspace.cwd }
         : config;
-      const workspaceId = await this.workspaceProvisioning.resolveOrCreateWorkspaceIdForCreateAgent(
-        {
-          createdWorktree,
-          requestedWorkspaceId: msg.workspaceId,
+      let workspaceId: string;
+      if (createdWorktree) {
+        workspaceId = createdWorktree.workspace.workspaceId;
+      } else if (msg.workspaceId) {
+        workspaceId = msg.workspaceId;
+      } else {
+        directoryLaunch = await this.workspaceProvisioning.allocateDirectoryWorkspaceForLaunch({
           cwd: createAgentConfig.cwd,
-          initialTitle: workspacePromptTitle,
-        },
-      );
-      const createdDirectoryWorkspaceForAgent = !createdWorktree && !msg.workspaceId;
+          title: workspacePromptTitle,
+        });
+        workspaceId = directoryLaunch.workspaceId;
+      }
+      const createdDirectoryWorkspaceForAgent = directoryLaunch !== null;
 
       const { snapshot, liveSnapshot } = await createAgentCommand(
         {
@@ -2882,6 +2898,10 @@ export class Session {
         },
       );
       createdAgentId = snapshot.id;
+      if (directoryLaunch) {
+        directoryLaunch.retain();
+        directoryLaunch.commit();
+      }
       await this.agentUpdates.forwardLiveAgent(snapshot);
       if (createdDirectoryWorkspaceForAgent && trimmedPrompt) {
         this.workspaceAutoName.scheduleForDirectory(
@@ -2920,6 +2940,18 @@ export class Session {
         createdWorktree: createdWorktreeForCleanup,
         createdAgentId,
       });
+      if (directoryLaunch) {
+        const failedWorkspaceId = directoryLaunch.workspaceId;
+        await directoryLaunch.cleanupUnusedOnFailure();
+        try {
+          await this.emitWorkspaceUpdateForWorkspaceId(failedWorkspaceId);
+        } catch (emitError) {
+          this.sessionLogger.error(
+            { err: emitError, workspaceId: failedWorkspaceId },
+            "Failed to emit workspace update after directory launch cleanup",
+          );
+        }
+      }
       const wireError = toWorktreeWireError(error);
       this.sessionLogger.error({ err: error }, "Failed to create agent");
       if (requestId) {

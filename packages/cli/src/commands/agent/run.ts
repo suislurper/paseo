@@ -406,18 +406,38 @@ async function connectToDaemonOrThrow(
 }
 
 // A workspace is the explicit home of a run: it owns the directory the agent
-// runs in. The CLI resolves one before creating any agent, so no run leans on
-// createAgent's legacy cwd->workspace fallback.
+// runs in. Explicit and ambient selection reuse an existing id. Bare runs leave
+// allocation to create_agent_request so Session can clean up unused directory
+// metadata if agent creation fails. --worktree still mints its workspace first.
 interface RunWorkspace {
-  id: string;
+  id?: string;
   cwd: string;
+}
+
+function logCreatedWorkspace(workspaceId: string, label?: string): void {
+  console.error(
+    label ? `Created workspace ${workspaceId} - ${label}` : `Created workspace ${workspaceId}`,
+  );
+  console.error(
+    "Tip: pass --workspace <id> (or set PASEO_WORKSPACE_ID) to run in an existing workspace.",
+  );
+}
+
+function maybeLogAllocatedDirectoryWorkspace(
+  requestedId: string | undefined,
+  agent: AgentSnapshotPayload,
+): void {
+  if (requestedId || !agent.workspaceId) {
+    return;
+  }
+  logCreatedWorkspace(agent.workspaceId);
 }
 
 // Workspace policy for `paseo run`. Precedence:
 //   1. --workspace <id>            -> run in that existing workspace
 //   2. $PASEO_WORKSPACE_ID         -> exported by workspace terminals
 //   3. --worktree <name>           -> mint a new worktree-backed workspace
-//   4. bare run                    -> mint a new local-backed workspace for cwd
+//   4. bare run                    -> Session allocates a directory workspace
 // --worktree is rejected alongside both --workspace and an ambient
 // $PASEO_WORKSPACE_ID (validateRunOptions), so worktree resolution here never
 // races an existing-workspace selection.
@@ -436,18 +456,20 @@ async function resolveRunWorkspace(
     return { id: explicit, cwd };
   }
 
+  if (!options.worktree) {
+    return { cwd };
+  }
+
   // TODO: thread the run `prompt` as firstAgentContext so workspace-level
   // title/branch generation picks up the task description (U8/U6 deferred).
-  const result = options.worktree
-    ? await client.createWorkspace({
-        source: {
-          kind: "worktree",
-          cwd,
-          worktreeSlug: options.worktree,
-          baseBranch: options.base,
-        },
-      })
-    : await client.createWorkspace({ source: { kind: "directory", path: cwd } });
+  const result = await client.createWorkspace({
+    source: {
+      kind: "worktree",
+      cwd,
+      worktreeSlug: options.worktree,
+      baseBranch: options.base,
+    },
+  });
 
   if (!result.workspace) {
     throw {
@@ -458,10 +480,7 @@ async function resolveRunWorkspace(
 
   const branch = result.workspace.gitRuntime?.currentBranch;
   const label = branch ? `${result.workspace.name} (${branch})` : result.workspace.name;
-  console.error(`Created workspace ${result.workspace.id} - ${label}`);
-  console.error(
-    "Tip: pass --workspace <id> (or set PASEO_WORKSPACE_ID) to run in an existing workspace.",
-  );
+  logCreatedWorkspace(result.workspace.id, label);
   return { id: result.workspace.id, cwd: result.workspace.workspaceDirectory ?? cwd };
 }
 
@@ -524,6 +543,7 @@ export async function runRunCommand(
             env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
           });
+          maybeLogAllocatedDirectoryWorkspace(workspaceId, structuredAgent);
         } else {
           await client.sendMessage(structuredAgent.id, structuredPrompt);
         }
@@ -593,6 +613,7 @@ export async function runRunCommand(
       env: requestEnv,
       labels: Object.keys(labels).length > 0 ? labels : undefined,
     });
+    maybeLogAllocatedDirectoryWorkspace(workspaceId, agent);
 
     // Default run behavior is foreground: wait for completion unless --detach is set.
     if (!options.detach) {

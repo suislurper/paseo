@@ -9,8 +9,33 @@ import { createProviderSnapshotManagerStub } from "../../test-utils/session-stub
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
-import { createAgentCommand } from "./create.js";
+import { createAgentCommand, type McpCreateAgentLaunchProvisioning } from "./create.js";
 import type { ManagedAgent } from "../agent-manager.js";
+
+function attachProvisioning(workspaceId: string, cwd: string): McpCreateAgentLaunchProvisioning {
+  return {
+    async allocateDirectoryWorkspaceForLaunch() {
+      throw new Error("test should not allocate a directory workspace");
+    },
+    async requireExistingWorkspaceForLaunch(id) {
+      if (id !== workspaceId) {
+        throw new Error(`unexpected workspace attach: ${id}`);
+      }
+      return { cwd };
+    },
+  };
+}
+
+function unusedMcpLaunchProvisioning(): McpCreateAgentLaunchProvisioning {
+  return {
+    async allocateDirectoryWorkspaceForLaunch() {
+      throw new Error("test should not allocate a directory workspace");
+    },
+    async requireExistingWorkspaceForLaunch() {
+      throw new Error("test should not attach an existing workspace");
+    },
+  };
+}
 
 const logger = createTestLogger();
 
@@ -186,6 +211,7 @@ test("mcp create accepts provider-only internal input and leaves model undefined
         return {};
       }),
     } as Parameters<typeof createAgentCommand>[0]["providerSnapshotManager"],
+    mcpLaunchProvisioning: attachProvisioning("ws-create-test", "/tmp/paseo-create-test"),
   };
 
   await createAgentCommand(dependencies, {
@@ -307,6 +333,7 @@ test("mcp create stamps the new worktree's workspaceId, not the parent's", async
           repoRoot: workdir,
           createdWorkspaceId: "ws-new-worktree",
         }),
+        mcpLaunchProvisioning: unusedMcpLaunchProvisioning(),
       },
       {
         kind: "mcp",
@@ -355,6 +382,7 @@ test("mcp create exposes the created worktree before dispatching the initial pro
           },
         },
         createPaseoWorktree: async () => createdWorktree,
+        mcpLaunchProvisioning: unusedMcpLaunchProvisioning(),
       },
       {
         kind: "mcp",

@@ -93,6 +93,7 @@ interface WorkerTerminalManagerOptions {
   requestTimeoutMs?: number;
   forkWorker?: () => TerminalWorkerProcess;
   getTerminalActivityUrl?: () => string | null;
+  beforeCreateTerminal?: (workspaceId: string) => Promise<void>;
 }
 
 function createActivityToken(): string {
@@ -682,6 +683,9 @@ export function createWorkerTerminalManager(
     async createTerminal(
       options: WorkerCreateTerminalOptions & { workspaceId: string },
     ): Promise<TerminalSession> {
+      if (managerOptions.beforeCreateTerminal) {
+        await managerOptions.beforeCreateTerminal(options.workspaceId);
+      }
       const terminalId = options.id ?? randomUUID();
       const activityToken = createActivityToken();
       const terminalActivityUrl = managerOptions.getTerminalActivityUrl?.() ?? null;

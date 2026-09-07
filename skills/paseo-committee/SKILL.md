@@ -6,15 +6,15 @@ user-invocable: true
 
 # Committee Skill
 
-Two agents from contrasting providers, fresh context, planning a solution in parallel. They stay alive for review after implementation.
+Two agents from contrasting providers, fresh context, producing an advisory plan in parallel.
 
-The purpose is to step back, not double down. The committee may propose a completely different approach.
+The purpose is to step back, not double down. The committee may propose a completely different approach. It does not implement, and it does not substitute for or reopen a repository's governed final review.
 
 **User's additional context:** $ARGUMENTS
 
 ## Prerequisites
 
-Read the **paseo** skill. Before choosing committee members, read `~/.paseo/orchestration-preferences.json` unless the user explicitly named providers in this request. Do not create committee agents until you have read it.
+Read the **paseo** skill. Before choosing committee members, read `~/.paseo/orchestration-preferences.json` unless the user explicitly named providers in this request. Launch each member with that skill's **Research launch contract**. Do not invent a permission gate before spawning.
 
 Contrast is the point of a committee, so pick across providers deliberately using the configured preferences rather than hardcoded defaults.
 
@@ -35,10 +35,10 @@ Override only when the user explicitly asks for different members.
   This is analysis only. Do NOT edit, create, or delete any files. Do NOT write code.
   ```
 
-- **Trust the wait.** Do not poll, send hurry-ups, or interrupt. GPT-5.4 can reason 15–30 minutes; Opus does extended thinking. Long waits mean it found something worth thinking about.
-- **You are the middleman.** Drive plan → implement → review without yielding to the user, except for divergences that need their call.
+- **Trust the wait.** Do not poll, send hurry-ups, or interrupt. Long waits mean it found something worth thinking about.
+- **Advisory only.** Synthesize the plan for the orchestrator. Do not implement from this skill. Do not treat committee output as governed final review.
 
-## Phase 1: Plan
+## Deliberate
 
 Write a problem-level prompt:
 
@@ -49,13 +49,13 @@ Write a problem-level prompt:
 - Explicit: "do root cause analysis"
 - Explicit: "state assumptions, ask why three levels deep, check whether you're patching a symptom or removing the problem"
 
-Create both agents in parallel via Paseo with `[Committee] <task>` titles and the same prompt. Wait for both — not just whichever finishes first.
+Create both agents in parallel via Paseo with `[Committee] <task>` titles and the same prompt. Default: temporary, same workspace. Use the research launch contract for relationship, workspace, permission mode, Codex `plan_mode`, thinking, and `lifecycle` / `cleanup` labels. Wait for both — not just whichever finishes first.
 
 Read both responses. Challenge them — do not accept at face value:
 
 - "Why does <underlying thing> happen? Symptom or cause?"
 - Verify any assumption the plan makes about the code.
-- "What did you considered and reject?"
+- "What did you consider and reject?"
 
 Send follow-ups until the plan addresses root cause.
 
@@ -64,20 +64,4 @@ Synthesize:
 - Convergence → unified plan.
 - Significant divergence → involve the user.
 
-Confirm the merged plan with both members. Multi-turn until consensus.
-
-## Phase 2: Implement
-
-Default: implement yourself. If the user said **"delegate"**, launch one impl agent and pass the merged plan.
-
-The committee stays clean — not involved in implementation.
-
-## Phase 3: Review
-
-Send the diff to the committee:
-
-> Implementation is done. Review changes against the plan. Flag drift or missing pieces. <no-edits suffix>
-
-Apply feedback yourself, or send to the impl agent. Repeat 2 → 3 until consensus.
-
-After ~10 iterations without convergence, start a fresh committee with the full history of what was tried — the current committee's context may have drifted too far.
+Confirm the merged plan with both members. Then stop. Finish follow-ups and archive both members unless the user asks to keep an advisor around.

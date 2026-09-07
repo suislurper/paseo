@@ -13,11 +13,11 @@ Single agent. Reads the situation you're in. Gives a judgment. You decide what t
 
 ## Prerequisites
 
-Read the **paseo** skill. Before choosing a provider, read `~/.paseo/orchestration-preferences.json` unless the user explicitly named a provider in this request. Do not create the advisor until you have read it.
+Read the **paseo** skill. Before choosing a provider, read `~/.paseo/orchestration-preferences.json` unless the user explicitly named a provider in this request. Launch with that skill's **Research launch contract**. Do not invent a permission gate before spawning.
 
 ## Picking the advisor
 
-1. **User named one** (`--provider claude/opus`) → use it.
+1. **User named one** (`--provider` with a `provider/model`) → use it.
 2. **Otherwise** resolve from preferences — pick the category that matches the question:
    - Design / approach question → `planning`
    - "Did I miss something" review → `audit`
@@ -57,8 +57,8 @@ Pass through any remaining arguments after the skill name as the skill's own inp
 
 ## Launch and synthesize
 
-Create the advisor agent via Paseo with a `[Advisor] <topic>` title and the briefing as the initial prompt. Wait for it to finish. Read its response. Synthesize for the user — the advisor's verdict + your recommendation.
+Default: temporary, same workspace. Title `[Advisor] <topic>`. Use the research launch contract for relationship, workspace, permission mode, Codex `plan_mode`, thinking, and `lifecycle` / `cleanup` labels.
 
-## Persistent advisor
+Wait for it to finish. Read its response. Synthesize for the user — the advisor's verdict + your recommendation. Finish follow-ups, then archive.
 
-If the user wants ongoing input ("keep this advisor for the next few decisions"), don't archive after the first reply. Send follow-ups when you need another take. Archive when the user says they're done, or when the topic shifts and a fresh context would serve better.
+Keep the advisor only when the user asks for ongoing input. Send follow-ups while it is retained. Archive when they say they're done, or when the topic shifts and a fresh context would serve better.

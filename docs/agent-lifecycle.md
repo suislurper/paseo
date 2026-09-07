@@ -36,6 +36,14 @@ Users can also detach an existing subagent from the subagents track. Detach remo
 
 `notifyOnFinish` defaults to `true` for agent-scoped creation and background prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` only for truly fire-and-forget agents or prompts.
 
+### Temporary children
+
+Ordinary read-only research, advisors, and committee members attach to the parent's existing workspace. They are `relationship: { kind: "subagent" }` with `workspace: { kind: "current" }` in an agent-scoped session, or `workspace: { kind: "existing", workspaceId }` for the parent's workspace from a top-level session. They do not create a workspace or worktree for attachment, and they do not inherit Plan mode from the parent.
+
+Stamp them with labels `lifecycle=temporary-child` and `cleanup=archive-on-finish` so the cleanup intent is visible. Those labels do not auto-archive; after the parent consumes the result and finishes follow-ups, it archives the child with `archive_agent`. Keep an advisor only when the user asks for one to stay.
+
+Archiving a child is not workspace archival. Never archive the shared parent workspace to clean up a child.
+
 ## Provider-managed child agents
 
 Some providers can create their own child sessions inside one provider runtime. OMP's task tool reports these with `child_session` events; `AgentManager` imports the live provider handle, stamps `paseo.parent-agent-id`, and surfaces the result as a normal subagent in the parent's subagents track.
@@ -52,7 +60,9 @@ workspace reference, Paseo runs teardown and removes that worktree. An
 externally created worktree is rejected before its workspace or agents are
 archived, so the UI cannot report success while leaving an unexpected checkout
 on disk. External worktrees must be removed with Git or explicitly hidden
-without deleting files.
+without deleting files. When a repository defines its own worktree closeout,
+that procedure overrides generic `archive_worktree`. The shared parent
+workspace of a temporary child is never the child's cleanup target.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). If the same request created a Paseo worktree through its `worktree` field, auto-archive archives that worktree too, which removes the agent records inside the worktree.
 
@@ -66,11 +76,32 @@ Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/
 
 Cascade is what keeps subagent fleets from outliving their orchestrator.
 
-Workspace archive is a separate lifecycle. Archiving or removing a worktree can close a surviving
+Workspace archive is a separate lifecycle. Archiving an agent does not archive its
+workspace. Archiving or removing a worktree can close a surviving
 agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the
 archived workspace. History navigation must not infer workspace lifecycle from `agent.archivedAt`
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state;
 only the route's explicit Unarchive or Restore action changes the archived workspace.
+
+A `create_agent_request` without a worktree or explicit workspace id allocates a
+request-owned directory workspace. MCP `create_agent` directory create and
+internal MCP-kind creates with no explicit or parent workspace do the same; the
+command owns the launch so a failed provider or mode does not leave an unused
+active record. Directory create does not inherit the parent workspace. If that
+agent never lands and nothing else references the new id — managed or persisted
+agents, including partial registration, or a terminal — the daemon archives only
+that metadata record and leaves the directory files in place. If reference
+inspection is unavailable or fails, the daemon conservatively preserves the
+record and logs the workspace ID. Cleanup is metadata archival only; it does
+not delete historical files. Explicit workspace ids, `workspace: { kind:
+"current" | "existing" }`, import attachments, and new
+terminals retain a provisional workspace before they can be archived, so an
+independent attach cannot be cleaned up from under them. `open_project` retains a
+selected same-directory provisional claim immediately, then re-reads the registry
+before refresh; if launch cleanup already archived the record, open follows the
+archived/new-workspace path instead of returning a stale active descriptor. Bare `paseo run` does
+not mint a directory workspace before `createAgent`; Session owns that
+allocation and cleanup.
 
 ## Tabs vs archive
 

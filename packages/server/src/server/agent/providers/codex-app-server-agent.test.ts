@@ -4333,14 +4333,14 @@ describe("Codex app-server provider", () => {
     });
     asInternals(session).collaborationModes = [
       {
-        name: "Code",
-        mode: "code",
-        developer_instructions: "Built-in code mode",
-      },
-      {
         name: "Plan",
         mode: "plan",
         developer_instructions: "Built-in plan mode",
+      },
+      {
+        name: "Code",
+        mode: "code",
+        developer_instructions: "Built-in code mode",
       },
     ];
     asInternals(session).refreshResolvedCollaborationMode();

@@ -95,6 +95,7 @@ export interface TerminalManager {
 
 export interface TerminalManagerOptions {
   getTerminalActivityUrl?: () => string | null;
+  beforeCreateTerminal?: (workspaceId: string) => Promise<void>;
 }
 
 function createActivityToken(): string {
@@ -322,6 +323,9 @@ export function createTerminalManager(
       activityToken?: string;
       activityUrl?: string | null;
     }): Promise<TerminalSession> {
+      if (managerOptions.beforeCreateTerminal) {
+        await managerOptions.beforeCreateTerminal(options.workspaceId);
+      }
       assertAbsolutePath(options.cwd);
 
       const terminals = terminalsByCwd.get(options.cwd) ?? [];

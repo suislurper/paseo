@@ -30,11 +30,18 @@ import type {
 } from "./agent/agent-sdk-types.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { AgentManager } from "./agent/agent-manager.js";
-import { createAgentCommand } from "./agent/create-agent/create.js";
+import {
+  createAgentCommand,
+  type McpCreateAgentLaunchProvisioning,
+} from "./agent/create-agent/create.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
-import { FileBackedProjectRegistry, FileBackedWorkspaceRegistry } from "./workspace-registry.js";
+import {
+  createPersistedWorkspaceRecord,
+  FileBackedProjectRegistry,
+  FileBackedWorkspaceRegistry,
+} from "./workspace-registry.js";
 import { LoopService } from "./loop-service.js";
 import { isPlatform } from "../test-utils/platform.js";
 import { createTestLogger } from "../test-utils/test-logger.js";
@@ -68,12 +75,31 @@ interface TestLoopServiceOptions {
     cwd: string,
     firstAgentContext?: { prompt: string },
   ) => Promise<string>;
+  mcpLaunchProvisioning?: McpCreateAgentLaunchProvisioning;
 }
 
 function createLoopService(options: TestLoopServiceOptions): LoopService {
   const providerSnapshotManager = options.providerSnapshotManager ?? NO_UNATTENDED_LOOP_POLICY;
   const ensureWorkspaceForCreate =
     options.ensureWorkspaceForCreate ?? (async () => "workspace-created-for-loop");
+  const mcpLaunchProvisioning =
+    options.mcpLaunchProvisioning ??
+    ({
+      async allocateDirectoryWorkspaceForLaunch() {
+        throw new Error("loop tests pass an explicit workspaceId");
+      },
+      async requireExistingWorkspaceForLaunch(workspaceId) {
+        return createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "prj_loop_test",
+          cwd: options.paseoHome,
+          kind: "directory",
+          displayName: "loop",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        });
+      },
+    } satisfies McpCreateAgentLaunchProvisioning);
   return new LoopService({
     paseoHome: options.paseoHome,
     agentManager: options.agentManager,
@@ -86,7 +112,7 @@ function createLoopService(options: TestLoopServiceOptions): LoopService {
           agentStorage: options.agentStorage,
           logger: options.logger,
           providerSnapshotManager: providerSnapshotManager as ProviderSnapshotManager,
-          ensureWorkspaceForCreate,
+          mcpLaunchProvisioning,
         },
         input,
       ),
@@ -96,6 +122,7 @@ function createLoopService(options: TestLoopServiceOptions): LoopService {
 async function createRegistryBackedWorkspaceEnsure(rootDir: string): Promise<{
   workspaceRegistry: FileBackedWorkspaceRegistry;
   ensureWorkspaceForCreate: TestLoopServiceOptions["ensureWorkspaceForCreate"];
+  mcpLaunchProvisioning: McpCreateAgentLaunchProvisioning;
 }> {
   const workspaceRegistry = new FileBackedWorkspaceRegistry(
     path.join(rootDir, "projects", "workspaces.json"),
@@ -112,6 +139,7 @@ async function createRegistryBackedWorkspaceEnsure(rootDir: string): Promise<{
     projectRegistry,
     workspaceRegistry,
     workspaceGitService,
+    logger: createTestLogger(),
   });
   return {
     workspaceRegistry,
@@ -122,6 +150,7 @@ async function createRegistryBackedWorkspaceEnsure(rootDir: string): Promise<{
       );
       return workspace.workspaceId;
     },
+    mcpLaunchProvisioning: workspaceProvisioning,
   };
 }
 
@@ -447,7 +476,7 @@ describe("LoopService", () => {
   });
 
   test("loop worker and verifier agents share one registry workspace across iterations", async () => {
-    const { workspaceRegistry, ensureWorkspaceForCreate } =
+    const { workspaceRegistry, ensureWorkspaceForCreate, mcpLaunchProvisioning } =
       await createRegistryBackedWorkspaceEnsure(tmpDir);
     let verifierCount = 0;
     const manager = new AgentManager({
@@ -473,6 +502,7 @@ describe("LoopService", () => {
       agentStorage: storage,
       logger,
       ensureWorkspaceForCreate,
+      mcpLaunchProvisioning,
     });
     await service.initialize();
 

@@ -13,7 +13,6 @@ import {
   createPersistedWorkspaceRecord,
   type WorkspaceRegistry,
 } from "../../workspace-registry.js";
-import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import {
   createWorkspaceProvisioningService,
   WorkspaceProvisioningError,
@@ -348,48 +347,6 @@ test("does not unarchive either record when checkout refresh fails", async () =>
 
   expect(await projectRegistry.get(created.projectId)).toEqual(archivedProject);
   expect(await workspaceRegistry.get(created.workspaceId)).toEqual(archivedWorkspace);
-});
-
-test("resolveOrCreateWorkspaceIdForCreateAgent returns a created worktree's id without touching the registry", async () => {
-  // The branch only reads workspace.workspaceId off the worktree result.
-  const createdWorktree = {
-    workspace: { workspaceId: "ws-from-worktree" },
-  } as unknown as CreatePaseoWorktreeWorkflowResult;
-
-  const id = await provisioning.resolveOrCreateWorkspaceIdForCreateAgent({
-    createdWorktree,
-    cwd: path.join(tmpDir, "x"),
-    initialTitle: null,
-  });
-
-  expect(id).toBe("ws-from-worktree");
-  expect(await workspaceRegistry.list()).toHaveLength(0);
-});
-
-test("resolveOrCreateWorkspaceIdForCreateAgent honors an explicitly requested workspace id", async () => {
-  const id = await provisioning.resolveOrCreateWorkspaceIdForCreateAgent({
-    createdWorktree: null,
-    requestedWorkspaceId: "ws-requested",
-    cwd: path.join(tmpDir, "x"),
-    initialTitle: null,
-  });
-
-  expect(id).toBe("ws-requested");
-  expect(await workspaceRegistry.list()).toHaveLength(0);
-});
-
-test("resolveOrCreateWorkspaceIdForCreateAgent creates a titled workspace when nothing is provided", async () => {
-  const dir = path.join(tmpDir, "plain");
-
-  const id = await provisioning.resolveOrCreateWorkspaceIdForCreateAgent({
-    createdWorktree: null,
-    cwd: dir,
-    initialTitle: "My Title",
-  });
-
-  const created = await workspaceRegistry.get(id);
-  expect(created?.cwd).toBe(dir);
-  expect(created?.title).toBe("My Title");
 });
 
 test("createWorkspaceForDirectory always mints a fresh workspace even when one already occupies the cwd", async () => {

@@ -18,11 +18,11 @@ Returns `{ branchName, worktreePath, workspaceId }`. Pass `cwd` to target a spec
 In `branch-off`, `worktreeSlug` controls the worktree path slug and `branchName` controls the git branch. If `branchName` is omitted, Paseo defaults it from `worktreeSlug`. The returned `branchName` is authoritative; checkout and PR flows may return a branch name that differs from any requested slug.
 
 **`list_worktrees`** — current repo (or pass `cwd`).
-**`archive_worktree`** — `{ worktreePath }` or `{ worktreeSlug }`. Removes worktree and branch.
+**`archive_worktree`** — `{ worktreePath }` or `{ worktreeSlug }`. Removes worktree and branch. Repository-specific worktree closeout, when a repo defines one, overrides this generic call.
 
 ## Agents
 
-**`create_agent`** — required: `relationship`, `workspace`, `title`, `provider` (`claude/opus`, `codex/gpt-5.4`, …), `initialPrompt`. Common: `notifyOnFinish`, `settings`, `labels`. Returns `{ agentId, … }`.
+**`create_agent`** — required: `relationship`, `workspace`, `title`, `provider` (`provider/model`), `initialPrompt`. Common: `notifyOnFinish`, `settings`, `labels`. Returns `{ agentId, … }`.
 
 Initial runtime settings live under `settings`: `modeId`, `thinkingOptionId`, and provider-specific `features`. For Codex fast mode, pass `settings: { features: { "fast_mode": true } }` when creating the agent.
 
@@ -52,7 +52,29 @@ Agent-scoped `create_agent` defaults `notifyOnFinish` to true. Set it to `false`
 
 **`list_agents`** — filter by `cwd`, `statuses`, `sinceHours`, `includeArchived`.
 
-**`archive_agent`** — `{ agentId }`. Interrupts if running, removes from active list.
+**`archive_agent`** — `{ agentId }`. Interrupts if running, removes from active list. Archiving an agent is not workspace archival.
+
+## Research launch contract
+
+Ordinary read-only research uses this contract. Other Paseo skills reference it instead of restating it. Keep worktree, CLI, schedule, and loop surfaces for those requested workflows.
+
+Delegation is discretionary: spawn only when a bounded independent investigation improves coverage, speed, or confidence. At most three children. No recursive delegation. Do not enter Plan because the parent is in Plan.
+
+1. Read `~/.paseo/orchestration-preferences.json` and resolve `providers.research`. Effort comes from that policy (currently high). Confirm provider, model, mode, thinking option, and features with `inspect_provider` (and `list_models` if needed) before launch. If every configured research route is unavailable, continue the investigation locally. Do not silently substitute a native subagent.
+
+2. Launch via MCP `create_agent`. Do not use `paseo run`, a schedule, a loop, or a new workspace/worktree for one-off exploration. Failed attachment is not permission to create a workspace.
+
+3. Required launch fields:
+   - `relationship: { kind: "subagent" }`
+   - `workspace: { kind: "current" }` when agent-scoped; otherwise `{ kind: "existing", workspaceId }` for the parent's existing workspace
+   - explicit `settings.modeId` from policy (Codex research children: `full-access`; never `plan`, never an implicit default)
+   - `settings.thinkingOptionId` as configured
+   - Codex: `settings.features.plan_mode: false` when `inspect_provider` lists that feature
+   - `labels`: `lifecycle=temporary-child`, `cleanup=archive-on-finish`
+
+4. Permission mode is not a sandbox. Codex `full-access` prevents approval prompts; read-only behavior is the prompt. The prompt states a bounded question and evidence requirements, forbids edits, Git mutation, services, databases, and recursive delegation, and asks for source-backed findings — not a proposed plan and not questions back to the user.
+
+5. Consume the result and any follow-ups, then `archive_agent` the child. Never archive the shared parent workspace to clean up a child. Repository-specific worktree closeout, when a repo defines one, overrides generic `archive_worktree`.
 
 ## Provider discovery
 
@@ -72,7 +94,7 @@ Only set feature IDs returned by `inspect_provider`. For Codex fast mode, look f
 
 ## Models
 
-`claude/sonnet` (default), `claude/opus` (harder reasoning), `codex/gpt-5.4` (frontier coding), `claude/haiku` (tests only).
+`create_agent`'s `provider` field is `provider/model`. Read `~/.paseo/orchestration-preferences.json` and pass `providers.<role>` for the role you are launching. Discover live IDs and thinking options with `list_providers`, `list_models`, and `inspect_provider`. Do not copy example provider strings from this skill into a launch.
 
 ## Orchestration preferences
 
@@ -88,19 +110,23 @@ Categories: `impl`, `ui`, `research`, `planning`, `audit`. Skills pick the categ
 ```json
 {
   "providers": {
-    "impl": "codex/gpt-5.4",
-    "ui": "claude/opus",
-    "research": "codex/gpt-5.4",
-    "planning": "codex/gpt-5.4",
-    "audit": "codex/gpt-5.4"
+    "impl": "<impl-provider/model>",
+    "ui": "<ui-provider/model>",
+    "research": "<research-provider/model>",
+    "planning": "<planning-provider/model>",
+    "audit": "<audit-provider/model>"
   },
   "preferences": [
-    "Claude Opus is the right choice for anything artistic or human-skill-oriented: copywriting, naming, UX copy, visual design, styling. Codex is the workhorse for mechanical work."
+    "Role-specific routing and effort live in this file. Read it; do not invent a provider string."
   ]
 }
 ```
 
-If the file is missing, use sensible defaults and tell the user once.
+If the file is missing, tell the user once. For research, do not invent a route — continue locally.
+
+## Canonical skills
+
+These skills ship in the Paseo fork bundle (`skills/` in the repository). Desktop startup syncs them into `~/.agents/skills`, `~/.claude/skills`, and `~/.codex/skills`. Those three locations are managed outputs: edit the canonical sources; startup overwrites bundled files that differ on disk and preserves user-added files. Do not treat an installed copy as the source of truth.
 
 ## Waiting
 
@@ -115,14 +141,14 @@ Don't poll `list_agents` or `get_agent_status` to "check on" a running agent. Th
 The `paseo` CLI is a thin wrapper over the same daemon. Same surface:
 
 ```bash
-paseo run --provider codex/gpt-5.4 --mode full-access --worktree feat/x "<prompt>"
+paseo run --provider <impl-provider/model> --mode full-access --worktree feat/x "<prompt>"
 paseo send <agent-id> "<follow-up>"
 paseo ls
 paseo worktree ls
 paseo schedule create --cron "*/15 * * * *" "ping main build"
 ```
 
-Discover with `paseo --help` and `paseo <cmd> --help`.
+Discover with `paseo --help` and `paseo <cmd> --help`. Do not use `paseo run`, schedules, or loops as a substitute for the research launch contract.
 
 **If `paseo` isn't on PATH but the desktop app is installed**, the bundled CLI is at:
 

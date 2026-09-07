@@ -24,15 +24,15 @@ Ask the orchestrator to inspect providers first when you are unsure of the exact
 
 ## Fan out research
 
-Read-only work can safely share one workspace:
+Read-only work can safely share one workspace. Attach researchers to the current workspace; do not create a worktree, schedule, or loop for a one-off lookup.
 
 ```text
-Create three Paseo subagents in this workspace. Have one trace the request path,
+Create up to three Paseo subagents in this workspace. Have one trace the request path,
 one inspect the tests, and one look for related regressions. Do not edit files.
-Synthesize their findings when all three report back.
+Synthesize their findings when they report back, then archive the researchers.
 ```
 
-Each worker appears in the Subagents track, and the orchestrator can keep working while they run.
+Each worker appears in the Subagents track, and the orchestrator can keep working while they run. A parent in Plan mode still launches these helpers in ordinary execution mode.
 
 ## Parallelize edits without collisions
 

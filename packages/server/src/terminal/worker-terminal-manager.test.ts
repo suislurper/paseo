@@ -972,3 +972,69 @@ it("removes a killed worker terminal from terminalExit without duplicate snapsho
     },
   ]);
 });
+
+it("awaits beforeCreateTerminal before sending createTerminal to the worker", async () => {
+  const events: string[] = [];
+  let beforeStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    beforeStarted = resolve;
+  });
+  let releaseBefore!: () => void;
+  const beforeGate = new Promise<void>((resolve) => {
+    releaseBefore = resolve;
+  });
+  let sendStarted!: (message: TerminalWorkerRequest) => void;
+  const sent = new Promise<TerminalWorkerRequest>((resolve) => {
+    sendStarted = resolve;
+  });
+  const worker = new FakeTerminalWorker();
+  const originalSend = worker.send.bind(worker);
+  worker.send = (message, callback) => {
+    events.push(`send:${message.type}`);
+    sendStarted(message);
+    return originalSend(message, callback);
+  };
+  manager = createWorkerTerminalManager({
+    requestTimeoutMs: 200,
+    forkWorker: () => worker,
+    beforeCreateTerminal: async (workspaceId) => {
+      events.push(`before:${workspaceId}`);
+      beforeStarted();
+      await beforeGate;
+    },
+  });
+
+  const pending = manager.createTerminal({ cwd: "/workspace", workspaceId: "ws-owned" });
+  await started;
+  expect(events).toEqual(["before:ws-owned"]);
+  expect(worker.sentMessages).toEqual([]);
+
+  releaseBefore();
+  const request = await sent;
+  expect(events).toEqual(["before:ws-owned", "send:createTerminal"]);
+  expect(request.type).toBe("createTerminal");
+  worker.emitWorkerMessage({
+    type: "response",
+    requestId: request.requestId,
+    ok: false,
+    error: "stop",
+  });
+  await expect(pending).rejects.toThrow("stop");
+});
+
+it("rejects archived workspaces in beforeCreateTerminal before the worker spawn", async () => {
+  const worker = new FakeTerminalWorker();
+  manager = createWorkerTerminalManager({
+    requestTimeoutMs: 50,
+    forkWorker: () => worker,
+    beforeCreateTerminal: async (workspaceId) => {
+      throw new Error(`Archived workspace: ${workspaceId}`);
+    },
+  });
+
+  await expect(
+    manager.createTerminal({ cwd: "/workspace", workspaceId: "ws-archived" }),
+  ).rejects.toThrow("Archived workspace: ws-archived");
+  expect(worker.sentMessages).toEqual([]);
+  expect(manager.listDirectories()).toEqual([]);
+});

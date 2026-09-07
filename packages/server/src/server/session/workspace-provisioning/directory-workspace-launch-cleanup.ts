@@ -88,10 +88,17 @@ export function openDirectoryWorkspaceLaunch(
     let inspection: DirectoryWorkspaceLaunchReferenceInspection;
     try {
       inspection = await inspectReferences(workspaceId);
-    } catch {
+    } catch (error) {
+      logger.error(
+        { err: error, workspaceId },
+        "Directory workspace launch reference inspection failed",
+      );
       return "preserve";
     }
-    if (inspection.available !== true) return "preserve";
+    if (inspection.available !== true) {
+      logger.error({ workspaceId }, "Directory workspace launch reference inspection unavailable");
+      return "preserve";
+    }
     const referenced =
       inspection.hasManagedAgent || inspection.hasPersistedAgent || inspection.hasTerminal;
     if (referenced) return "preserve";

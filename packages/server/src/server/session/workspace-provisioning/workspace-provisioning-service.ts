@@ -144,6 +144,7 @@ export function createWorkspaceProvisioningService(deps: {
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
   ): Promise<ImportWorkspaceResult<T>> {
     if (input.requestedWorkspaceId) {
+      retainDirectoryWorkspaceLaunch(input.requestedWorkspaceId);
       const workspace = await workspaceRegistry.get(input.requestedWorkspaceId);
       if (!workspace || workspace.archivedAt) {
         throw new Error(`Workspace not found: ${input.requestedWorkspaceId}`);
@@ -266,17 +267,32 @@ export function createWorkspaceProvisioningService(deps: {
     try {
       await workspaceRegistry.upsert(workspace);
     } catch (error) {
-      const leftover = await workspaceRegistry.get(workspace.workspaceId);
-      if (!leftover) {
-        launch.commit();
-        throw error;
-      }
-      logger.error(
-        { err: error, workspaceId: workspace.workspaceId },
-        "Directory workspace allocation persist failed after cache mutation",
-      );
+      await failDirectoryWorkspaceAllocation(launch, error);
+      throw error;
     }
     return launch;
+  }
+
+  async function failDirectoryWorkspaceAllocation(
+    launch: DirectoryWorkspaceLaunch,
+    error: unknown,
+  ): Promise<void> {
+    const workspaceId = launch.workspaceId;
+    try {
+      const leftover = await workspaceRegistry.get(workspaceId);
+      logger.error(
+        { err: error, workspaceId },
+        leftover
+          ? "Directory workspace allocation persist failed after cache mutation"
+          : "Directory workspace allocation persist failed",
+      );
+    } catch (lookupError) {
+      logger.error(
+        { err: error, workspaceId, lookupError },
+        "Directory workspace allocation persist failed; leftover lookup also failed",
+      );
+    }
+    await launch.cleanupUnusedOnFailure();
   }
 
   function retainDirectoryWorkspaceLaunch(workspaceId: string): void {
@@ -286,11 +302,13 @@ export function createWorkspaceProvisioningService(deps: {
   async function requireExistingWorkspaceForLaunch(
     workspaceId: string,
   ): Promise<PersistedWorkspaceRecord> {
+    retainDirectoryWorkspaceLaunch(workspaceId);
     const workspace = await workspaceRegistry.get(workspaceId);
     if (!workspace) throw new WorkspaceProvisioningError("unknown_workspace", workspaceId);
     if (workspace.archivedAt) {
       throw new WorkspaceProvisioningError("archived_workspace", workspaceId);
     }
+    await requireActiveProject(workspace.projectId);
     return workspace;
   }
 

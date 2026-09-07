@@ -588,8 +588,18 @@ export async function createPaseoDaemon(
   app.set("trust proxy", resolveExpressTrustProxySetting(config));
   let boundListenTarget: ListenTarget | null = null;
   let workspaceRegistry: FileBackedWorkspaceRegistry | null = null;
+  const workspaceProvisioningRef: {
+    current: ReturnType<typeof createWorkspaceProvisioningService> | null;
+  } = { current: null };
   const terminalManager = createConfiguredTerminalManager({
     getTerminalActivityUrl: () => createTerminalActivityUrl(boundListenTarget),
+    beforeCreateTerminal: async (workspaceId) => {
+      const provisioning = workspaceProvisioningRef.current;
+      if (!provisioning) {
+        throw new Error("Workspace provisioning is not ready");
+      }
+      await provisioning.requireExistingWorkspaceForLaunch(workspaceId);
+    },
   });
   applyTerminalAgentHookSetting({ store: daemonConfigStore, logger });
 
@@ -811,6 +821,7 @@ export async function createPaseoDaemon(
     workspaceGitService,
     logger,
   });
+  workspaceProvisioningRef.current = workspaceProvisioning;
   const providerSnapshotLogger = logger.child({ module: "provider-snapshot-manager" });
   const providerSnapshotManager = new ProviderSnapshotManager({
     logger: providerSnapshotLogger,

@@ -310,11 +310,17 @@ test("failed worktree-kind allocation is not archived by launch cleanup", async 
   await expectActive(launch.workspaceId);
 });
 
+test("missing inspector preserves the unused launch workspace without logging inspection failure", async () => {
+  provisioning = createProvisioning({ inspect: undefined });
+  const launch = await provisioning.allocateDirectoryWorkspaceForLaunch({
+    cwd: path.join(tmpDir, "fail-safe-missing"),
+  });
+  await launch.cleanupUnusedOnFailure();
+  await expectActive(launch.workspaceId);
+  expect(errorLogs).toEqual([]);
+});
+
 test.each([
-  {
-    label: "missing inspector",
-    inspect: undefined,
-  },
   {
     label: "inspector throws",
     inspect: async () => {
@@ -325,20 +331,40 @@ test.each([
     label: "inspector reports unavailable",
     inspect: async () => ({ available: false as const }),
   },
-])("fail-safe $label preserves the unused launch workspace", async ({ inspect }) => {
-  provisioning = createProvisioning({ inspect });
-  const launch = await provisioning.allocateDirectoryWorkspaceForLaunch({
-    cwd: path.join(tmpDir, "fail-safe"),
-  });
-  await launch.cleanupUnusedOnFailure();
-  await expectActive(launch.workspaceId);
-});
+])(
+  "fail-safe $label preserves the unused launch workspace and logs the workspace id",
+  async ({ inspect }) => {
+    const original = new Error("agent create failed");
+    provisioning = createProvisioning({ inspect });
+    const launch = await provisioning.allocateDirectoryWorkspaceForLaunch({
+      cwd: path.join(tmpDir, "fail-safe"),
+    });
 
-test("allocation persist failure after cache mutation still owns the leftover for cleanup", async () => {
+    let thrown: unknown;
+    try {
+      try {
+        throw original;
+      } catch (error) {
+        await launch.cleanupUnusedOnFailure();
+        throw error;
+      }
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBe(original);
+    expect(errorLogs.map((entry) => entry.bindings.workspaceId)).toContain(launch.workspaceId);
+    await expectActive(launch.workspaceId);
+  },
+);
+
+test("allocation persist failure after cache mutation rejects, archives leftover, and keeps the original error", async () => {
   const persistError = new Error("persist failed after cache mutation");
+  let leftoverId: string | undefined;
   provisioning = createProvisioning({
     workspaceRegistry: wrapRegistry({
       upsert: async (record) => {
+        leftoverId = record.workspaceId;
         await workspaceRegistry.upsert(record);
         throw persistError;
       },
@@ -346,14 +372,43 @@ test("allocation persist failure after cache mutation still owns the leftover fo
     inspect: async () => unusedInspection,
     logger: capturingLogger(),
   });
-  const launch = await provisioning.allocateDirectoryWorkspaceForLaunch({
-    cwd: path.join(tmpDir, "leftover"),
-  });
-  expect(errorLogs.map((entry) => entry.bindings.workspaceId)).toContain(launch.workspaceId);
+
+  await expect(
+    provisioning.allocateDirectoryWorkspaceForLaunch({
+      cwd: path.join(tmpDir, "leftover"),
+    }),
+  ).rejects.toBe(persistError);
+
+  expect(leftoverId).toEqual(expect.any(String));
+  expect(errorLogs.map((entry) => entry.bindings.workspaceId)).toContain(leftoverId);
   expect(errorLogs.map((entry) => entry.bindings.err)).toContain(persistError);
-  await expectActive(launch.workspaceId);
-  await launch.cleanupUnusedOnFailure();
-  await expectArchived(launch.workspaceId);
+  await expectArchived(leftoverId as string);
+});
+
+test("allocation persist failure preserves the original error when leftover lookup fails", async () => {
+  const persistError = new Error("persist failed before leftover lookup");
+  const lookupError = new Error("leftover lookup failed");
+  provisioning = createProvisioning({
+    workspaceRegistry: wrapRegistry({
+      upsert: async () => {
+        throw persistError;
+      },
+      get: async () => {
+        throw lookupError;
+      },
+    }),
+    inspect: async () => unusedInspection,
+    logger: capturingLogger(),
+  });
+
+  await expect(
+    provisioning.allocateDirectoryWorkspaceForLaunch({
+      cwd: path.join(tmpDir, "lookup-failure"),
+    }),
+  ).rejects.toBe(persistError);
+
+  expect(errorLogs.map((entry) => entry.bindings.err)).toContain(persistError);
+  expect(errorLogs.map((entry) => entry.bindings.lookupError)).toContain(lookupError);
 });
 
 test("existing workspace attach validates the record and never creates a fallback", async () => {

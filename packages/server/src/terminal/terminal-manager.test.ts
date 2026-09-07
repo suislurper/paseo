@@ -457,6 +457,21 @@ it("setTerminalTitle returns false for unknown terminal ids without changing exi
   unsubscribe();
 });
 
+it("rejects createTerminal before spawn when beforeCreateTerminal fails", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "terminal-manager-before-create-"));
+  temporaryDirs.push(cwd);
+  manager = createTerminalManager({
+    beforeCreateTerminal: async (workspaceId) => {
+      throw new Error(`Archived workspace: ${workspaceId}`);
+    },
+  });
+
+  await expect(manager.createTerminal({ cwd, workspaceId: "ws-archived" })).rejects.toThrow(
+    "Archived workspace: ws-archived",
+  );
+  expect(manager.listDirectories()).toEqual([]);
+});
+
 it("setTerminalTitle returns true and updates the terminal title for existing terminals", async () => {
   manager = createTerminalManager();
   const session = await manager.createTerminal({

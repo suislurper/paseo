@@ -13,7 +13,6 @@ import {
   type WorkspaceRegistry,
 } from "../../workspace-registry.js";
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
-import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { areEquivalentPaths, createRealpathAwarePathMatcher } from "../../../utils/path.js";
 import {
   openDirectoryWorkspaceLaunch,
@@ -23,13 +22,6 @@ import {
 } from "./directory-workspace-launch-cleanup.js";
 
 export type { DirectoryWorkspaceLaunch, DirectoryWorkspaceLaunchReferenceInspection };
-
-export interface ResolveOrCreateWorkspaceIdInput {
-  createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
-  requestedWorkspaceId?: string;
-  cwd: string;
-  initialTitle: string | null;
-}
 
 export interface ImportWorkspaceInput {
   cwd: string;
@@ -64,7 +56,6 @@ export interface WorkspaceProvisioningService {
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
   ): Promise<ImportWorkspaceResult<T>>;
   findOrCreateWorkspaceForDirectory(cwd: string): Promise<PersistedWorkspaceRecord>;
-  resolveOrCreateWorkspaceIdForCreateAgent(input: ResolveOrCreateWorkspaceIdInput): Promise<string>;
   createWorkspaceForDirectory(
     cwd: string,
     title?: string | null,
@@ -406,14 +397,6 @@ export function createWorkspaceProvisioningService(deps: {
     return createWorkspaceForDirectory(normalizedCwd);
   }
 
-  async function resolveOrCreateWorkspaceIdForCreateAgent(
-    input: ResolveOrCreateWorkspaceIdInput,
-  ): Promise<string> {
-    if (input.createdWorktree) return input.createdWorktree.workspace.workspaceId;
-    if (input.requestedWorkspaceId) return input.requestedWorkspaceId;
-    return (await createWorkspaceForDirectory(input.cwd, input.initialTitle)).workspaceId;
-  }
-
   async function ensureWorkspaceRecordUnarchived(
     workspace: PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord> {
@@ -488,7 +471,6 @@ export function createWorkspaceProvisioningService(deps: {
   return {
     runInImportWorkspace,
     findOrCreateWorkspaceForDirectory,
-    resolveOrCreateWorkspaceIdForCreateAgent,
     createWorkspaceForDirectory,
     createWorkspaceForWorktree,
     findOrCreateProjectForDirectory,

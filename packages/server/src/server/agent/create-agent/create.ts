@@ -18,7 +18,7 @@ import type { AgentStorage } from "../agent-storage.js";
 import type { AgentOwner } from "../agent-owner.js";
 import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import { setupFinishNotification, startCreatedAgentInitialPrompt } from "../agent-prompt.js";
-import { resolveCreateAgentTitles } from "../create-agent-title.js";
+import { resolveCreateAgentTitles, resolveFirstAgentPromptTitle } from "../create-agent-title.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
 import { normalizeClientMessageId, resolveClientMessageId } from "../../client-message-id.js";
 import { resolveRequiredProviderModel, type ResolvedProviderModel } from "../mcp-shared.js";
@@ -26,6 +26,10 @@ import {
   appendTimelineItemIfAgentKnown,
   emitLiveTimelineItemIfAgentKnown,
 } from "../timeline-append.js";
+import type {
+  AllocateDirectoryWorkspaceForLaunchInput,
+  DirectoryWorkspaceLaunch,
+} from "../../session/workspace-provisioning/workspace-provisioning-service.js";
 
 export interface CreateAgentSessionWorktreeResult {
   sessionConfig: AgentSessionConfig;
@@ -33,6 +37,19 @@ export interface CreateAgentSessionWorktreeResult {
   // Set when this build created a fresh worktree workspace. The agent must be
   // stamped with it so workspaceId-scoped archive can find the agent later.
   createdWorkspaceId?: string;
+}
+
+export interface McpCreateAgentLaunchProvisioning {
+  allocateDirectoryWorkspaceForLaunch(
+    input: AllocateDirectoryWorkspaceForLaunchInput,
+  ): Promise<DirectoryWorkspaceLaunch>;
+  requireExistingWorkspaceForLaunch(workspaceId: string): Promise<{ cwd: string }>;
+}
+
+export interface DirectoryWorkspaceCommittedInput {
+  workspaceId: string;
+  cwd: string;
+  firstAgentContext: FirstAgentContext;
 }
 
 export interface CreateAgentCommandDependencies {
@@ -44,14 +61,19 @@ export interface CreateAgentCommandDependencies {
   terminalManager?: TerminalManager | null;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "resolveCreateConfig">;
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
-  // Mints a fresh directory workspace for a cwd and returns its id.
-  ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
+  mcpLaunchProvisioning?: McpCreateAgentLaunchProvisioning;
+  onDirectoryWorkspaceCommitted?: (input: DirectoryWorkspaceCommittedInput) => void | Promise<void>;
+  onDirectoryWorkspaceCleanup?: (workspaceId: string) => void | Promise<void>;
 }
 
 export type EnsureWorkspaceForCreate = (
   cwd: string,
   firstAgentContext?: FirstAgentContext,
 ) => Promise<string>;
+
+export type McpCreateAgentWorkspaceLaunch =
+  | { kind: "attach"; workspaceId: string }
+  | { kind: "directory" };
 
 export interface CreateAgentFromSessionInput {
   kind: "session";
@@ -84,6 +106,7 @@ export interface CreateAgentFromMcpInput {
   config?: Partial<AgentSessionConfig>;
   cwd?: string;
   workspaceId?: string;
+  workspaceLaunch?: McpCreateAgentWorkspaceLaunch;
   thinking?: string;
   features?: Record<string, unknown>;
   labels?: Record<string, string>;
@@ -174,16 +197,71 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
-  const resolved =
-    input.kind === "session"
-      ? await resolveSessionCreateAgent(dependencies, input)
-      : await resolveMcpCreateAgent(dependencies, input);
+  if (input.kind === "session") {
+    const resolved = await resolveSessionCreateAgent(dependencies, input);
+    return finishCreatedAgent(dependencies, input, resolved);
+  }
 
+  const directoryLaunchState: { current: DirectoryWorkspaceLaunch | null } = { current: null };
+  try {
+    const resolved = await resolveMcpCreateAgent(dependencies, input, {
+      onDirectoryLaunch(launch) {
+        directoryLaunchState.current = launch;
+      },
+    });
+    const result = await finishCreatedAgent(dependencies, input, resolved, {
+      beforePostCreate: async () => {
+        const directoryLaunch = directoryLaunchState.current;
+        if (!directoryLaunch) return;
+        directoryLaunch.retain();
+        directoryLaunch.commit();
+        directoryLaunchState.current = null;
+        await invokeGuardedWorkspaceCallback({
+          callback: dependencies.onDirectoryWorkspaceCommitted
+            ? () =>
+                dependencies.onDirectoryWorkspaceCommitted?.({
+                  workspaceId: directoryLaunch.workspaceId,
+                  cwd: resolved.config.cwd,
+                  firstAgentContext: mcpFirstAgentContext(input),
+                })
+            : undefined,
+          workspaceId: directoryLaunch.workspaceId,
+          logger: dependencies.logger,
+          message: "Failed to run directory workspace success side effects",
+        });
+      },
+    });
+    return result;
+  } catch (error) {
+    const directoryLaunch = directoryLaunchState.current;
+    if (directoryLaunch) {
+      const failedWorkspaceId = directoryLaunch.workspaceId;
+      await directoryLaunch.cleanupUnusedOnFailure();
+      await invokeGuardedWorkspaceCallback({
+        callback: dependencies.onDirectoryWorkspaceCleanup
+          ? () => dependencies.onDirectoryWorkspaceCleanup?.(failedWorkspaceId)
+          : undefined,
+        workspaceId: failedWorkspaceId,
+        logger: dependencies.logger,
+        message: "Failed to emit directory workspace cleanup update",
+      });
+    }
+    throw error;
+  }
+}
+
+async function finishCreatedAgent(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  resolved: ResolvedCreateAgent,
+  hooks?: { beforePostCreate?: () => void | Promise<void> },
+): Promise<CreateAgentCommandResult> {
   const snapshot = await dependencies.agentManager.createAgent(
     resolved.config,
     undefined,
     resolved.createOptions,
   );
+  await hooks?.beforePostCreate?.();
 
   resolved.setupContinuation?.startAfterAgentCreate({
     agentId: snapshot.id,
@@ -298,38 +376,52 @@ async function resolveSessionCreateAgent(
   };
 }
 
+interface ResolveMcpCreateAgentCallbacks {
+  onDirectoryLaunch(launch: DirectoryWorkspaceLaunch): void;
+}
+
+type McpWorkspacePlan =
+  | {
+      kind: "worktree";
+      resolvedCwd: string;
+      workspaceId: string;
+      setupContinuation?: AgentWorktreeSetupContinuation;
+      createdWorktree?: CreatePaseoWorktreeWorkflowResult;
+    }
+  | {
+      kind: "directory";
+      resolvedCwd: string;
+      workspaceId: string;
+    }
+  | {
+      kind: "attach";
+      resolvedCwd: string;
+      workspaceId: string;
+    };
+
 async function resolveMcpCreateAgent(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentFromMcpInput,
+  callbacks: ResolveMcpCreateAgentCallbacks,
 ): Promise<ResolvedCreateAgent> {
+  const launchProvisioning = requireMcpLaunchProvisioning(dependencies);
   const resolvedProviderModel = resolveProviderModel(input.provider);
   const provider = resolvedProviderModel.provider;
   const parentAgent = input.callerAgentId
     ? requireParentAgent(dependencies.agentManager, input.callerAgentId)
     : null;
-  const cwd = resolveMcpInitialCwd(input, parentAgent);
-  const { resolvedCwd, setupContinuation, createdWorkspaceId, createdWorktree } =
-    await resolveMcpCwd({
-      dependencies,
-      cwd,
-      worktree: input.worktree,
-      initialPrompt: input.initialPrompt ?? "",
-    });
-  if (createdWorktree) input.onWorktreeCreated?.(createdWorktree);
-
-  const workspaceId = await resolveMcpWorkspaceId({
+  const plan = await resolveMcpWorkspacePlan({
     dependencies,
     input,
     parentAgent,
-    setupContinuation,
-    createdWorkspaceId,
-    resolvedCwd,
+    launchProvisioning,
+    onDirectoryLaunch: callbacks.onDirectoryLaunch,
   });
   const resolvedCreateConfig = await resolveMcpProviderCreateConfig({
     dependencies,
     input,
     provider,
-    resolvedCwd,
+    resolvedCwd: plan.resolvedCwd,
     parentAgent,
   });
 
@@ -346,22 +438,120 @@ async function resolveMcpCreateAgent(
       input,
       resolvedProviderModel,
       provider,
-      resolvedCwd,
+      resolvedCwd: plan.resolvedCwd,
       trimmedPrompt,
       resolvedMode: resolvedCreateConfig.modeId,
       resolvedFeatures: resolvedCreateConfig.featureValues,
     }),
     createOptions: {
       ...(labels ? { labels } : {}),
-      workspaceId: requireResolvedWorkspaceId(workspaceId),
+      workspaceId: plan.workspaceId,
       owner: input.owner,
       env: input.env,
     },
     prompt: trimmedPrompt ? trimmedPrompt : undefined,
-    setupContinuation,
-    createdWorktree,
+    setupContinuation: plan.kind === "worktree" ? plan.setupContinuation : undefined,
+    createdWorktree: plan.kind === "worktree" ? plan.createdWorktree : undefined,
     background: input.background,
     promptFailure: input.promptFailure ?? "log",
+  };
+}
+
+function requireMcpLaunchProvisioning(
+  dependencies: CreateAgentCommandDependencies,
+): McpCreateAgentLaunchProvisioning {
+  if (!dependencies.mcpLaunchProvisioning) {
+    throw new Error("MCP create-agent launch provisioning is not configured");
+  }
+  return dependencies.mcpLaunchProvisioning;
+}
+
+async function resolveMcpWorkspacePlan(params: {
+  dependencies: CreateAgentCommandDependencies;
+  input: CreateAgentFromMcpInput;
+  parentAgent: ManagedAgent | null;
+  launchProvisioning: McpCreateAgentLaunchProvisioning;
+  onDirectoryLaunch: (launch: DirectoryWorkspaceLaunch) => void;
+}): Promise<McpWorkspacePlan> {
+  const { dependencies, input, parentAgent, launchProvisioning, onDirectoryLaunch } = params;
+
+  if (shouldCreateMcpWorktree(input.worktree)) {
+    const initialCwd = resolveMcpInitialCwd(input, parentAgent);
+    const { resolvedCwd, setupContinuation, createdWorkspaceId, createdWorktree } =
+      await resolveMcpCwd({
+        dependencies,
+        cwd: initialCwd,
+        worktree: input.worktree,
+        initialPrompt: input.initialPrompt ?? "",
+      });
+    if (createdWorktree) input.onWorktreeCreated?.(createdWorktree);
+    return {
+      kind: "worktree",
+      resolvedCwd,
+      workspaceId: requireResolvedWorkspaceId(createdWorkspaceId),
+      setupContinuation,
+      createdWorktree,
+    };
+  }
+
+  if (input.workspaceLaunch?.kind === "directory") {
+    return allocateOwnedDirectoryWorkspace({
+      launchProvisioning,
+      cwd: resolveMcpInitialCwd(input, parentAgent),
+      title: resolveFirstAgentPromptTitle({ prompt: input.initialPrompt }),
+      onDirectoryLaunch,
+    });
+  }
+
+  const attachWorkspaceId = resolveMcpAttachWorkspaceId(input, parentAgent);
+  if (attachWorkspaceId) {
+    await launchProvisioning.requireExistingWorkspaceForLaunch(attachWorkspaceId);
+    return {
+      kind: "attach",
+      resolvedCwd: resolveMcpInitialCwd(input, parentAgent),
+      workspaceId: attachWorkspaceId,
+    };
+  }
+
+  return allocateOwnedDirectoryWorkspace({
+    launchProvisioning,
+    cwd: resolveMcpInitialCwd(input, parentAgent),
+    title: resolveFirstAgentPromptTitle({ prompt: input.initialPrompt }),
+    onDirectoryLaunch,
+  });
+}
+
+function resolveMcpAttachWorkspaceId(
+  input: CreateAgentFromMcpInput,
+  parentAgent: ManagedAgent | null,
+): string | null {
+  if (input.workspaceLaunch?.kind === "attach") {
+    return input.workspaceLaunch.workspaceId;
+  }
+  if (input.workspaceId) {
+    return input.workspaceId;
+  }
+  if (parentAgent?.workspaceId) {
+    return parentAgent.workspaceId;
+  }
+  return null;
+}
+
+async function allocateOwnedDirectoryWorkspace(params: {
+  launchProvisioning: McpCreateAgentLaunchProvisioning;
+  cwd: string;
+  title: string | null;
+  onDirectoryLaunch: (launch: DirectoryWorkspaceLaunch) => void;
+}): Promise<Extract<McpWorkspacePlan, { kind: "directory" }>> {
+  const launch = await params.launchProvisioning.allocateDirectoryWorkspaceForLaunch({
+    cwd: params.cwd,
+    title: params.title,
+  });
+  params.onDirectoryLaunch(launch);
+  return {
+    kind: "directory",
+    resolvedCwd: params.cwd,
+    workspaceId: launch.workspaceId,
   };
 }
 
@@ -378,34 +568,6 @@ function resolveMcpInitialCwd(
     lockedCwd: input.callerContext?.lockedCwd,
     allowCustomCwd: input.callerContext?.allowCustomCwd ?? true,
   });
-}
-
-async function resolveMcpWorkspaceId(params: {
-  dependencies: CreateAgentCommandDependencies;
-  input: CreateAgentFromMcpInput;
-  parentAgent: ManagedAgent | null;
-  setupContinuation?: AgentWorktreeSetupContinuation;
-  createdWorkspaceId?: string;
-  resolvedCwd: string;
-}): Promise<string | undefined> {
-  // MCP callers resolve workspace ownership before this point. Worktree
-  // creation wins because the new agent lives in the fresh worktree workspace.
-  // Otherwise use the explicit workspace id, then the parent workspace for
-  // direct internal callers. Ownership is never resolved from cwd.
-  if (params.setupContinuation) {
-    return params.createdWorkspaceId;
-  }
-  if (params.input.workspaceId) {
-    return params.input.workspaceId;
-  }
-  if (params.parentAgent?.workspaceId) {
-    return params.parentAgent.workspaceId;
-  }
-  return ensureWorkspaceForMcpCreate(
-    params.dependencies,
-    params.resolvedCwd,
-    params.input.initialPrompt ?? "",
-  );
 }
 
 async function resolveMcpProviderCreateConfig(params: {
@@ -459,15 +621,23 @@ function buildMcpSessionConfig(params: {
   return config;
 }
 
-async function ensureWorkspaceForMcpCreate(
-  dependencies: CreateAgentCommandDependencies,
-  cwd: string,
-  initialPrompt: string,
-): Promise<string | undefined> {
-  if (!dependencies.ensureWorkspaceForCreate) {
-    return undefined;
+function mcpFirstAgentContext(input: CreateAgentFromMcpInput): FirstAgentContext {
+  const prompt = input.initialPrompt?.trim();
+  return prompt ? { prompt } : {};
+}
+
+async function invokeGuardedWorkspaceCallback(params: {
+  callback: (() => void | Promise<void>) | undefined;
+  workspaceId: string;
+  logger: Logger;
+  message: string;
+}): Promise<void> {
+  if (!params.callback) return;
+  try {
+    await params.callback();
+  } catch (error) {
+    params.logger.error({ err: error, workspaceId: params.workspaceId }, params.message);
   }
-  return dependencies.ensureWorkspaceForCreate(cwd, { prompt: initialPrompt });
 }
 
 async function sendInitialPrompt(
@@ -528,6 +698,15 @@ function resolveChildAgentCwd(params: {
   return resolvePathFromBase(params.parentCwd, requestedCwd);
 }
 
+function shouldCreateMcpWorktree(
+  worktree: CreateAgentFromMcpInput["worktree"],
+): worktree is NonNullable<CreateAgentFromMcpInput["worktree"]> {
+  if (!worktree) return false;
+  return Boolean(
+    worktree.worktreeName || worktree.refName || worktree.action || worktree.githubPrNumber,
+  );
+}
+
 async function resolveMcpCwd(params: {
   dependencies: CreateAgentCommandDependencies;
   cwd: string;
@@ -540,13 +719,7 @@ async function resolveMcpCwd(params: {
   createdWorktree?: CreatePaseoWorktreeWorkflowResult;
 }> {
   const { dependencies, worktree } = params;
-  if (!worktree) {
-    return { resolvedCwd: params.cwd };
-  }
-  const shouldCreateWorktree = Boolean(
-    worktree.worktreeName || worktree.refName || worktree.action || worktree.githubPrNumber,
-  );
-  if (!shouldCreateWorktree) {
+  if (!shouldCreateMcpWorktree(worktree)) {
     return { resolvedCwd: params.cwd };
   }
   if (

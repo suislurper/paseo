@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentManager } from "../agent/agent-manager.js";
 import { AgentStorage } from "../agent/agent-storage.js";
-import { createAgentCommand } from "../agent/create-agent/create.js";
+import {
+  createAgentCommand,
+  type McpCreateAgentLaunchProvisioning,
+} from "../agent/create-agent/create.js";
 import type {
   AgentCapabilityFlags,
   AgentClient,
@@ -28,6 +31,7 @@ import { resolveWorkspaceIdForPath } from "../resolve-workspace-id-for-path.js";
 import { createNoopWorkspaceGitService } from "../test-utils/workspace-git-service-stub.js";
 import {
   type PersistedWorkspaceRecord,
+  createPersistedWorkspaceRecord,
   FileBackedProjectRegistry,
   FileBackedWorkspaceRegistry,
 } from "../workspace-registry.js";
@@ -156,6 +160,27 @@ function createScheduleService(options: TestScheduleServiceOptions): ScheduleSer
             agentStorage: options.agentStorage,
             logger: options.logger,
             providerSnapshotManager: options.providerSnapshotManager as ProviderSnapshotManager,
+            mcpLaunchProvisioning: {
+              async allocateDirectoryWorkspaceForLaunch() {
+                throw new Error("schedule tests pass an explicit workspaceId");
+              },
+              async requireExistingWorkspaceForLaunch(workspaceId) {
+                const workspace = workspaces.get(workspaceId);
+                if (workspace?.archivedAt) {
+                  throw new Error(`Archived workspace: ${workspaceId}`);
+                }
+                if (workspace) return workspace;
+                return createPersistedWorkspaceRecord({
+                  workspaceId,
+                  projectId: "test-project",
+                  cwd: options.paseoHome,
+                  kind: "directory",
+                  displayName: "test-project",
+                  createdAt: "2026-01-01T00:00:00.000Z",
+                  updatedAt: "2026-01-01T00:00:00.000Z",
+                });
+              },
+            } satisfies McpCreateAgentLaunchProvisioning,
           },
           input,
         )),
@@ -200,6 +225,7 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
     projectRegistry,
     workspaceRegistry,
     workspaceGitService,
+    logger: createTestLogger(),
   });
   return {
     workspaceRegistry,

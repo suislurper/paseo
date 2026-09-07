@@ -84,14 +84,18 @@ or mutate either lifecycle. The workspace route asks the daemon for authoritativ
 only the route's explicit Unarchive or Restore action changes the archived workspace.
 
 A `create_agent_request` without a worktree or explicit workspace id allocates a
-request-owned directory workspace. If that agent never lands and nothing else
-references the new id — managed or persisted agents, including partial
-registration, or a terminal — the daemon archives only that metadata record and
-leaves the directory files in place. Explicit workspace ids, import attachments,
-and new terminals retain a provisional workspace before they can be archived, so
-an independent attach cannot be cleaned up from under them. Bare `paseo run`
-does not mint a directory workspace before `createAgent`; Session owns that
-allocation and cleanup. MCP `create_agent` wiring is separate.
+request-owned directory workspace. MCP `create_agent` directory create and
+internal MCP-kind creates with no explicit or parent workspace do the same; the
+command owns the launch so a failed provider or mode does not leave an unused
+active record. Directory create does not inherit the parent workspace. If that
+agent never lands and nothing else references the new id — managed or persisted
+agents, including partial registration, or a terminal — the daemon archives only
+that metadata record and leaves the directory files in place. Explicit workspace
+ids, `workspace: { kind: "current" | "existing" }`, import attachments, and new
+terminals retain a provisional workspace before they can be archived, so an
+independent attach cannot be cleaned up from under them. Bare `paseo run` does
+not mint a directory workspace before `createAgent`; Session owns that
+allocation and cleanup.
 
 ## Tabs vs archive
 

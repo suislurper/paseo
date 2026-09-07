@@ -125,6 +125,7 @@ import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 import { createGitHubService } from "../services/github-service.js";
 import { createPaseoWorktree as createRegisteredPaseoWorktree } from "./paseo-worktree-service.js";
 import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
+import { inspectDirectoryWorkspaceLaunchReferences } from "./session/workspace-provisioning/directory-workspace-launch-references.js";
 import { createPaseoWorktreeWorkflow } from "./worktree-session.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import type { OpenAiSpeechProviderConfig } from "./speech/providers/openai/config.js";
@@ -202,6 +203,7 @@ import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
 import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
+  type DirectoryWorkspaceCommittedInput,
 } from "./agent/create-agent/create.js";
 import { archiveAgentCommand } from "./agent/lifecycle-command.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
@@ -815,13 +817,6 @@ export async function createPaseoDaemon(
       forgeOverrides: { github },
     },
   });
-  const workspaceProvisioning = createWorkspaceProvisioningService({
-    projectRegistry,
-    workspaceRegistry,
-    workspaceGitService,
-    logger,
-  });
-  workspaceProvisioningRef.current = workspaceProvisioning;
   const providerSnapshotLogger = logger.child({ module: "provider-snapshot-manager" });
   const providerSnapshotManager = new ProviderSnapshotManager({
     logger: providerSnapshotLogger,
@@ -850,6 +845,19 @@ export async function createPaseoDaemon(
     mcpAuthToken: agentMcpAuthToken,
     logger,
   });
+  const workspaceProvisioning = createWorkspaceProvisioningService({
+    projectRegistry,
+    workspaceRegistry,
+    workspaceGitService,
+    logger,
+    inspectDirectoryWorkspaceLaunchReferences: (workspaceId) =>
+      inspectDirectoryWorkspaceLaunchReferences(workspaceId, {
+        listManagedAgents: () => agentManager.listAgents(),
+        listPersistedAgents: () => agentStorage.list(),
+        terminalManager,
+      }),
+  });
+  workspaceProvisioningRef.current = workspaceProvisioning;
 
   const detachAgentStoragePersistence = attachAgentStoragePersistence(
     logger,
@@ -1061,6 +1069,22 @@ export async function createPaseoDaemon(
     );
   };
 
+  const onDirectoryWorkspaceCommitted = ({
+    workspaceId,
+    cwd,
+    firstAgentContext,
+  }: DirectoryWorkspaceCommittedInput) => {
+    if (firstAgentContext.prompt || (firstAgentContext.attachments?.length ?? 0) > 0) {
+      workspaceAutoName.scheduleForDirectory({
+        workspaceId,
+        cwd,
+        firstAgentContext,
+      });
+    }
+    return emitWorkspaceUpdatesExternal([workspaceId]);
+  };
+  const onDirectoryWorkspaceCleanup = (workspaceId: string) =>
+    emitWorkspaceUpdatesExternal([workspaceId]);
   const createAgentCommandDependencies: CreateAgentCommandDependencies = {
     agentManager,
     agentStorage,
@@ -1070,7 +1094,9 @@ export async function createPaseoDaemon(
     terminalManager,
     providerSnapshotManager,
     createPaseoWorktree: createPaseoWorktreeForTools,
-    ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
+    mcpLaunchProvisioning: workspaceProvisioning,
+    onDirectoryWorkspaceCommitted,
+    onDirectoryWorkspaceCleanup,
   };
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
@@ -1241,8 +1267,11 @@ export async function createPaseoDaemon(
     workspaceRegistry,
     markWorkspaceArchiving: markWorkspaceArchivingExternal,
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
-    ensureWorkspaceForCreate: createAgentCommandDependencies.ensureWorkspaceForCreate,
+    ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
     createPaseoWorktree: createAgentCommandDependencies.createPaseoWorktree,
+    mcpLaunchProvisioning: workspaceProvisioning,
+    onDirectoryWorkspaceCommitted,
+    onDirectoryWorkspaceCleanup,
     browserToolsEnabled: browserToolsPolicy.isEnabled(),
     browserToolsBroker,
     paseoHome: config.paseoHome,

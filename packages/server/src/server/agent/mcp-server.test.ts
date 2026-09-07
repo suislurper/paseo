@@ -55,7 +55,11 @@ import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-tools/broker.js";
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { readPaseoWorktreeMetadata } from "../../utils/worktree-metadata.js";
-import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
+import {
+  createWorkspaceProvisioningService,
+  WorkspaceProvisioningError,
+} from "../session/workspace-provisioning/workspace-provisioning-service.js";
+import type { McpCreateAgentLaunchProvisioning } from "./create-agent/create.js";
 
 const REPO_CWD = resolvePath("/tmp/repo");
 const TARGET_CWD = resolvePath("/tmp/target");
@@ -1135,15 +1139,73 @@ describe("create_agent MCP tool", () => {
     relationship: { kind: "detached" as const },
     workspace: { kind: "existing" as const, workspaceId, ...(cwd ? { cwd } : {}) },
   });
-  const ensureWorkspaceForCreate = async () => "workspace-created";
+  function createGuardedMcpLaunchProvisioning(options?: {
+    directoryWorkspaceId?: string;
+    knownWorkspaces?: Record<string, string>;
+  }): McpCreateAgentLaunchProvisioning {
+    const directoryWorkspaceId = options?.directoryWorkspaceId ?? "workspace-created";
+    const knownWorkspaces = new Map(
+      Object.entries(
+        options?.knownWorkspaces ?? {
+          wks_existing: existingCwd,
+          wks_parent: existingCwd,
+          wks_voice: existingCwd,
+        },
+      ),
+    );
+    return {
+      async allocateDirectoryWorkspaceForLaunch({ cwd, title }) {
+        const workspace = createPersistedWorkspaceRecord({
+          workspaceId: directoryWorkspaceId,
+          projectId: "prj_mcp_test",
+          cwd,
+          kind: "directory",
+          displayName: "mcp-test",
+          title: title ?? null,
+          createdAt: "2026-09-07T00:00:00.000Z",
+          updatedAt: "2026-09-07T00:00:00.000Z",
+        });
+        return {
+          workspaceId: directoryWorkspaceId,
+          workspace,
+          retain() {},
+          commit() {},
+          async cleanupUnusedOnFailure() {},
+        };
+      },
+      async requireExistingWorkspaceForLaunch(workspaceId) {
+        const cwd = knownWorkspaces.get(workspaceId);
+        if (!cwd) {
+          throw new WorkspaceProvisioningError("unknown_workspace", workspaceId);
+        }
+        return createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "prj_mcp_test",
+          cwd,
+          kind: "directory",
+          displayName: "mcp-test",
+          createdAt: "2026-09-07T00:00:00.000Z",
+          updatedAt: "2026-09-07T00:00:00.000Z",
+        });
+      },
+    };
+  }
+
+  function createCreateAgentMcpServer(
+    options: Parameters<typeof createAgentMcpServer>[0],
+  ): ReturnType<typeof createAgentMcpServer> {
+    return createAgentMcpServer({
+      mcpLaunchProvisioning: createGuardedMcpLaunchProvisioning(),
+      ...options,
+    });
+  }
 
   it("requires a concise title no longer than 60 characters", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1180,11 +1242,10 @@ describe("create_agent MCP tool", () => {
 
   it("requires initialPrompt", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1204,11 +1265,10 @@ describe("create_agent MCP tool", () => {
 
   it("rejects partial explicit workspace shape", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1228,7 +1288,7 @@ describe("create_agent MCP tool", () => {
 
   it("rejects caller-only relationship and workspace intents without a caller agent", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -1263,7 +1323,7 @@ describe("create_agent MCP tool", () => {
       provider: "codex",
       currentModeId: "full-access",
     } as ManagedAgent);
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -1293,7 +1353,7 @@ describe("create_agent MCP tool", () => {
       availableModes: [],
       config: { title: "Existing workspace" },
     } as ManagedAgent);
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -1333,11 +1393,10 @@ describe("create_agent MCP tool", () => {
       config: { title: "Feature test", featureValues: { fast_mode: true } },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1386,11 +1445,10 @@ describe("create_agent MCP tool", () => {
       config: { title: "Mode test" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1424,11 +1482,10 @@ describe("create_agent MCP tool", () => {
 
   it("requires provider as provider/model and rejects the old model field", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1487,7 +1544,7 @@ describe("create_agent MCP tool", () => {
 
   it("accepts worktree workspace intent in create_agent input validation", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -1510,7 +1567,7 @@ describe("create_agent MCP tool", () => {
 
   it("accepts each create_worktree target kind", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -1531,7 +1588,7 @@ describe("create_agent MCP tool", () => {
 
   it("rejects create_worktree without a target", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -1548,11 +1605,10 @@ describe("create_agent MCP tool", () => {
     spies.agentManager.createAgent.mockRejectedValue(
       new Error("Working directory does not exist: /path/that/does/not/exist"),
     );
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1578,11 +1634,10 @@ describe("create_agent MCP tool", () => {
       config: { title: "Fix auth bug" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1614,11 +1669,10 @@ describe("create_agent MCP tool", () => {
       config: { title: "Fix auth" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1649,11 +1703,10 @@ describe("create_agent MCP tool", () => {
       config: { title: "Config test", model: "claude-sonnet-4-20250514" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -1717,7 +1770,7 @@ describe("create_agent MCP tool", () => {
         config: { title: "Worktree agent" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -1809,7 +1862,7 @@ describe("create_agent MCP tool", () => {
         config: { title: "Worktree agent" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -1884,7 +1937,7 @@ describe("create_agent MCP tool", () => {
         config: { title: "Agent title" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -1977,7 +2030,7 @@ describe("create_agent MCP tool", () => {
         config: { title: "Agent title" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2076,7 +2129,7 @@ describe("create_agent MCP tool", () => {
         config: { title: "Explicit Agent Title" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2174,30 +2227,30 @@ describe("create_agent MCP tool", () => {
         config: { title: "Directory agent" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
-        ensureWorkspaceForCreate: async (cwd, firstAgentContext) => {
+        mcpLaunchProvisioning: createGuardedMcpLaunchProvisioning({
+          directoryWorkspaceId: "workspace-directory-auto-title",
+        }),
+        onDirectoryWorkspaceCommitted: ({ workspaceId, cwd, firstAgentContext }) => {
           const workspace = createPersistedWorkspaceRecord({
-            workspaceId: "workspace-directory-auto-title",
+            workspaceId,
             projectId: "project-directory-auto-title",
             cwd,
             kind: "directory",
             displayName: "workspace",
-            title: firstAgentContext?.prompt ?? null,
+            title: firstAgentContext.prompt ?? null,
             createdAt: "2026-07-03T00:00:00.000Z",
             updatedAt: "2026-07-03T00:00:00.000Z",
           });
           workspaceRecords.set(workspace.workspaceId, workspace);
-          if (firstAgentContext) {
-            workspaceAutoName.scheduleForDirectory({
-              workspaceId: workspace.workspaceId,
-              cwd: workspace.cwd,
-              firstAgentContext,
-            });
-          }
-          return workspace.workspaceId;
+          workspaceAutoName.scheduleForDirectory({
+            workspaceId: workspace.workspaceId,
+            cwd: workspace.cwd,
+            firstAgentContext,
+          });
         },
         logger,
       });
@@ -2281,7 +2334,7 @@ describe("create_agent MCP tool", () => {
         config: { title: "Checkout agent" },
       }));
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2401,7 +2454,7 @@ describe("create_agent MCP tool", () => {
       config: { title: "PR agent" },
     }));
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -2472,7 +2525,7 @@ describe("create_agent MCP tool", () => {
         resolveRepoRoot: vi.fn(async () => repoDir),
       };
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2549,7 +2602,7 @@ describe("create_agent MCP tool", () => {
       const markWorkspaceArchiving = vi.fn();
       const clearWorkspaceArchiving = vi.fn();
       const listActiveWorkspaces = vi.fn(async () => []);
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2651,7 +2704,7 @@ describe("create_agent MCP tool", () => {
         activeWorkspaces,
         archivedWorkspaceIds,
       );
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2727,7 +2780,7 @@ describe("create_agent MCP tool", () => {
         listWorktrees: vi.fn(async () => []),
         resolveRepoRoot: vi.fn(async () => repoDir),
       };
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage,
         providerSnapshotManager: createOpenCodeManager().manager,
@@ -2788,7 +2841,7 @@ describe("create_agent MCP tool", () => {
         },
       ]),
     };
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -2816,7 +2869,7 @@ describe("create_agent MCP tool", () => {
 
   it("accepts custom provider IDs in create_agent input validation", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -2856,7 +2909,7 @@ describe("create_agent MCP tool", () => {
       config: { title: "Child" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -2902,7 +2955,7 @@ describe("create_agent MCP tool", () => {
       currentModeId: "full-access",
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -2962,7 +3015,7 @@ describe("create_agent MCP tool", () => {
     });
     spies.agentManager.createAgent.mockResolvedValue(childAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -3001,7 +3054,7 @@ describe("create_agent MCP tool", () => {
       config: { title: "Detached" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
@@ -3058,7 +3111,7 @@ describe("create_agent MCP tool", () => {
       return { modeId: undefined, featureValues: opts.featureValues };
     });
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       callerAgentId: "parent-agent",
@@ -3111,7 +3164,7 @@ describe("create_agent MCP tool", () => {
         { workspaceId: "wks_parent" },
       );
 
-      const server = await createAgentMcpServer({
+      const server = await createCreateAgentMcpServer({
         agentManager,
         agentStorage: storage,
         callerAgentId: parent.id,
@@ -3146,11 +3199,10 @@ describe("create_agent MCP tool", () => {
       config: { title: "Injected config test" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -3180,11 +3232,10 @@ describe("create_agent MCP tool", () => {
     providerSnapshot.stub.resolveCreateConfig.mockImplementation(async () => {
       throw new Error("resolver rejected mode");
     });
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: providerSnapshot.manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -3228,11 +3279,10 @@ describe("create_agent MCP tool", () => {
       expect(opts.requestedMode).toBe("dynamic");
       return { modeId: "dynamic", featureValues: undefined };
     });
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: provStub.manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -3267,11 +3317,10 @@ describe("create_agent MCP tool", () => {
       modeId: "build",
       featureValues: { auto_accept: true },
     });
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: providerSnapshot.manager,
-      ensureWorkspaceForCreate,
       logger,
     });
     const tool = registeredTool(server, "create_agent");
@@ -3315,7 +3364,7 @@ describe("create_agent MCP tool", () => {
       featureValues: { resolver_feature: true },
     });
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       callerAgentId: "parent-agent",
@@ -3361,7 +3410,7 @@ describe("create_agent MCP tool", () => {
       config: { title: "Child" },
     } as ManagedAgent);
 
-    const server = await createAgentMcpServer({
+    const server = await createCreateAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,

@@ -2,9 +2,10 @@
 
 // Fail-closed packaging check for the desktop artifact.
 //
-// The AppImage ships two independently built halves:
+// The AppImage ships two independently built halves plus a skills payload:
 //   - resources/app.asar   <- packages/server/dist (daemon, model manifests)
 //   - resources/app-dist   <- packages/app/dist    (Expo web export, the UI)
+//   - resources/skills     <- skills/              (canonical agent instructions)
 //
 // `npm run build --workspace=@getpaseo/desktop` rebuilds only the first one and
 // silently packages whatever `packages/app/dist` happens to contain. On
@@ -114,8 +115,103 @@ function checkMarkers(filePath, markers, label, problems) {
   }
 }
 
+function describeFsError(error) {
+  return error instanceof Error ? error.message : error;
+}
+
+function listRelativeFiles(root) {
+  const files = [];
+  const walk = (absDir, relDir) => {
+    let entries;
+    try {
+      entries = readdirSync(absDir, { withFileTypes: true });
+    } catch (error) {
+      throw new Error(`${relDir || "."}: unreadable (${describeFsError(error)})`, { cause: error });
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      const childRel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      const childAbs = join(absDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(childAbs, childRel);
+      } else if (entry.isFile()) {
+        files.push(childRel);
+      }
+    }
+  };
+  walk(root, "");
+  files.sort();
+  return files;
+}
+
+function canonicalSkillsRoot() {
+  return join(repoRoot, "skills");
+}
+
+function joinSkillPath(root, relativePath) {
+  return join(root, ...relativePath.split("/"));
+}
+
+function loadCanonicalSkillInventory(problems) {
+  const skillsRoot = canonicalSkillsRoot();
+  try {
+    if (!statSync(skillsRoot).isDirectory()) {
+      problems.push("skills/: canonical skills source is not a directory.");
+      return [];
+    }
+  } catch (error) {
+    problems.push(`skills/: canonical skills source is missing (${describeFsError(error)}).`);
+    return [];
+  }
+
+  let files;
+  try {
+    files = listRelativeFiles(skillsRoot);
+  } catch (error) {
+    problems.push(`skills/: canonical skills source is unreadable (${describeFsError(error)}).`);
+    return [];
+  }
+  if (files.length === 0) {
+    problems.push("skills/: canonical skills source is empty.");
+    return [];
+  }
+  return files;
+}
+
+function verifyPackagedSkills(resources, label, sourceFiles, problems) {
+  const packagedRoot = join(resources, "skills");
+  for (const relativePath of sourceFiles) {
+    const sourcePath = joinSkillPath(canonicalSkillsRoot(), relativePath);
+    const packagedPath = joinSkillPath(packagedRoot, relativePath);
+    let source;
+    try {
+      source = readFileSync(sourcePath);
+    } catch (error) {
+      problems.push(
+        `${label}: canonical skill ${relativePath} is unreadable (${describeFsError(error)}).`,
+      );
+      continue;
+    }
+    let packaged;
+    try {
+      packaged = readFileSync(packagedPath);
+    } catch (error) {
+      problems.push(
+        `${label}/skills/${relativePath} is missing or unreadable (${describeFsError(error)}).`,
+      );
+      continue;
+    }
+    if (!source.equals(packaged)) {
+      problems.push(
+        `${label}/skills/${relativePath} does not match canonical skills/${relativePath}.`,
+      );
+    }
+  }
+}
+
 function verifyDist() {
   const problems = [];
+  loadCanonicalSkillInventory(problems);
   const distRoot = join(repoRoot, "packages", "app", "dist");
 
   let distStats;
@@ -169,6 +265,7 @@ const PACKAGED_RESOURCE_DIRS = [
 function verifyPackaged() {
   const problems = [];
   const releaseRoot = join(repoRoot, "packages", "desktop", "release");
+  const sourceFiles = loadCanonicalSkillInventory(problems);
 
   const present = PACKAGED_RESOURCE_DIRS.map((relativePath) =>
     join(releaseRoot, relativePath),
@@ -203,27 +300,39 @@ function verifyPackaged() {
     }
 
     checkMarkers(join(resources, "app.asar"), SERVER_MARKERS, `${label}/app.asar`, problems);
+    if (sourceFiles.length > 0) {
+      verifyPackagedSkills(resources, label, sourceFiles, problems);
+    }
   }
 
   if (problems.length > 0) fail(problems);
   console.log(
-    `Packaged desktop resources verified (${present.length} tree(s); UI export and server asar carry every marker).`,
+    `Packaged desktop resources verified (${present.length} tree(s); UI export, server asar, and skills payload match).`,
   );
 }
 
 function verifyGitCleanliness() {
   // A packaged artifact must be reproducible from the reviewed commit. Uncommitted
-  // work in the app or server source means the AppImage does not match any SHA.
+  // work in the app, server, protocol, or canonical skills means the AppImage
+  // does not match any SHA. electron-builder copies skills/ into resources/skills.
   const dirty = execFileSync(
     "git",
-    ["status", "--porcelain", "--", "packages/app", "packages/server", "packages/protocol"],
+    [
+      "status",
+      "--porcelain",
+      "--",
+      "packages/app",
+      "packages/server",
+      "packages/protocol",
+      "skills",
+    ],
     { cwd: repoRoot, encoding: "utf8" },
   ).trim();
   if (dirty) {
     fail([
-      "uncommitted changes under packages/app, packages/server or packages/protocol:",
+      "uncommitted changes under packages/app, packages/server, packages/protocol or skills/:",
       ...dirty.split(/\r?\n/).map((line) => `    ${line}`),
-      "commit or stash them so the artifact matches a reviewed commit.",
+      "commit owned work so the artifact matches a reviewed commit.",
     ]);
   }
 }

@@ -443,3 +443,31 @@ test("retain from a second provisioning instance sharing the registry prevents a
   await launch.cleanupUnusedOnFailure();
   await expectActive(launch.workspaceId);
 });
+
+test("stale active selection after cleanup won follows the archived path instead of a stale descriptor", async () => {
+  const cwd = path.join(tmpDir, "stale-select");
+  const launch = await provisioning.allocateDirectoryWorkspaceForLaunch({ cwd });
+  let listedStaleSnapshot = false;
+  const racing = createProvisioning({
+    workspaceRegistry: wrapRegistry({
+      list: async () => {
+        const snapshot = await workspaceRegistry.list();
+        if (!listedStaleSnapshot) {
+          listedStaleSnapshot = true;
+          await launch.cleanupUnusedOnFailure();
+        }
+        return snapshot;
+      },
+    }),
+    inspect: async () => unusedInspection,
+  });
+
+  const opened = await racing.findOrCreateWorkspaceForDirectory(cwd);
+
+  expect(opened).toMatchObject({
+    workspaceId: launch.workspaceId,
+    archivedAt: null,
+  });
+  await expectActive(launch.workspaceId);
+  expect(await workspaceRegistry.list()).toHaveLength(1);
+});

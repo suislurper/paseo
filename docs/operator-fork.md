@@ -88,6 +88,7 @@ This is the single most important thing to know before touching a desktop build.
 | -------------------- | ------------------------------------------------------ | --------------------------------------------------- |
 | `resources/app.asar` | `packages/server/dist` (+ `cli`, `client`, `protocol`) | daemon, providers, **model manifests**              |
 | `resources/app-dist` | `packages/app/dist` — an **Expo web export**           | the entire React UI: sidebar, workspaces list, chat |
+| `resources/skills`   | repo `skills/`                                         | canonical managed agent instructions                |
 
 `npm run build --workspace=@getpaseo/desktop` rebuilds only `app.asar`. It copies
 `packages/app/dist` verbatim, whatever state it is in, and **never regenerates it**. Only the root
@@ -103,10 +104,13 @@ shortcut path cannot skip them:
 
 - `npm run verify:desktop-bundle` (`prebuild`) — refuses to package when `packages/app/dist` is
   missing, is missing a guarded feature marker, or is older than `packages/app/src`. It also
-  refuses when `packages/app`, `packages/server` or `packages/protocol` have uncommitted changes,
-  so an artifact always corresponds to a reviewed commit.
+  refuses when canonical `skills/` is missing or empty, and when `packages/app`, `packages/server`,
+  `packages/protocol` or `skills/` have uncommitted changes. Commit owned work so the artifact
+  matches a reviewed commit.
 - `npm run verify:desktop-packaged` (`postbuild`) — re-checks the markers in the artifact
-  electron-builder actually produced, on every platform tree it emitted.
+  electron-builder actually produced, on every platform tree it emitted, and recursively compares
+  every canonical `skills/` file against that tree's `resources/skills`. Missing, unreadable, or
+  mismatched skill bytes fail closed.
 
 Feature markers live in `scripts/verify-desktop-bundle.mjs` and mirror `requiredHistory` in
 `scripts/verify-operator-fork-baseline.mjs`. When you guard a new feature, add its marker in the

@@ -368,6 +368,15 @@ export function createWorkspaceProvisioningService(deps: {
     return refreshProjectKind(project);
   }
 
+  async function reopenArchivedDirectoryWorkspace(
+    archived: PersistedWorkspaceRecord,
+    normalizedCwd: string,
+  ): Promise<PersistedWorkspaceRecord> {
+    const project = await projectRegistry.get(archived.projectId);
+    if (project && !project.archivedAt) return ensureWorkspaceRecordUnarchived(archived);
+    return createWorkspaceForDirectory(normalizedCwd);
+  }
+
   async function findOrCreateWorkspaceForDirectory(cwd: string): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     const workspaces = await workspaceRegistry.list();
@@ -380,7 +389,16 @@ export function createWorkspaceProvisioningService(deps: {
           Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
           left.workspaceId.localeCompare(right.workspaceId),
       )[0];
-    if (active) return refreshWorkspaceRecord(active);
+    if (active) {
+      // Retain before any await so failed-launch cleanup cannot archive an
+      // independently opened same-directory workspace. Re-read afterwards: if
+      // cleanup already won, follow the archived/new-workspace path.
+      retainDirectoryWorkspaceLaunch(active.workspaceId);
+      const current = await workspaceRegistry.get(active.workspaceId);
+      if (!current) return createWorkspaceForDirectory(normalizedCwd);
+      if (!current.archivedAt) return refreshWorkspaceRecord(current);
+      return reopenArchivedDirectoryWorkspace(current, normalizedCwd);
+    }
     const archived = workspaces
       .filter(
         (workspace) => workspace.archivedAt && areEquivalentPaths(workspace.cwd, normalizedCwd),
@@ -391,8 +409,7 @@ export function createWorkspaceProvisioningService(deps: {
           left.workspaceId.localeCompare(right.workspaceId),
       )[0];
     if (archived) {
-      const project = await projectRegistry.get(archived.projectId);
-      if (project && !project.archivedAt) return ensureWorkspaceRecordUnarchived(archived);
+      return reopenArchivedDirectoryWorkspace(archived, normalizedCwd);
     }
     return createWorkspaceForDirectory(normalizedCwd);
   }

@@ -59,6 +59,7 @@ function findCreateFailed(emitted: SessionOutboundMessage[]): SessionOutboundMes
 
 async function createDirectoryLaunchSession(options?: {
   resolveCreateConfig?: () => Promise<never>;
+  seedSameCwdWorkspace?: boolean;
 }) {
   workdir = mkdtempSync(path.join(tmpdir(), "paseo-directory-launch-"));
   const cwd = path.join(workdir, "repo");
@@ -94,17 +95,19 @@ async function createDirectoryLaunchSession(options?: {
       updatedAt: TIMESTAMP,
     }),
   );
-  await workspaceRegistry.upsert(
-    createPersistedWorkspaceRecord({
-      workspaceId: "ws-preexisting",
-      projectId: "proj-existing",
-      cwd,
-      kind: "directory",
-      displayName: "repo",
-      createdAt: TIMESTAMP,
-      updatedAt: TIMESTAMP,
-    }),
-  );
+  if (options?.seedSameCwdWorkspace !== false) {
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "ws-preexisting",
+        projectId: "proj-existing",
+        cwd,
+        kind: "directory",
+        displayName: "repo",
+        createdAt: TIMESTAMP,
+        updatedAt: TIMESTAMP,
+      }),
+    );
+  }
 
   const snapshot = createProviderSnapshotManagerStub();
   if (options?.resolveCreateConfig) {
@@ -225,6 +228,65 @@ test("invalid explicit workspace id creates no workspace or agent", async () => 
   expect(harness.agentManager.listAgents()).toEqual([]);
   expect(findCreateFailed(harness.emitted)).toMatchObject({
     payload: { status: "agent_create_failed", requestId: "req-invalid-explicit" },
+  });
+});
+
+test("open_project during a failed directory launch keeps the independently opened workspace active", async () => {
+  let releaseLaunch!: () => void;
+  const launchGate = new Promise<void>((resolve) => {
+    releaseLaunch = resolve;
+  });
+  let launchReached!: () => void;
+  const launchStarted = new Promise<void>((resolve) => {
+    launchReached = resolve;
+  });
+  const harness = await createDirectoryLaunchSession({
+    seedSameCwdWorkspace: false,
+    resolveCreateConfig: async () => {
+      launchReached();
+      await launchGate;
+      throw new Error("Invalid mode 'nope' for provider 'codex'");
+    },
+  });
+
+  const createPromise = harness.session.handleMessage({
+    type: "create_agent_request",
+    requestId: "req-open-during-launch",
+    config: { provider: "codex", cwd: harness.cwd, modeId: "nope" },
+    attachments: [],
+    labels: {},
+  });
+  await launchStarted;
+
+  await harness.session.handleMessage({
+    type: "open_project_request",
+    cwd: harness.cwd,
+    requestId: "req-open-project",
+  });
+
+  const openResponse = harness.emitted.find(
+    (message) =>
+      message.type === "open_project_response" && message.payload.requestId === "req-open-project",
+  );
+  expect(openResponse).toMatchObject({
+    type: "open_project_response",
+    payload: { requestId: "req-open-project", error: null },
+  });
+  const openedId =
+    openResponse?.type === "open_project_response" ? openResponse.payload.workspace?.id : undefined;
+  expect(openedId).toEqual(expect.any(String));
+
+  releaseLaunch();
+  await createPromise;
+
+  expect(await harness.workspaceRegistry.get(openedId as string)).toMatchObject({
+    workspaceId: openedId,
+    archivedAt: null,
+  });
+  expect(readFileSync(harness.keptFile, "utf8")).toBe("keep me");
+  expect(harness.agentManager.listAgents()).toEqual([]);
+  expect(findCreateFailed(harness.emitted)).toMatchObject({
+    payload: { status: "agent_create_failed", requestId: "req-open-during-launch" },
   });
 });
 

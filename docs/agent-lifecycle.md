@@ -96,7 +96,10 @@ record and logs the workspace ID. Cleanup is metadata archival only; it does
 not delete historical files. Explicit workspace ids, `workspace: { kind:
 "current" | "existing" }`, import attachments, and new
 terminals retain a provisional workspace before they can be archived, so an
-independent attach cannot be cleaned up from under them. Bare `paseo run` does
+independent attach cannot be cleaned up from under them. `open_project` retains a
+selected same-directory provisional claim immediately, then re-reads the registry
+before refresh; if launch cleanup already archived the record, open follows the
+archived/new-workspace path instead of returning a stale active descriptor. Bare `paseo run` does
 not mint a directory workspace before `createAgent`; Session owns that
 allocation and cleanup.
 

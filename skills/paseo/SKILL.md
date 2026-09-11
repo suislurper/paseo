@@ -18,7 +18,9 @@ Returns `{ branchName, worktreePath, workspaceId }`. Pass `cwd` to target a spec
 In `branch-off`, `worktreeSlug` controls the worktree path slug and `branchName` controls the git branch. If `branchName` is omitted, Paseo defaults it from `worktreeSlug`. The returned `branchName` is authoritative; checkout and PR flows may return a branch name that differs from any requested slug.
 
 **`list_worktrees`** — current repo (or pass `cwd`).
-**`archive_worktree`** — `{ worktreePath }` or `{ worktreeSlug }`. Removes worktree and branch. Repository-specific worktree closeout, when a repo defines one, overrides this generic call.
+**`archive_worktree`** — `{ worktreePath }` or `{ worktreeSlug }`. Archives workspace records and returns a separate cleanup outcome. Eligible managed checkouts and remotely preserved local branches may be removed; dirty files, active owners, unknown preservation, or teardown failures retain files with a reason. Never infer deletion from archive success. Repository-specific worktree closeout overrides this generic call.
+
+**`archive_workspace`** — `{ workspaceId, mode: "archive_only" }` archives records while retaining the backing directory. Use this before an owning repository's closeout tool. Require the daemon's record-only archive capability; an older daemon is not safe to emulate with generic worktree deletion.
 
 ## Agents
 
@@ -76,7 +78,13 @@ Delegation is discretionary: spawn only when a bounded independent investigation
 
 4. Permission mode is not a sandbox. Codex `full-access` prevents approval prompts; read-only behavior is the prompt. The prompt states a bounded question and evidence requirements, forbids edits, Git mutation, services, databases, and recursive delegation, and asks for source-backed findings — not a proposed plan and not questions back to the user.
 
-5. Consume the result and any follow-ups, then `archive_agent` the child. Never archive the shared parent workspace to clean up a child. Repository-specific worktree closeout, when a repo defines one, overrides generic `archive_worktree`.
+5. Consume the result and any follow-ups, then complete temporary-child closeout below. Never archive the shared parent workspace to clean up a child.
+
+## Temporary-child closeout
+
+Finish or preserve the work, confirm the worker is terminal and its checkout lock is released, then archive the temporary agent. This preserves its conversation. Release its exact prepared scratch generation with `release_agent_scratch` using the recorded agent ID and generation; release marks eligibility and does not delete files. Do not invent a generation or relabel historical active scratch based only on age or an archived GUI record.
+
+For an exclusively owned disposable workspace, archive its records and use the repository's closeout procedure after verified landing or remote preservation. A shared parent workspace stays open. Report the actual cleanup outcome and any retained-file reason. Released scratch becomes eligible for the existing ten-day maintenance policy; retained artifacts remain separate. Do not delete runtime directories manually or create another cleanup schedule.
 
 ## Provider discovery
 

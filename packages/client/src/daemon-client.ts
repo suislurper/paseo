@@ -3971,6 +3971,17 @@ export class DaemonClient {
     });
   }
 
+  supportsWorkspaceCreationRetry(): boolean {
+    // COMPAT(workspaceCreationRetry): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
+    return this.lastServerInfoMessage?.features?.workspaceCreationRetry === true;
+  }
+
+  requireWorkspaceCreationRetrySupport(): void {
+    if (!this.supportsWorkspaceCreationRetry()) {
+      throw new Error("Update the host to retry workspace creation safely.");
+    }
+  }
+
   async validateBranch(
     options: { cwd: string; branchName: string },
     requestId?: string,

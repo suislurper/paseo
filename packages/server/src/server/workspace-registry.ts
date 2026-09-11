@@ -73,6 +73,19 @@ const PersistedWorkspaceRecordSchema = z.object({
     .nullable()
     .optional()
     .transform((value) => value ?? null),
+  // COMPAT(workspaceCreationRetry): added in v0.2.0-beta.1. Identity of one
+  // workspace.create attempt; retries reuse the envelope requestId. Old
+  // records parse with both fields null.
+  creationRequestId: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((value) => value ?? null),
+  creationFingerprint: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((value) => value ?? null),
 });
 
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
@@ -420,6 +433,8 @@ export function createPersistedWorkspaceRecord(input: {
   updatedAt: string;
   archivedAt?: string | null;
   pinnedAt?: string | null;
+  creationRequestId?: string | null;
+  creationFingerprint?: string | null;
 }): PersistedWorkspaceRecord {
   return PersistedWorkspaceRecordSchema.parse({
     ...input,
@@ -431,6 +446,8 @@ export function createPersistedWorkspaceRecord(input: {
     mainRepoRoot: input.mainRepoRoot ?? null,
     archivedAt: input.archivedAt ?? null,
     pinnedAt: input.pinnedAt ?? null,
+    creationRequestId: input.creationRequestId ?? null,
+    creationFingerprint: input.creationFingerprint ?? null,
   });
 }
 

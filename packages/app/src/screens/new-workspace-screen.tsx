@@ -89,6 +89,13 @@ import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceDraftTabSetup, WorkspaceTabTarget } from "@/stores/workspace-tabs-store";
 import { isEmptyWorkspaceSubmission, runCreateEmptyWorkspace } from "./new-workspace-empty";
 import {
+  createWorkspaceCreationAttempt,
+  retryWorkspaceCreationAttempt,
+  runWorkspaceCreationAttempt,
+  WorkspaceCreationAttemptError,
+  type WorkspaceCreationAttempt,
+} from "./workspace-creation-attempt";
+import {
   getWorkspaceNamingAttachments,
   remapDraftCwdToWorkspace,
 } from "./new-workspace-fork-context";
@@ -873,14 +880,9 @@ async function createAndMergeWorkspace(input: {
 
 async function createMultiplicityWorkspace(input: {
   client: NonNullable<ReturnType<typeof useHostRuntimeClient>>;
-  isolation: "local" | "worktree";
-  project: HostProjectListItem;
-  sourceDirectory: string;
-  selectedItem: PickerItem | null;
-  currentBranch: string | null;
+  attempt: WorkspaceCreationAttempt;
+  retry?: boolean;
   withInitialAgent: boolean;
-  prompt: string;
-  attachments: AgentAttachment[];
   mergeWorkspaces: (
     serverId: string,
     workspaces: ReturnType<typeof normalizeWorkspaceDescriptor>[],
@@ -888,34 +890,11 @@ async function createMultiplicityWorkspace(input: {
   serverId: string;
   createFailedMessage: string;
 }): Promise<ReturnType<typeof normalizeWorkspaceDescriptor>> {
-  const isWorktree = input.isolation === "worktree";
-  const checkoutRequest = isWorktree
-    ? resolveCheckoutRequest(input.selectedItem, input.currentBranch)
-    : undefined;
-  const firstAgentContext = buildFirstAgentContext({
-    prompt: input.prompt,
-    attachments: input.attachments,
+  const result = await (input.retry ? retryWorkspaceCreationAttempt : runWorkspaceCreationAttempt)({
+    client: input.client,
+    attempt: input.attempt,
   });
-  const payload = await input.client.createWorkspace({
-    source: isWorktree
-      ? {
-          kind: "worktree",
-          cwd: input.sourceDirectory,
-          projectId: input.project.projectKey,
-          worktreeSlug: createNameId(),
-          ...checkoutRequest,
-        }
-      : {
-          kind: "directory",
-          path: input.sourceDirectory,
-          projectId: input.project.projectKey,
-        },
-    ...(firstAgentContext ? { firstAgentContext } : {}),
-  });
-  if (payload.error || !payload.workspace) {
-    throw new Error(payload.error ?? input.createFailedMessage);
-  }
-  const normalizedWorkspace = normalizeWorkspaceDescriptor(payload.workspace);
+  const normalizedWorkspace = normalizeWorkspaceDescriptor(result.workspace);
   const workspaceForInitialMerge = input.withInitialAgent
     ? { ...normalizedWorkspace, status: "running" as const, statusEnteredAt: new Date() }
     : normalizedWorkspace;
@@ -1610,6 +1589,25 @@ function useNewWorkspaceFormStack(input: NewWorkspaceFormStackInput): ReactEleme
   );
 }
 
+function WorkspaceCreationRetryButton(input: {
+  attempt: WorkspaceCreationAttempt | null;
+  errorMessage: string | null;
+  created: boolean;
+  onPress: () => void;
+  label: string;
+}) {
+  if (!input.attempt || !input.errorMessage || input.created) return null;
+  return (
+    <Pressable
+      accessibilityRole="button"
+      onPress={input.onPress}
+      testID="workspace-create-check-again"
+    >
+      <Text>{input.label}</Text>
+    </Pressable>
+  );
+}
+
 export function NewWorkspaceScreen({
   serverId,
   sourceDirectory: sourceDirectoryProp,
@@ -1646,6 +1644,10 @@ export function NewWorkspaceScreen({
   const [createdWorkspace, setCreatedWorkspace] = useState<ReturnType<
     typeof normalizeWorkspaceDescriptor
   > | null>(null);
+  const [pendingCreationAttempt, setPendingCreationAttempt] =
+    useState<WorkspaceCreationAttempt | null>(null);
+  const pendingSubmissionRef = useRef<MessagePayload | null>(null);
+  const pendingCreationServerRef = useRef<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"chat" | "empty" | null>(null);
   const [manualPickerSelection, setManualPickerSelection] = useState<PickerSelection | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -1983,6 +1985,7 @@ export function NewWorkspaceScreen({
       cwd: string;
       prompt: string;
       attachments: AgentAttachment[];
+      worktreeSlug: string;
     }): CreatePaseoWorktreeInput => {
       if (!selectedProject) {
         throw new Error("Choose a project");
@@ -1996,7 +1999,7 @@ export function NewWorkspaceScreen({
       return {
         cwd: selectedSourceDirectory,
         projectId: selectedProject.projectKey,
-        worktreeSlug: createNameId(),
+        worktreeSlug: input.worktreeSlug,
         ...(firstAgentContext ? { firstAgentContext } : {}),
         ...checkoutRequest,
       };
@@ -2020,30 +2023,83 @@ export function NewWorkspaceScreen({
       if (!selectedSourceDirectory) {
         throw new Error("Choose a host for this project");
       }
-      const normalizedWorkspace = supportsWorkspaceMultiplicity
-        ? await createMultiplicityWorkspace({
-            client: withConnectedClient(),
-            isolation: effectiveIsolation,
-            project: selectedProject,
-            sourceDirectory: selectedSourceDirectory,
-            selectedItem,
-            currentBranch,
-            withInitialAgent: input.withInitialAgent,
-            prompt: input.prompt,
-            attachments: input.attachments,
-            mergeWorkspaces,
-            serverId: selectedServerId,
-            createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
-          })
-        : await createAndMergeWorkspace({
-            client: withConnectedClient(),
-            createInput: buildCreateWorktreeInput(input),
-            mergeWorkspaces,
-            serverId: selectedServerId,
-            createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
-          });
-      setCreatedWorkspace(normalizedWorkspace);
-      return normalizedWorkspace;
+      if (pendingCreationAttempt && pendingCreationServerRef.current !== selectedServerId) {
+        throw new WorkspaceCreationAttemptError(
+          "connection",
+          "Return to the original host to check the pending workspace creation.",
+          true,
+        );
+      }
+      const connectedClient = withConnectedClient();
+      const firstAgentContext = buildFirstAgentContext({
+        prompt: input.prompt,
+        attachments: input.attachments,
+      });
+      const isWorktree = effectiveIsolation === "worktree";
+      const checkoutRequest = isWorktree
+        ? resolveCheckoutRequest(selectedItem, currentBranch)
+        : undefined;
+      // Freeze the complete create input (including the generated worktree
+      // slug) for one GUI attempt. Retries reuse this attempt identity.
+      const attempt =
+        pendingCreationAttempt ??
+        createWorkspaceCreationAttempt({
+          source:
+            supportsWorkspaceMultiplicity && !isWorktree
+              ? {
+                  kind: "directory",
+                  path: selectedSourceDirectory,
+                  projectId: selectedProject.projectKey,
+                }
+              : {
+                  kind: "worktree",
+                  cwd: selectedSourceDirectory,
+                  projectId: selectedProject.projectKey,
+                  worktreeSlug: createNameId(),
+                  ...checkoutRequest,
+                },
+          ...(firstAgentContext ? { firstAgentContext } : {}),
+        });
+      if (!pendingCreationAttempt) pendingCreationServerRef.current = selectedServerId;
+      setPendingCreationAttempt(attempt);
+      try {
+        const normalizedWorkspace = supportsWorkspaceMultiplicity
+          ? await createMultiplicityWorkspace({
+              client: connectedClient,
+              attempt,
+              retry: pendingCreationAttempt !== null,
+              withInitialAgent: input.withInitialAgent,
+              mergeWorkspaces,
+              serverId: selectedServerId,
+              createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
+            })
+          : await createAndMergeWorkspace({
+              client: connectedClient,
+              createInput: buildCreateWorktreeInput({
+                cwd: input.cwd,
+                prompt: input.prompt,
+                attachments: input.attachments,
+                worktreeSlug:
+                  attempt.source.kind === "worktree" && attempt.source.worktreeSlug
+                    ? attempt.source.worktreeSlug
+                    : createNameId(),
+              }),
+              mergeWorkspaces,
+              serverId: selectedServerId,
+              createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
+            });
+        setCreatedWorkspace(normalizedWorkspace);
+        setPendingCreationAttempt(null);
+        return normalizedWorkspace;
+      } catch (error) {
+        // Timeout/connection uncertainty retains the frozen attempt for an
+        // explicit check-again retry; any other failure clears attempt
+        // identity so the next intentional action gets a new ID.
+        if (!(error instanceof WorkspaceCreationAttemptError && error.retryable)) {
+          setPendingCreationAttempt(null);
+        }
+        throw error;
+      }
     },
     [
       buildCreateWorktreeInput,
@@ -2051,6 +2107,7 @@ export function NewWorkspaceScreen({
       currentBranch,
       effectiveIsolation,
       mergeWorkspaces,
+      pendingCreationAttempt,
       selectedItem,
       selectedProject,
       selectedServerId,
@@ -2063,6 +2120,9 @@ export function NewWorkspaceScreen({
 
   const handleSubmitNewWorkspace = useCallback(
     async (payload: MessagePayload) => {
+      if (pendingCreationAttempt && pendingSubmissionRef.current)
+        payload = pendingSubmissionRef.current;
+      else pendingSubmissionRef.current = payload;
       try {
         setErrorMessage(null);
         await composerState?.persistFormPreferences();
@@ -2094,7 +2154,10 @@ export function NewWorkspaceScreen({
           },
         });
       } catch (error) {
-        const message = toErrorMessage(error);
+        const message =
+          error instanceof WorkspaceCreationAttemptError && error.retryable
+            ? `${toErrorMessage(error)} Check again to reconcile the same attempt.`
+            : toErrorMessage(error);
         setPendingAction(null);
         setErrorMessage(message);
         toast.error(message);
@@ -2104,6 +2167,7 @@ export function NewWorkspaceScreen({
       composerState,
       draftId,
       draftKey,
+      pendingCreationAttempt,
       ensureWorkspace,
       forkDraftSetup,
       selectedServerId,
@@ -2112,6 +2176,11 @@ export function NewWorkspaceScreen({
       toast,
     ],
   );
+
+  const handleCheckAgain = useCallback(() => {
+    const submission = pendingSubmissionRef.current;
+    if (submission) void handleSubmitNewWorkspace(submission);
+  }, [handleSubmitNewWorkspace]);
 
   const renderPickerOption = useCallback(
     (props: {
@@ -2309,6 +2378,13 @@ export function NewWorkspaceScreen({
             footer={composerFooter}
           />
           {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+          <WorkspaceCreationRetryButton
+            attempt={pendingCreationAttempt}
+            errorMessage={errorMessage}
+            created={createdWorkspace !== null}
+            onPress={handleCheckAgain}
+            label={t("newWorkspace.checkAgain", { defaultValue: "Check again" })}
+          />
         </ReanimatedAnimated.View>
       </View>
     </FileDropZone>

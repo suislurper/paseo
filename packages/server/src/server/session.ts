@@ -19,6 +19,14 @@ import {
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
 } from "./messages.js";
+import {
+  computeWorkspaceCreationFingerprint,
+  runWorkspaceCreationIdempotent,
+  WorkspaceCreationMismatchError,
+  type WorkspaceCreationOutcome,
+} from "./workspace-creation-identity.js";
+import { WorkspaceCreationReconciliationError } from "./workspace-creation-errors.js";
+import { computeWorktreePath } from "../utils/worktree.js";
 import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
@@ -4809,19 +4817,40 @@ export class Session {
   private async handleWorkspaceCreateRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
   ): Promise<void> {
+    const fingerprint = computeWorkspaceCreationFingerprint({
+      requestId: request.requestId,
+      title: request.title,
+      firstAgentContext: request.firstAgentContext,
+      source: request.source,
+    });
     try {
-      if (request.source.kind === "directory") {
-        await this.handleWorkspaceCreateLocal(request);
+      const persisted = await this.findWorkspaceByCreationRequestId(request.requestId, fingerprint);
+      if (persisted) {
+        await this.emitWorkspaceCreateResponseForRecord(request, persisted, true);
         return;
       }
-      await this.handleWorkspaceCreateWorktree(request);
+      const { outcome, reconciled } = await runWorkspaceCreationIdempotent({
+        owner: this.workspaceRegistry,
+        requestId: request.requestId,
+        fingerprint,
+        runner: () => this.runWorkspaceCreateAttempt(request, fingerprint),
+      });
+      await this.emitWorkspaceCreateOutcome(request, outcome, reconciled);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create workspace";
       this.sessionLogger.error(
         { err: error, sourceKind: request.source.kind, requestId: request.requestId },
         "Failed to create workspace",
       );
-      const errorCode = error instanceof WorkspaceProvisioningError ? error.code : undefined;
+      let errorCode: string | undefined;
+      if (
+        error instanceof WorkspaceProvisioningError ||
+        error instanceof WorkspaceCreationReconciliationError
+      ) {
+        errorCode = error.code;
+      } else if (error instanceof WorkspaceCreationMismatchError) {
+        errorCode = "creation_request_mismatch";
+      }
       this.emit({
         type: "workspace.create.response",
         payload: {
@@ -4830,42 +4859,48 @@ export class Session {
           setupTerminalId: null,
           error: message,
           errorCode,
+          creationRequestId: request.requestId,
         },
       });
     }
   }
 
-  private async handleWorkspaceCreateLocal(
-    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
-  ): Promise<void> {
-    if (request.source.kind !== "directory") {
-      return;
+  private async findWorkspaceByCreationRequestId(
+    requestId: string,
+    fingerprint: string,
+  ): Promise<PersistedWorkspaceRecord | null> {
+    const workspaces = await this.workspaceRegistry.list();
+    const match = workspaces.find((workspace) => workspace.creationRequestId === requestId) ?? null;
+    if (!match) {
+      return null;
     }
+    if (match.creationFingerprint !== fingerprint) {
+      throw new WorkspaceCreationMismatchError(requestId);
+    }
+    return match;
+  }
 
-    const cwd = expandTilde(request.source.path);
-    const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
-    if (!directoryExists) {
+  private async emitWorkspaceCreateResponseForRecord(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    workspace: PersistedWorkspaceRecord,
+    reconciled: boolean,
+  ): Promise<void> {
+    if (workspace.archivedAt) {
       this.emit({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
           workspace: null,
           setupTerminalId: null,
-          error: `Directory not found: ${cwd}`,
-          errorCode: "directory_not_found",
+          error: `Workspace creation attempt "${request.requestId}" was already archived; start a new workspace action for a new attempt.`,
+          errorCode: "creation_attempt_archived",
+          creationRequestId: request.requestId,
+          creationReconciled: reconciled,
+          creationArchived: true,
         },
       });
       return;
     }
-
-    const explicitTitle = request.title?.trim() || null;
-    const promptTitle = resolveFirstAgentPromptTitle(request.firstAgentContext);
-    const workspace = await this.workspaceProvisioning.createWorkspaceForDirectory(
-      cwd,
-      explicitTitle ?? promptTitle,
-      request.source.projectId,
-    );
-    await this.syncWorkspaceGitObserverForWorkspace(workspace);
     const descriptor = await this.describeWorkspaceRecord(workspace);
     this.emit({
       type: "workspace.create.response",
@@ -4874,74 +4909,173 @@ export class Session {
         workspace: descriptor,
         setupTerminalId: null,
         error: null,
+        creationRequestId: request.requestId,
+        creationReconciled: reconciled,
       },
     });
-    await this.emitCreatedWorkspaceUpdate(descriptor);
-    void this.workspaceGitService
-      .getSnapshot(workspace.cwd, { force: true, includeForge: true, reason: "open_project" })
-      .catch((error) => {
-        this.sessionLogger.warn(
-          { err: error, cwd: workspace.cwd },
-          "Background snapshot refresh failed after workspace.create",
-        );
-      });
-    if (request.firstAgentContext) {
-      const firstAgentContext = request.firstAgentContext;
-      this.workspaceAutoName.scheduleForDirectory(
-        {
-          workspaceId: workspace.workspaceId,
-          cwd: workspace.cwd,
-          firstAgentContext,
-        },
-        { currentSelection: this.getFocusedAgentSelectionForCwd(workspace.cwd) },
-      );
+    try {
+      await this.emitCreatedWorkspaceUpdate(descriptor);
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Created workspace notification failed");
     }
   }
 
-  private async handleWorkspaceCreateWorktree(
+  private async emitWorkspaceCreateOutcome(
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    outcome: WorkspaceCreationOutcome,
+    reconciled: boolean,
   ): Promise<void> {
-    if (request.source.kind !== "worktree") {
-      return;
-    }
-
-    const source = request.source;
-
-    if (!source.cwd && !source.projectId) {
+    if (!outcome.workspace || outcome.error) {
       this.emit({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
           workspace: null,
           setupTerminalId: null,
-          error: "cwd or projectId is required for a worktree-backed workspace",
-          errorCode: "source_required",
+          error: outcome.error ?? "Failed to create workspace",
+          errorCode: outcome.errorCode,
+          creationRequestId: request.requestId,
+          creationReconciled: reconciled || outcome.reconciled,
         },
       });
       return;
     }
+    this.emit({
+      type: "workspace.create.response",
+      payload: {
+        requestId: request.requestId,
+        workspace: outcome.workspace,
+        setupTerminalId: null,
+        error: null,
+        creationRequestId: request.requestId,
+        creationReconciled: reconciled || outcome.reconciled,
+      },
+    });
+    try {
+      await this.emitCreatedWorkspaceUpdate(outcome.workspace);
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Created workspace notification failed");
+    }
+  }
 
+  private async runWorkspaceCreateAttempt(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    fingerprint: string,
+  ): Promise<WorkspaceCreationOutcome> {
+    // A persisted retry check inside the coalesced runner: the first execution
+    // may have persisted while this attempt waited for the shared in-flight slot.
+    const persisted = await this.findWorkspaceByCreationRequestId(request.requestId, fingerprint);
+    if (persisted) {
+      if (persisted.archivedAt) {
+        return {
+          workspace: null,
+          error: `Workspace creation attempt "${request.requestId}" was already archived; start a new workspace action for a new attempt.`,
+          errorCode: "creation_attempt_archived",
+          reconciled: true,
+          archived: true,
+        };
+      }
+      const descriptor = await this.describeWorkspaceRecord(persisted);
+      return { workspace: descriptor, error: null, reconciled: true, archived: false };
+    }
+    if (request.source.kind === "directory") {
+      return this.runWorkspaceCreateLocal(request, fingerprint);
+    }
+    return this.runWorkspaceCreateWorktree(request, fingerprint);
+  }
+
+  private async runWorkspaceCreateLocal(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    fingerprint: string,
+  ): Promise<WorkspaceCreationOutcome> {
+    if (request.source.kind !== "directory") {
+      throw new Error("Mismatched workspace.create source");
+    }
+    const cwd = expandTilde(request.source.path);
+    const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
+    if (!directoryExists) {
+      return {
+        workspace: null,
+        error: `Directory not found: ${cwd}`,
+        errorCode: "directory_not_found",
+        reconciled: false,
+        archived: false,
+      };
+    }
+    const explicitTitle = request.title?.trim() || null;
+    const promptTitle = resolveFirstAgentPromptTitle(request.firstAgentContext);
+    const workspace = await this.workspaceProvisioning.createWorkspaceForDirectory(
+      cwd,
+      explicitTitle ?? promptTitle,
+      request.source.projectId,
+      { creationRequestId: request.requestId, creationFingerprint: fingerprint },
+    );
+    await this.syncWorkspaceGitObserverForWorkspace(workspace);
+    const descriptor = await this.describeWorkspaceRecord(workspace);
+    // Response-critical path stays minimal: full Git snapshots, forge refreshes,
+    // and generated titles run outside the response via background work below.
+    void this.refreshWorkspaceGitSnapshotAfterCreate(workspace.cwd);
+    if (request.firstAgentContext) {
+      const firstAgentContext = request.firstAgentContext;
+      this.workspaceAutoName.scheduleForDirectory(
+        { workspaceId: workspace.workspaceId, cwd: workspace.cwd, firstAgentContext },
+        { currentSelection: this.getFocusedAgentSelectionForCwd(workspace.cwd) },
+      );
+    }
+    return { workspace: descriptor, error: null, reconciled: false, archived: false };
+  }
+
+  private refreshWorkspaceGitSnapshotAfterCreate(cwd: string): void {
+    void this.workspaceGitService
+      .getSnapshot(cwd, { force: true, includeForge: true, reason: "open_project" })
+      .catch((error) => {
+        this.sessionLogger.warn(
+          { err: error, cwd },
+          "Background snapshot refresh failed after workspace.create",
+        );
+      });
+  }
+
+  private async runWorkspaceCreateWorktree(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    fingerprint: string,
+  ): Promise<WorkspaceCreationOutcome> {
+    if (request.source.kind !== "worktree") {
+      throw new Error("Mismatched workspace.create source");
+    }
+    const source = request.source;
+    if (!source.cwd && !source.projectId) {
+      return {
+        workspace: null,
+        error: "cwd or projectId is required for a worktree-backed workspace",
+        errorCode: "source_required",
+        reconciled: false,
+        archived: false,
+      };
+    }
     const sourceCwd = await this.resolveWorktreeSourceCwd({
       cwd: source.cwd,
       projectId: source.projectId,
     });
-
+    const worktreeSlug = source.worktreeSlug ?? `workspace-${fingerprint.slice(0, 16)}`;
+    await this.assertFrozenWorktreeTargetAvailable(worktreeSlug, sourceCwd);
     const result = await this.createPaseoWorktreeWorkflow(
       {
         cwd: sourceCwd,
         projectId: source.projectId,
-        worktreeSlug: source.worktreeSlug,
+        worktreeSlug,
         action: source.action,
         refName: source.refName,
         checkoutSource: source.checkoutSource,
         githubPrNumber: source.githubPrNumber,
         firstAgentContext: request.firstAgentContext,
+        creationRequestId: request.requestId,
+        creationFingerprint: fingerprint,
       },
       source.baseBranch
         ? { resolveDefaultBranch: async () => source.baseBranch as string }
         : undefined,
     );
-
     if (request.title?.trim()) {
       await this.workspaceRegistry.upsert({
         ...result.workspace,
@@ -4950,18 +5084,37 @@ export class Session {
       });
       result.workspace.title = request.title.trim();
     }
+    return {
+      workspace: await this.describeCreatedWorktreeWorkspace(result),
+      error: null,
+      reconciled: false,
+      archived: false,
+    };
+  }
 
-    const descriptor = await this.describeCreatedWorktreeWorkspace(result);
-    this.emit({
-      type: "workspace.create.response",
-      payload: {
-        requestId: request.requestId,
-        workspace: descriptor,
-        setupTerminalId: null,
-        error: null,
-      },
-    });
-    await this.emitCreatedWorkspaceUpdate(descriptor);
+  private async assertFrozenWorktreeTargetAvailable(
+    worktreeSlug: string,
+    sourceCwd: string,
+  ): Promise<void> {
+    const repoRoot = await this.workspaceGitService.resolveRepoRoot(sourceCwd);
+    const frozenPath = await computeWorktreePath(
+      repoRoot,
+      worktreeSlug,
+      this.paseoHome,
+      this.worktreesRoot,
+    );
+    try {
+      await lstat(frozenPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    // Persisted matching requests are resolved before reaching this point. Any
+    // remaining directory needs inspection, never an automatically suffixed copy.
+    throw new WorkspaceCreationReconciliationError(
+      "creation_target_ambiguous",
+      `The requested workspace path already exists: ${frozenPath}. Inspect the existing attempt before creating another workspace.`,
+    );
   }
 
   private async resolveWorktreeSourceCwd(input: {

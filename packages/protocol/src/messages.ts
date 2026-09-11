@@ -2778,6 +2778,8 @@ export const ServerInfoStatusPayloadSchema = z
         stableProjectIdentity: z.boolean().optional(),
         // COMPAT(scheduleIdentity): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
         scheduleIdentity: z.boolean().optional(),
+        // COMPAT(workspaceCreationRetry): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
+        workspaceCreationRetry: z.boolean().optional(),
       })
       .optional(),
   })
@@ -3631,6 +3633,10 @@ export const WorkspaceCreateResponseSchema = z.object({
     error: z.string().nullable(),
     errorCode: z.string().optional(),
     requestId: z.string(),
+    // COMPAT(workspaceCreationRetry): added in v0.2.0-beta.1, drop when floor >= v0.2.0-beta.1.
+    creationRequestId: z.string().optional(),
+    creationReconciled: z.boolean().optional(),
+    creationArchived: z.boolean().optional(),
   }),
 });
 

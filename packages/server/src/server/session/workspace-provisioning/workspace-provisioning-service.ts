@@ -42,6 +42,8 @@ export interface CreateWorktreeWorkspaceInput {
   branch: string | null;
   baseBranch: string | null;
   title: string | null;
+  creationRequestId?: string | null;
+  creationFingerprint?: string | null;
 }
 
 export interface AllocateDirectoryWorkspaceForLaunchInput {
@@ -60,6 +62,7 @@ export interface WorkspaceProvisioningService {
     cwd: string,
     title?: string | null,
     projectId?: string,
+    identity?: { creationRequestId?: string | null; creationFingerprint?: string | null },
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
     input: CreateWorktreeWorkspaceInput,
@@ -217,6 +220,7 @@ export function createWorkspaceProvisioningService(deps: {
     cwd: string,
     title?: string | null,
     projectId?: string,
+    identity?: { creationRequestId?: string | null; creationFingerprint?: string | null },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
@@ -232,6 +236,8 @@ export function createWorkspaceProvisioningService(deps: {
       title: title?.trim() || null,
       createdAt: timestamp,
       updatedAt: timestamp,
+      creationRequestId: identity?.creationRequestId ?? null,
+      creationFingerprint: identity?.creationFingerprint ?? null,
     });
   }
 
@@ -239,8 +245,9 @@ export function createWorkspaceProvisioningService(deps: {
     cwd: string,
     title?: string | null,
     projectId?: string,
+    identity?: { creationRequestId?: string | null; creationFingerprint?: string | null },
   ): Promise<PersistedWorkspaceRecord> {
-    const workspace = await buildDirectoryWorkspaceRecord(cwd, title, projectId);
+    const workspace = await buildDirectoryWorkspaceRecord(cwd, title, projectId, identity);
     await workspaceRegistry.upsert(workspace);
     return workspace;
   }
@@ -330,6 +337,8 @@ export function createWorkspaceProvisioningService(deps: {
       title: input.title,
       createdAt: timestamp,
       updatedAt: timestamp,
+      creationRequestId: input.creationRequestId ?? null,
+      creationFingerprint: input.creationFingerprint ?? null,
     });
     await workspaceRegistry.upsert(workspace);
     return workspace;

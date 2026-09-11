@@ -1427,6 +1427,8 @@ export class VoiceAssistantWebSocketServer {
         stableProjectIdentity: true,
         // COMPAT(scheduleIdentity): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
         scheduleIdentity: true,
+        // COMPAT(workspaceCreationRetry): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
+        workspaceCreationRetry: true,
       },
     };
   }

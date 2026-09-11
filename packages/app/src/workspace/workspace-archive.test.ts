@@ -175,6 +175,51 @@ describe("archiveWorkspaceOptimistically", () => {
     }
   });
 
+  it("stays hidden while pre-record teardown continues beyond the RPC deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const archived = workspace();
+      useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+      let serverArchived = false;
+      let finishServer!: () => void;
+      const serverFinished = new Promise<void>((resolve) => {
+        finishServer = resolve;
+      });
+      const client = {
+        archiveWorkspace: async () =>
+          new Promise<ArchiveWorkspacePayload>((_resolve, reject) => {
+            setTimeout(() => reject(new Error("RPC timed out")), 60_000);
+          }),
+        inspectWorkspaceRecovery: async () => {
+          // The daemon's shared-registry barrier waits before reading active state.
+          expect(serverArchived).toBe(false);
+          await serverFinished;
+          return {
+            kind: "recoverable" as const,
+            workspaceId: archived.id,
+            workspaceName: "archived",
+            action: "unarchive",
+            branch: "feature",
+          };
+        },
+      };
+      const outcome = archiveWorkspaceOptimistically({ client, workspace: target() });
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(serverArchived).toBe(false);
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+      expect(isWorkspaceArchivePending({ serverId: SERVER_ID, workspaceId: archived.id })).toBe(
+        true,
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      serverArchived = true;
+      finishServer();
+      await expect(outcome).resolves.toMatchObject({ status: "failed" });
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps an ambiguous disconnected archive hidden until authoritative reconciliation", async () => {
     const archived = workspace();
     useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);

@@ -132,6 +132,10 @@ import {
   checkoutFromPersistedWorkspacePlacement,
   deriveWorkspaceDisplayName,
 } from "./workspace-registry-model.js";
+import {
+  trackWorkspaceArchiveRequest,
+  readAfterWorkspaceArchives,
+} from "./workspace-archive-flight.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   resolveProjectDisplayName,
@@ -1953,7 +1957,9 @@ export class Session {
       case "project.github.clone.request":
         return this.handleProjectGithubCloneRequest(msg);
       case "archive_workspace_request":
-        return this.handleArchiveWorkspaceRequest(msg);
+        return trackWorkspaceArchiveRequest(this.workspaceRegistry, msg.workspaceId, () =>
+          this.handleArchiveWorkspaceRequest(msg),
+        );
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
       case "workspace.create.request":
@@ -2716,7 +2722,11 @@ export class Session {
   private async handleWorkspaceRecoveryInspectRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.inspect.request" }>,
   ): Promise<void> {
-    const state = await this.workspaceRecovery.inspect(request.workspaceId);
+    const state = await readAfterWorkspaceArchives(
+      this.workspaceRegistry,
+      () => this.workspaceRecovery.inspect(request.workspaceId),
+      request.workspaceId,
+    );
     this.emit({
       type: "workspace.recovery.inspect.response",
       payload: {
@@ -4719,7 +4729,9 @@ export class Session {
         };
       }
 
-      const payload = await this.listFetchWorkspacesEntries(request);
+      const payload = await readAfterWorkspaceArchives(this.workspaceRegistry, () =>
+        this.listFetchWorkspacesEntries(request),
+      );
       this.workspaceGitObserver.syncObservers(payload.entries);
       this.sessionLogger.debug(
         {

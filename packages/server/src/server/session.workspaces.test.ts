@@ -8982,3 +8982,77 @@ test.each(["unknown_project", "archived_project"] as const)(
     });
   },
 );
+
+test.each([true, false])(
+  "archive reads on a reconnected session await pre-record teardown (success=%s)",
+  async (success) => {
+    const root = mkdtempSync(path.join(tmpdir(), "archive-read-barrier-"));
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(root, "workspaces.json"),
+      asSessionLogger(createTestLogger()),
+    );
+    await registry.initialize();
+    const record = createPersistedWorkspaceRecord({
+      workspaceId: "barrier-workspace",
+      projectId: "barrier-project",
+      cwd: root,
+      kind: "directory",
+      displayName: "barrier",
+      createdAt: "2026-09-11T00:00:00Z",
+      updatedAt: "2026-09-11T00:00:00Z",
+    });
+    await registry.upsert(record);
+    const emitted: SessionOutboundMessage[] = [];
+    const first = createSessionForWorkspaceTests({ workspaceRegistry: registry });
+    const second = createSessionForWorkspaceTests({
+      workspaceRegistry: registry,
+      onMessage: (message) => emitted.push(message),
+    });
+    let finishTeardown!: () => void;
+    let startedTeardown!: () => void;
+    const teardownStarted = new Promise<void>((resolve) => {
+      startedTeardown = resolve;
+    });
+    const teardown = new Promise<void>((resolve) => {
+      finishTeardown = resolve;
+    });
+    first.terminalController.killTerminalsForWorkspace = async () => {
+      startedTeardown();
+      await teardown;
+      if (!success) throw new Error("teardown failed");
+    };
+    try {
+      const archive = first.handleMessage({
+        type: "archive_workspace_request",
+        workspaceId: record.workspaceId,
+        requestId: "slow-archive",
+        mode: "archive_only",
+      });
+      await teardownStarted;
+      const inspection = second.handleMessage({
+        type: "workspace.recovery.inspect.request",
+        workspaceId: record.workspaceId,
+        requestId: "reconnect-inspect",
+      });
+      const fetch = second.handleMessage({
+        type: "fetch_workspaces_request",
+        requestId: "reconnect-fetch",
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(findByType(emitted, "workspace.recovery.inspect.response")).toBeUndefined();
+      expect(findByType(emitted, "fetch_workspaces_response")).toBeUndefined();
+      expect((await registry.get(record.workspaceId))?.archivedAt).toBeNull();
+      finishTeardown();
+      await Promise.all([archive, inspection, fetch]);
+      const state = findByType(emitted, "workspace.recovery.inspect.response")?.payload.state;
+      expect(state).toBeDefined();
+      if (success) expect(state).not.toMatchObject({ reason: "workspace_not_archived" });
+      else expect(state).toMatchObject({ reason: "workspace_not_archived" });
+      const entries = findByType(emitted, "fetch_workspaces_response")?.payload.entries;
+      expect(entries?.some((entry) => entry.id === record.workspaceId)).toBe(!success);
+    } finally {
+      finishTeardown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

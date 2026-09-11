@@ -249,6 +249,12 @@ fresh complete directory snapshot. A fetch started before the uncertain result,
 or before a newer archive attempt, cannot clear that attempt's suppression.
 Unknown cleanup status is shown explicitly instead of claiming files were retained.
 
+Recovery and directory reads wait for archive requests on the shared registry to
+finish before reporting active state. Requests register before their first await;
+reads retry if another archive starts or finishes while the snapshot is being
+read. Thus a slow pre-record agent shutdown cannot produce false rollback proof.
+A read timeout leaves the client pending until a later confirmation.
+
 Cleanup checks Linux mount source paths as well as mount points, using filesystem
 roots and device identities from mountinfo. A checkout bind-mounted elsewhere,
 including through an ancestor alias or a separate home filesystem, is retained.

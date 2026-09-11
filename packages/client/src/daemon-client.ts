@@ -2183,12 +2183,23 @@ export class DaemonClient {
   async archiveWorkspace(
     workspaceId: string,
     requestId?: string,
+    options?: { mode?: "archive_and_cleanup" | "archive_only" },
   ): Promise<ArchiveWorkspacePayload> {
+    // COMPAT(workspaceArchiveModes): added in v0.1.110; remove after 2027-03-11.
+    // Older daemons ignore mode and may delete the checkout. Never send an
+    // archive-only request until the host has advertised that it honors it.
+    if (
+      options?.mode === "archive_only" &&
+      this.lastServerInfoMessage?.features?.workspaceArchiveModes !== true
+    ) {
+      throw new Error("Update the host to archive workspace records without deleting files.");
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "archive_workspace_request",
         workspaceId,
+        ...(options?.mode ? { mode: options.mode } : {}),
       },
       responseType: "archive_workspace_response",
     });

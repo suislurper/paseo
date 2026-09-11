@@ -5517,40 +5517,197 @@ test("archive_workspace_request hides non-destructive workspace records", async 
   expect(response?.payload.error).toBeNull();
 });
 
-test("archive_workspace_request refuses to hide an unmanaged worktree", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "session-unmanaged-worktree-archive-"));
+test("archive_workspace_request archives an external worktree record without deleting files", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-external-worktree-archive-"));
   const workspace = createPersistedWorkspaceRecord({
-    workspaceId: "ws-unmanaged-worktree",
-    projectId: "proj-unmanaged-worktree",
+    workspaceId: "ws-external-worktree",
+    projectId: "proj-external-worktree",
     cwd: tempDir,
     kind: "worktree",
-    displayName: "unmanaged-worktree",
+    displayName: "external-worktree",
     createdAt: "2026-03-01T12:00:00.000Z",
     updatedAt: "2026-03-01T12:00:00.000Z",
   });
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests();
-  let archiveCalls = 0;
 
   session.emit = (message) => {
     if (isSessionOutboundMessage(message)) emitted.push(message);
   };
   session.workspaceRegistry.get = async () => workspace;
-  session.workspaceRegistry.archive = async () => {
-    archiveCalls += 1;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.archive = async (_workspaceId: string, archivedAt: string) => {
+    workspace.archivedAt = archivedAt;
   };
 
   try {
     await session.handleMessage({
       type: "archive_workspace_request",
       workspaceId: workspace.workspaceId,
-      requestId: "req-unmanaged-worktree-archive",
+      requestId: "req-external-worktree-archive",
     });
 
-    expect(archiveCalls).toBe(0);
-    expect(workspace.archivedAt).toBeNull();
+    expect(workspace.archivedAt).toBeTruthy();
+    expect(existsSync(tempDir)).toBe(true);
     const response = findByType(emitted, "archive_workspace_response");
-    expect(response?.payload.error).toContain("not a Paseo-managed worktree");
+    expect(response?.payload.error).toBeNull();
+    expect(response?.payload.archivedAt).toBeTruthy();
+    expect(response?.payload.cleanup).toMatchObject({ status: "retained" });
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("archive_only keeps sibling records and the backing directory", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-archive-only-sibling-"));
+  const target = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-only-target",
+    projectId: "proj-archive-only",
+    cwd: tempDir,
+    kind: "directory",
+    displayName: "target",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const sibling = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-only-sibling",
+    projectId: "proj-archive-only",
+    cwd: tempDir,
+    kind: "directory",
+    displayName: "sibling",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => target;
+  session.workspaceRegistry.list = async () => [target, sibling];
+  session.workspaceRegistry.archive = async (_workspaceId: string, archivedAt: string) => {
+    target.archivedAt = archivedAt;
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: target.workspaceId,
+      requestId: "req-archive-only-sibling",
+      mode: "archive_only",
+    });
+
+    expect(target.archivedAt).toBeTruthy();
+    expect(sibling.archivedAt).toBeNull();
+    expect(existsSync(tempDir)).toBe(true);
+    expect(findByType(emitted, "archive_workspace_response")?.payload.error).toBeNull();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("archive_workspace_request retries residual cleanup for an already-archived record", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-archived-retry-"));
+  const repoDir = path.join(tempDir, "repo");
+  mkdirSync(repoDir, { recursive: true });
+  execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "pipe" });
+  execFileSync("git", ["config", "user.email", "test@getpaseo.local"], {
+    cwd: repoDir,
+    stdio: "pipe",
+  });
+  execFileSync("git", ["config", "user.name", "Paseo Test"], { cwd: repoDir, stdio: "pipe" });
+  execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial"], {
+    cwd: repoDir,
+    stdio: "pipe",
+  });
+  const paseoHome = path.join(tempDir, ".paseo");
+  const worktree = await createWorktree({
+    cwd: repoDir,
+    worktreeSlug: "archived-retry",
+    source: { kind: "branch-off", baseBranch: "main", branchName: "archived-retry" },
+    runSetup: false,
+    paseoHome,
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archived-retry",
+    projectId: "proj-archived-retry",
+    cwd: worktree.worktreePath,
+    kind: "worktree",
+    displayName: "archived-retry",
+    worktreeRoot: worktree.worktreePath,
+    isPaseoOwnedWorktree: true,
+    mainRepoRoot: repoDir,
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  workspace.archivedAt = "2026-03-02T12:00:00.000Z";
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    paseoHome,
+    workspaceGitService: createNoopWorkspaceGitService(),
+  });
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.archive = async () => {
+    throw new Error("must not unarchive or duplicate an archived record");
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-archived-retry",
+    });
+
+    expect(workspace.archivedAt).toBe("2026-03-02T12:00:00.000Z");
+    expect(existsSync(worktree.worktreePath)).toBe(false);
+    const response = findByType(emitted, "archive_workspace_response");
+    expect(response?.payload.error).toBeNull();
+    expect(response?.payload.archivedAt).toBe("2026-03-02T12:00:00.000Z");
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("archive_workspace_request reports required teardown failure without marking success", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-teardown-failure-"));
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-teardown-failure",
+    projectId: "proj-teardown-failure",
+    cwd: tempDir,
+    kind: "directory",
+    displayName: "teardown-failure",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  // A required terminal shutdown failure must not report successful archival.
+  const controller = session.terminalController as {
+    killTerminalsForWorkspace: (workspaceId: string) => Promise<void>;
+  };
+  controller.killTerminalsForWorkspace = async () => {
+    throw new Error("terminal teardown failed");
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-teardown-failure",
+    });
+
+    const response = findByType(emitted, "archive_workspace_response");
+    expect(response?.payload.archivedAt).toBeNull();
+    expect(response?.payload.error).toContain("required teardown failed");
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }

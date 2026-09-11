@@ -2064,10 +2064,15 @@ export const ProjectGithubCloneRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const ArchiveWorkspaceModeSchema = z.enum(["archive_and_cleanup", "archive_only"]);
+
+export type ArchiveWorkspaceMode = z.infer<typeof ArchiveWorkspaceModeSchema>;
+
 export const ArchiveWorkspaceRequestSchema = z.object({
   type: z.literal("archive_workspace_request"),
   workspaceId: z.string(),
   requestId: z.string(),
+  mode: ArchiveWorkspaceModeSchema.optional(),
 });
 
 // Create a new workspace record. Unlike open_project, this never deduplicates by
@@ -2727,6 +2732,8 @@ export const ServerInfoStatusPayloadSchema = z
         worktreeRestore: z.boolean().optional(),
         // COMPAT(workspaceRecovery): added in v0.1.105, remove after 2027-01-11 once daemon floor >= v0.1.105.
         workspaceRecovery: z.boolean().optional(),
+        // COMPAT(workspaceArchiveModes): added in v0.1.110; remove gate after 2027-03-11.
+        workspaceArchiveModes: z.boolean().optional(),
         // COMPAT(providerUsageList): added in v0.1.98, drop the gate when daemon floor >= v0.1.98.
         providerUsageList: z.boolean().optional(),
         // COMPAT(providerUsageForceRefresh): added in v0.1.X, drop the gate when daemon floor >= v0.1.X.
@@ -3404,6 +3411,13 @@ export const LegacyOpenInEditorResponseMessageSchema = z.object({
   }),
 });
 
+export const ArchiveWorkspaceCleanupSchema = z.object({
+  status: z.enum(["removed", "retained", "failed"]),
+  reason: z.string().optional(),
+});
+
+export type ArchiveWorkspaceCleanup = z.infer<typeof ArchiveWorkspaceCleanupSchema>;
+
 export const ArchiveWorkspaceResponseMessageSchema = z.object({
   type: z.literal("archive_workspace_response"),
   payload: z.object({
@@ -3411,6 +3425,7 @@ export const ArchiveWorkspaceResponseMessageSchema = z.object({
     workspaceId: z.string(),
     archivedAt: z.string().nullable(),
     error: z.string().nullable(),
+    cleanup: ArchiveWorkspaceCleanupSchema.optional(),
   }),
 });
 

@@ -5505,6 +5505,73 @@ test("sends close_items_request and resolves close_items_response", async () => 
   });
 });
 
+test("archiveWorkspace forwards optional mode and resolves cleanup", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "cid_archive",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { workspaceArchiveModes: true } });
+  await connected;
+  const responsePromise = client.archiveWorkspace("ws-1", "req-archive-mode", {
+    mode: "archive_only",
+  });
+
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "archive_workspace_request",
+    workspaceId: "ws-1",
+    requestId: "req-archive-mode",
+    mode: "archive_only",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "archive_workspace_response",
+      payload: {
+        requestId: "req-archive-mode",
+        workspaceId: "ws-1",
+        archivedAt: "2026-09-11T00:00:00.000Z",
+        error: null,
+        cleanup: { status: "retained", reason: "archive-only request" },
+      },
+    }),
+  );
+
+  await expect(responsePromise).resolves.toEqual({
+    requestId: "req-archive-mode",
+    workspaceId: "ws-1",
+    archivedAt: "2026-09-11T00:00:00.000Z",
+    error: null,
+    cleanup: { status: "retained", reason: "archive-only request" },
+  });
+});
+
+test("archive-only refuses an old host before sending a destructive request", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "cid_old_host",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+
+  await expect(
+    client.archiveWorkspace("ws-1", "req-archive-only", { mode: "archive_only" }),
+  ).rejects.toThrow("Update the host");
+  expect(mock.sent).toEqual([]);
+});
+
 test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", async () => {
   useHeartbeatClock();
   try {

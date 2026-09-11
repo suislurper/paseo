@@ -237,7 +237,6 @@ import {
   ProjectDirectoryRequestError,
 } from "./project-directory-service.js";
 import { runGitCommand } from "../utils/run-git-command.js";
-import { isPaseoOwnedWorktreeCwd } from "../utils/worktree.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 
 // TODO: Remove once all app store clients are on >=0.1.45 and understand arbitrary provider strings.
@@ -5449,31 +5448,16 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
     try {
+      const mode = request.mode ?? "archive_and_cleanup";
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
 
-      if (existing.kind === "worktree") {
-        const hasDurableOwnedPlacement =
-          existing.isPaseoOwnedWorktree &&
-          existing.worktreeRoot !== null &&
-          existing.mainRepoRoot !== null;
-        if (!hasDurableOwnedPlacement) {
-          const ownership = await isPaseoOwnedWorktreeCwd(existing.worktreeRoot ?? existing.cwd, {
-            paseoHome: this.paseoHome,
-            worktreesRoot: this.worktreesRoot,
-          });
-          if (!ownership.allowed) {
-            throw new Error(
-              "Cannot archive this worktree because it is not a Paseo-managed worktree. " +
-                "Remove it with Git, or hide its workspace without deleting files.",
-            );
-          }
-        }
-      }
-
-      await archiveByScope(
+      // archive_only archives records and workspace-owned terminals/agents. It
+      // never runs arbitrary worktree teardown or deletes the directory, and it
+      // must preserve active sibling workspace records.
+      const result = await archiveByScope(
         {
           paseoHome: this.paseoHome,
           paseoWorktreesBaseRoot: this.worktreesRoot,
@@ -5496,11 +5480,29 @@ export class Session {
         {
           scope: { kind: "workspace", workspaceId: existing.workspaceId },
           requestId: request.requestId,
+          mode,
+          existingPlacement: existing.archivedAt
+            ? {
+                workspaceId: existing.workspaceId,
+                cwd: existing.cwd,
+                kind: existing.kind,
+                worktreeRoot: existing.worktreeRoot,
+                isPaseoOwnedWorktree: existing.isPaseoOwnedWorktree,
+                mainRepoRoot: existing.mainRepoRoot,
+              }
+            : undefined,
         },
       );
 
+      if (result.archivedWorkspaceIds.length === 0 && !existing.archivedAt) {
+        throw new Error("Failed to archive workspace: required teardown failed");
+      }
+
       const archivedWorkspace = await this.workspaceRegistry.get(request.workspaceId);
-      const archivedAt = archivedWorkspace?.archivedAt ?? new Date().toISOString();
+      const archivedAt = archivedWorkspace?.archivedAt ?? existing.archivedAt ?? null;
+      if (!archivedAt) {
+        throw new Error("Failed to archive workspace: required teardown failed");
+      }
       this.emit({
         type: "archive_workspace_response",
         payload: {
@@ -5508,6 +5510,9 @@ export class Session {
           workspaceId: request.workspaceId,
           archivedAt,
           error: null,
+          cleanup: result.cleanup ?? {
+            status: result.removedDirectory ? "removed" : "retained",
+          },
         },
       });
     } catch (error) {

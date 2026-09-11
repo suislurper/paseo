@@ -147,3 +147,71 @@ it("allows unrelated same-filesystem bind mounts", async () => {
     await fs.rm(proc, { recursive: true });
   }
 });
+
+it.each([
+  {
+    name: "Docker network namespace outside checkout",
+    root: "net:[4026533321]",
+    type: "nsfs",
+    mountpoint: "/run/docker/netns/example",
+    device: "0:4",
+    allowed: true,
+  },
+  {
+    name: "namespace mount inside checkout",
+    root: "net:[4026533321]",
+    type: "nsfs",
+    mountpoint: "/home/fixture/project/namespace",
+    device: "0:4",
+    allowed: false,
+  },
+  {
+    name: "unknown filesystem with namespace-like root",
+    root: "net:[4026533321]",
+    type: "ext4",
+    mountpoint: "/elsewhere",
+    device: "0:4",
+    allowed: false,
+  },
+  {
+    name: "malformed namespace handle",
+    root: "net:[unknown]",
+    type: "nsfs",
+    mountpoint: "/elsewhere",
+    device: "0:4",
+    allowed: false,
+  },
+  {
+    name: "namespace reported on checkout filesystem",
+    root: "net:[4026533321]",
+    type: "nsfs",
+    mountpoint: "/elsewhere",
+    device: "8:1",
+    allowed: false,
+  },
+  {
+    name: "namespace as containing mount",
+    root: "net:[4026533321]",
+    type: "nsfs",
+    mountpoint: "/home/fixture",
+    device: "0:4",
+    allowed: false,
+  },
+])(
+  "handles $name without weakening filesystem source checks",
+  async ({ root, type, mountpoint, device, allowed }) => {
+    const proc = await fs.mkdtemp("/tmp/paseo-namespace-mounts-");
+    try {
+      await fs.mkdir(proc + "/self");
+      await fs.writeFile(
+        proc + "/self/mountinfo",
+        `1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 ${device} ${root} ${mountpoint} rw - ${type} nsfs rw\n`,
+      );
+      const check = assertNoCheckoutMounts("/home/fixture/project", proc);
+      if (allowed) await expect(check).resolves.toBeUndefined();
+      else await expect(check).rejects.toThrow();
+    } finally {
+      await fs.rm(proc, { recursive: true });
+    }
+  },
+);

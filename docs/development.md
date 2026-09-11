@@ -215,6 +215,12 @@ The supervisor rotates `daemon.log`. Persisted `log.file.rotate` settings in
 `PASEO_LOG_ROTATE_SIZE` and `PASEO_LOG_ROTATE_COUNT` env vars override the
 defaults. The default rotation is `10m` x `3` files everywhere.
 
+Git command metrics (`startGitCommandMetrics` / `stopGitCommandMetrics` in
+`packages/server/src/utils/run-git-command.ts`) record `queueWaitMs` (time spent
+waiting for the shared git limiter), `durationMs` (execution only), and
+`totalDurationMs` (queue plus execution). The CLI identifies each invocation with
+an ephemeral process-scoped client id; it performs no `HOME` IO for identity.
+
 ### Agent Tool Catalog Measurement
 
 Measure the MCP `tools/list` payload that Paseo injects into agents with:

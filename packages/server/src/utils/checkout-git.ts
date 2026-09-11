@@ -1988,8 +1988,50 @@ export type CheckoutIdentity =
       "isGit" | "repoRoot" | "mainRepoRoot" | "currentBranch" | "remoteUrl" | "isPaseoOwnedWorktree"
     >;
 
+let nextCheckoutContextObjectId = 1;
+const checkoutContextObjectIds = new WeakMap<object, number>();
+
+function checkoutContextObjectId(value: object | null | undefined): string {
+  if (value === null || value === undefined) return "-";
+  let id = checkoutContextObjectIds.get(value);
+  if (id === undefined) {
+    id = nextCheckoutContextObjectId;
+    nextCheckoutContextObjectId += 1;
+    checkoutContextObjectIds.set(value, id);
+  }
+  return String(id);
+}
+
+function checkoutIdentityInflightKey(cwd: string, context?: CheckoutContext): string {
+  return JSON.stringify([
+    resolve(cwd),
+    context?.paseoHome ?? "",
+    context?.worktreesRoot ?? "",
+    checkoutContextObjectId(context?.facts ?? undefined),
+    checkoutContextObjectId(context?.logger ?? undefined),
+  ]);
+}
+
+const checkoutIdentityInflight = new Map<string, Promise<CheckoutIdentity>>();
+
 // Workspace placement must not wait for dirty scans, history comparisons or remote queries.
-export async function getCheckoutIdentity(
+export function getCheckoutIdentity(
+  cwd: string,
+  context?: CheckoutContext,
+): Promise<CheckoutIdentity> {
+  const key = checkoutIdentityInflightKey(cwd, context);
+  const inflight = checkoutIdentityInflight.get(key);
+  if (inflight) return inflight;
+  const read = readCheckoutIdentity(cwd, context).finally(() => {
+    if (checkoutIdentityInflight.get(key) === read) {
+      checkoutIdentityInflight.delete(key);
+    }
+  });
+  checkoutIdentityInflight.set(key, read);
+  return read;
+}
+
+async function readCheckoutIdentity(
   cwd: string,
   context?: CheckoutContext,
 ): Promise<CheckoutIdentity> {

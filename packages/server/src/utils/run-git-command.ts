@@ -34,6 +34,8 @@ export interface GitCommandMetric {
   cwd: string;
   startedAtMs: number;
   durationMs: number;
+  queueWaitMs: number;
+  totalDurationMs: number;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   success: boolean;
@@ -123,188 +125,176 @@ export function runGitCommand(
   args: string[],
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
-  return gitLimit(
-    () =>
-      new Promise<GitCommandResult>((resolve, reject) => {
-        const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
-        const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-        const acceptExitCodes = options.acceptExitCodes ?? [0];
-        const command = formatGitCommand(args);
-        const envOverlay = mergeEnvOverlays(options.env, options.envOverlay);
-        const startedAt = Date.now();
-        const metricsState = beginGitCommandMetric();
-        const logger = typeof options.logger?.trace === "function" ? options.logger : undefined;
-        const traceContext = logger
-          ? {
-              command: "git",
-              args,
-              cwd: options.cwd,
-              cwdExists: existsSync(options.cwd),
-              timeout,
-              maxOutputBytes,
-              acceptExitCodes,
-              envOverlayKeys: getEnvOverlayKeys(envOverlay),
-            }
-          : null;
+  const enqueuedAt = Date.now();
+  return gitLimit(() => {
+    const queueWaitMs = Date.now() - enqueuedAt;
+    return new Promise<GitCommandResult>((resolve, reject) => {
+      const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
+      const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+      const acceptExitCodes = options.acceptExitCodes ?? [0];
+      const command = formatGitCommand(args);
+      const envOverlay = mergeEnvOverlays(options.env, options.envOverlay);
+      const startedAt = Date.now();
+      const metricsState = beginGitCommandMetric();
+      const logger = typeof options.logger?.trace === "function" ? options.logger : undefined;
+      const traceContext = logger
+        ? {
+            command: "git",
+            args,
+            cwd: options.cwd,
+            cwdExists: existsSync(options.cwd),
+            timeout,
+            queueWaitMs,
+            maxOutputBytes,
+            acceptExitCodes,
+            envOverlayKeys: getEnvOverlayKeys(envOverlay),
+          }
+        : null;
 
-        if (logger && traceContext) {
-          logger.trace(traceContext, "Spawning git command");
+      if (logger && traceContext) {
+        logger.trace(traceContext, "Spawning git command");
+      }
+
+      // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
+      // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
+      const child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
+        cwd: options.cwd,
+        envOverlay,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let settled = false;
+      let metricFinished = false;
+      let truncated = false;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+
+      const settle = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback();
+      };
+
+      const finishMetricOnce = (
+        metric: Omit<GitCommandMetric, "queueWaitMs" | "totalDurationMs">,
+      ) => {
+        if (metricFinished) return;
+        metricFinished = true;
+        finishGitCommandMetric(metricsState, {
+          ...metric,
+          queueWaitMs,
+          totalDurationMs: Date.now() - enqueuedAt,
+        });
+      };
+
+      const timer = setTimeout(() => {
+        const error = new Error(`Git command timed out after ${timeout}ms: ${command}`);
+        child.kill("SIGKILL");
+        finishMetricOnce({
+          args,
+          cwd: options.cwd,
+          startedAtMs: startedAt,
+          durationMs: Date.now() - startedAt,
+          exitCode: null,
+          signal: "SIGKILL",
+          success: false,
+        });
+        settle(() => reject(error));
+      }, timeout);
+
+      child.stdout!.on("data", (chunk: Buffer | string) => {
+        if (settled || truncated) return;
+
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const remainingBytes = maxOutputBytes - stdoutBytes;
+
+        if (remainingBytes <= 0) {
+          truncated = true;
+          child.kill("SIGKILL");
+          return;
         }
 
-        // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
-        // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
-        const child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
-          cwd: options.cwd,
-          envOverlay,
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        let settled = false;
-        let metricFinished = false;
-        let truncated = false;
-        let stdoutBytes = 0;
-        let stderrBytes = 0;
-        const stdoutChunks: Buffer[] = [];
-        const stderrChunks: Buffer[] = [];
-
-        const settle = (callback: () => void) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          callback();
-        };
-
-        const finishMetricOnce = (metric: GitCommandMetric) => {
-          if (metricFinished) return;
-          metricFinished = true;
-          finishGitCommandMetric(metricsState, metric);
-        };
-
-        const timer = setTimeout(() => {
-          const error = new Error(`Git command timed out after ${timeout}ms: ${command}`);
+        if (buffer.length > remainingBytes) {
+          stdoutChunks.push(buffer.subarray(0, remainingBytes));
+          stdoutBytes += remainingBytes;
+          truncated = true;
           child.kill("SIGKILL");
-          finishMetricOnce({
-            args,
-            cwd: options.cwd,
-            startedAtMs: startedAt,
-            durationMs: Date.now() - startedAt,
-            exitCode: null,
-            signal: "SIGKILL",
-            success: false,
-          });
-          settle(() => reject(error));
-        }, timeout);
+          return;
+        }
 
-        child.stdout!.on("data", (chunk: Buffer | string) => {
-          if (settled || truncated) return;
+        stdoutChunks.push(buffer);
+        stdoutBytes += buffer.length;
+      });
 
-          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-          const remainingBytes = maxOutputBytes - stdoutBytes;
+      child.stderr!.on("data", (chunk: Buffer | string) => {
+        if (settled || stderrBytes >= DEFAULT_STDERR_LIMIT) return;
 
-          if (remainingBytes <= 0) {
-            truncated = true;
-            child.kill("SIGKILL");
-            return;
-          }
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const remainingBytes = DEFAULT_STDERR_LIMIT - stderrBytes;
 
-          if (buffer.length > remainingBytes) {
-            stdoutChunks.push(buffer.subarray(0, remainingBytes));
-            stdoutBytes += remainingBytes;
-            truncated = true;
-            child.kill("SIGKILL");
-            return;
-          }
+        if (buffer.length > remainingBytes) {
+          stderrChunks.push(buffer.subarray(0, remainingBytes));
+          stderrBytes += remainingBytes;
+          return;
+        }
 
-          stdoutChunks.push(buffer);
-          stdoutBytes += buffer.length;
+        stderrChunks.push(buffer);
+        stderrBytes += buffer.length;
+      });
+
+      child.on("error", (error) => {
+        finishMetricOnce({
+          args,
+          cwd: options.cwd,
+          startedAtMs: startedAt,
+          durationMs: Date.now() - startedAt,
+          exitCode: null,
+          signal: null,
+          success: false,
         });
-
-        child.stderr!.on("data", (chunk: Buffer | string) => {
-          if (settled || stderrBytes >= DEFAULT_STDERR_LIMIT) return;
-
-          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-          const remainingBytes = DEFAULT_STDERR_LIMIT - stderrBytes;
-
-          if (buffer.length > remainingBytes) {
-            stderrChunks.push(buffer.subarray(0, remainingBytes));
-            stderrBytes += remainingBytes;
-            return;
-          }
-
-          stderrChunks.push(buffer);
-          stderrBytes += buffer.length;
-        });
-
-        child.on("error", (error) => {
-          finishMetricOnce({
-            args,
-            cwd: options.cwd,
-            startedAtMs: startedAt,
-            durationMs: Date.now() - startedAt,
-            exitCode: null,
-            signal: null,
-            success: false,
-          });
-          if (logger && traceContext) {
-            logger.trace(
-              {
-                ...traceContext,
-                err: error,
-                durationMs: Date.now() - startedAt,
-              },
-              "Git command process error",
-            );
-          }
-          settle(() => reject(error));
-        });
-
-        child.on("close", (exitCode, signal) => {
-          const result: GitCommandResult = {
-            stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-            stderr: Buffer.concat(stderrChunks).toString("utf8"),
-            truncated,
-            exitCode,
-            signal,
-          };
-          if (logger && traceContext) {
-            logger.trace(
-              {
-                ...traceContext,
-                durationMs: Date.now() - startedAt,
-                exitCode,
-                signal,
-                truncated,
-                stdoutBytes,
-                stderrBytes,
-              },
-              "Git command closed",
-            );
-          }
-
-          if (!truncated && !acceptExitCodes.includes(exitCode ?? -1)) {
-            finishMetricOnce({
-              args,
-              cwd: options.cwd,
-              startedAtMs: startedAt,
+        if (logger && traceContext) {
+          logger.trace(
+            {
+              ...traceContext,
+              err: error,
               durationMs: Date.now() - startedAt,
+              totalDurationMs: Date.now() - enqueuedAt,
+            },
+            "Git command process error",
+          );
+        }
+        settle(() => reject(error));
+      });
+
+      child.on("close", (exitCode, signal) => {
+        const result: GitCommandResult = {
+          stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf8"),
+          truncated,
+          exitCode,
+          signal,
+        };
+        if (logger && traceContext) {
+          logger.trace(
+            {
+              ...traceContext,
+              durationMs: Date.now() - startedAt,
+              totalDurationMs: Date.now() - enqueuedAt,
               exitCode,
               signal,
-              success: false,
-            });
-            const stderrPreview = result.stderr.trim() || "(no stderr)";
-            const truncationNote = result.truncated ? " (stdout truncated)" : "";
+              truncated,
+              stdoutBytes,
+              stderrBytes,
+            },
+            "Git command closed",
+          );
+        }
 
-            settle(() =>
-              reject(
-                new Error(
-                  `Git command failed: ${command}${truncationNote} (exit code: ${String(exitCode)}, signal: ${signal ?? "none"})\n${stderrPreview}`,
-                ),
-              ),
-            );
-            return;
-          }
-
+        if (!truncated && !acceptExitCodes.includes(exitCode ?? -1)) {
           finishMetricOnce({
             args,
             cwd: options.cwd,
@@ -312,12 +302,34 @@ export function runGitCommand(
             durationMs: Date.now() - startedAt,
             exitCode,
             signal,
-            success: true,
+            success: false,
           });
-          settle(() => resolve(result));
+          const stderrPreview = result.stderr.trim() || "(no stderr)";
+          const truncationNote = result.truncated ? " (stdout truncated)" : "";
+
+          settle(() =>
+            reject(
+              new Error(
+                `Git command failed: ${command}${truncationNote} (exit code: ${String(exitCode)}, signal: ${signal ?? "none"})\n${stderrPreview}`,
+              ),
+            ),
+          );
+          return;
+        }
+
+        finishMetricOnce({
+          args,
+          cwd: options.cwd,
+          startedAtMs: startedAt,
+          durationMs: Date.now() - startedAt,
+          exitCode,
+          signal,
+          success: true,
         });
-      }),
-  );
+        settle(() => resolve(result));
+      });
+    });
+  });
 }
 
 function formatGitCommand(args: string[]): string {

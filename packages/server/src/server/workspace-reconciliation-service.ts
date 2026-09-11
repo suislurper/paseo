@@ -1,6 +1,7 @@
 import { statSync, watch as watchPath } from "node:fs";
 import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
 import type pino from "pino";
+import pLimit from "p-limit";
 import type {
   ProjectRegistry,
   WorkspaceRegistry,
@@ -18,6 +19,9 @@ import { workspaceIdsForProjects } from "./workspace-directory.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
+const BACKGROUND_PROJECT_GIT_CONCURRENCY = 2;
+
+const runOnceInflight = new WeakMap<object, Promise<ReconciliationResult>>();
 
 export type ProjectUpdate =
   | { kind: "upsert"; project: PersistedProjectRecord }
@@ -208,6 +212,18 @@ export class WorkspaceReconciliationService {
   }
 
   async runOnce(): Promise<ReconciliationResult> {
+    const inflight = runOnceInflight.get(this.workspaceRegistry);
+    if (inflight) return inflight;
+    const scan = this.runOnceUnshared().finally(() => {
+      if (runOnceInflight.get(this.workspaceRegistry) === scan) {
+        runOnceInflight.delete(this.workspaceRegistry);
+      }
+    });
+    runOnceInflight.set(this.workspaceRegistry, scan);
+    return scan;
+  }
+
+  private async runOnceUnshared(): Promise<ReconciliationResult> {
     const start = Date.now();
     const changes: ReconciliationChange[] = [];
 
@@ -282,10 +298,11 @@ export class WorkspaceReconciliationService {
     changes: ReconciliationChange[],
   ): Promise<void> {
     const checkoutReads: CachedCheckoutRead[] = [];
+    const gitReadLimit = pLimit(BACKGROUND_PROJECT_GIT_CONCURRENCY);
     const readCheckout = (cwd: string): Promise<ProjectCheckoutLitePayload> => {
       const existing = checkoutReads.find((read) => areEquivalentPaths(read.cwd, cwd));
       if (existing) return existing.checkout;
-      const checkout = this.readCheckout(cwd);
+      const checkout = gitReadLimit(() => this.readCheckout(cwd));
       checkoutReads.push({ cwd, checkout });
       return checkout;
     };

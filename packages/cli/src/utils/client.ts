@@ -14,7 +14,7 @@ import {
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
 import path from "node:path";
 import { WebSocket } from "ws";
-import { getOrCreateCliClientId } from "./client-id.js";
+import { getCliClientId } from "./client-id.js";
 import { resolveCliVersion } from "../version.js";
 
 export interface ConnectOptions {
@@ -350,7 +350,7 @@ function parseHostOfferOrNull(host: string | undefined): ConnectionOffer | null 
 
 export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonClient> {
   const timeout = options?.timeout ?? DEFAULT_TIMEOUT;
-  const clientId = await getOrCreateCliClientId();
+  const clientId = getCliClientId();
   const nodeWebSocketFactory = createNodeWebSocketFactory();
 
   const explicitHost = options?.host ?? process.env.PASEO_HOST;

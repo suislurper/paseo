@@ -221,6 +221,24 @@ waiting for the shared git limiter), `durationMs` (execution only), and
 `totalDurationMs` (queue plus execution). The CLI identifies each invocation with
 an ephemeral process-scoped client id; it performs no `HOME` IO for identity.
 
+### Pending workspace creation
+
+A client timeout does not cancel daemon work. Both GUI creation interfaces retain a
+frozen request ID, source, slug and initial prompt until creation is confirmed or
+a definitive failure is returned. Use **Check again** to reconcile that same
+attempt; a separate intentional workspace gets a new ID, even in the same directory.
+
+The daemon coalesces same-ID requests across sessions using the shared registry
+and persists the ID plus an input fingerprint on the workspace record. A reconnect
+or registry reload returns that record without repeating creation. Changed input,
+archived attempts and leftover target directories have explicit errors. Target
+preflight uses the same slug normalization as worktree creation.
+
+Safe retries require `server_info.features.workspaceCreationRetry` at the original
+dispatch. An uncertain first creation on an older host must be inspected before
+starting another attempt; upgrading the host does not make that old request
+replayable. Repeated clicks are held while a submission is running.
+
 ### Agent Tool Catalog Measurement
 
 Measure the MCP `tools/list` payload that Paseo injects into agents with:

@@ -344,6 +344,6 @@ function validateWorktreeSlug(slug: string): string {
   return slug;
 }
 
-function normalizeWorktreeSlug(value: string): string {
+export function normalizeWorktreeSlug(value: string): string {
   return validateWorktreeSlug(slugify(value));
 }

@@ -8,6 +8,8 @@ export interface FrozenWorkspaceCreationInput {
 
 export interface WorkspaceCreationAttempt extends FrozenWorkspaceCreationInput {
   requestId: string;
+  /** Capability observed before the original dispatch, not after a host upgrade. */
+  retrySupported?: boolean;
 }
 
 function randomAttemptId(): string {
@@ -55,17 +57,19 @@ function isConnectionError(error: unknown): boolean {
   return /transport not connected|connection|network|socket|closed|econn/i.test(message);
 }
 
+export interface WorkspaceCreationReply<TWorkspace> {
+  workspace: TWorkspace | null;
+  error: string | null;
+  errorCode?: string | null;
+}
+
 export interface WorkspaceCreationClient<TWorkspace extends { id?: string }> {
   supportsWorkspaceCreationRetry(): boolean;
   requireWorkspaceCreationRetrySupport(): void;
   createWorkspace(
     input: FrozenWorkspaceCreationInput,
     requestId?: string,
-  ): Promise<{
-    workspace: TWorkspace | null;
-    error: string | null;
-    errorCode?: string | null;
-  }>;
+  ): Promise<WorkspaceCreationReply<TWorkspace>>;
 }
 
 export interface WorkspaceCreationAttemptResult<TWorkspace> {
@@ -82,18 +86,25 @@ export interface WorkspaceCreationAttemptResult<TWorkspace> {
 export async function runWorkspaceCreationAttempt<TWorkspace extends { id?: string }>(input: {
   client: WorkspaceCreationClient<TWorkspace>;
   attempt: WorkspaceCreationAttempt;
+  /** COMPAT(workspaceCreationRetry): first creation on old hosts only; remove after 2027-03-11. */
+  legacyCreate?: (requestId: string) => Promise<WorkspaceCreationReply<TWorkspace>>;
 }): Promise<WorkspaceCreationAttemptResult<TWorkspace>> {
-  const payload = await input.client
-    .createWorkspace(
-      {
-        source: input.attempt.source,
-        ...(input.attempt.title !== undefined ? { title: input.attempt.title } : {}),
-        ...(input.attempt.firstAgentContext !== undefined
-          ? { firstAgentContext: input.attempt.firstAgentContext }
-          : {}),
-      },
-      input.attempt.requestId,
-    )
+  input.attempt.retrySupported ??= input.client.supportsWorkspaceCreationRetry();
+  const dispatch = () =>
+    input.legacyCreate
+      ? input.legacyCreate(input.attempt.requestId)
+      : input.client.createWorkspace(
+          {
+            source: input.attempt.source,
+            ...(input.attempt.title !== undefined ? { title: input.attempt.title } : {}),
+            ...(input.attempt.firstAgentContext !== undefined
+              ? { firstAgentContext: input.attempt.firstAgentContext }
+              : {}),
+          },
+          input.attempt.requestId,
+        );
+  const payload = await Promise.resolve()
+    .then(dispatch)
     .catch((error: unknown) => {
       if (isTimeoutError(error)) {
         throw new WorkspaceCreationAttemptError(
@@ -109,7 +120,11 @@ export async function runWorkspaceCreationAttempt<TWorkspace extends { id?: stri
           true,
         );
       }
-      throw error;
+      throw new WorkspaceCreationAttemptError(
+        "connection",
+        "Workspace creation could not be confirmed. Check the same attempt before creating another workspace.",
+        true,
+      );
     });
   if (payload.error || !payload.workspace) {
     const code = payload.errorCode ?? null;
@@ -142,7 +157,11 @@ export async function runWorkspaceCreationAttempt<TWorkspace extends { id?: stri
   }
   const workspaceId = typeof payload.workspace.id === "string" ? payload.workspace.id : null;
   if (!workspaceId) {
-    throw new Error("Workspace creation completed without a workspace id");
+    throw new WorkspaceCreationAttemptError(
+      "failed",
+      "Workspace creation completed without a workspace id; inspect the existing attempt.",
+      true,
+    );
   }
   return { workspaceId, workspace: payload.workspace };
 }
@@ -152,6 +171,13 @@ export async function retryWorkspaceCreationAttempt<TWorkspace extends { id?: st
   client: WorkspaceCreationClient<TWorkspace>;
   attempt: WorkspaceCreationAttempt;
 }): Promise<WorkspaceCreationAttemptResult<TWorkspace>> {
+  if (input.attempt.retrySupported === false) {
+    throw new WorkspaceCreationAttemptError(
+      "host-update-required",
+      "The original host did not support safe retries. Inspect its workspaces before starting another creation attempt.",
+      true,
+    );
+  }
   if (!input.client.supportsWorkspaceCreationRetry()) {
     throw new WorkspaceCreationAttemptError(
       "host-update-required",

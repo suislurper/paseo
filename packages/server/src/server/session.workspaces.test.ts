@@ -32,7 +32,7 @@ import type {
   AgentSessionConfig,
   AgentStreamEvent,
 } from "./agent/agent-sdk-types.js";
-import { createWorktree } from "../utils/worktree.js";
+import { computeWorktreePath, createWorktree } from "../utils/worktree.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import {
   readPaseoWorktreeMetadata,
@@ -8629,4 +8629,258 @@ test("workspace.create.request reports an archived explicit project", async () =
     workspace: null,
     errorCode: "archived_project",
   });
+});
+
+function createCreationRetrySession(input: {
+  onMessage?: (message: SessionOutboundMessage) => void;
+  workspaces: Map<string, PersistedWorkspaceRecord>;
+  projects?: Map<string, PersistedProjectRecord>;
+  resolveRepoRoot?: (cwd: string) => Promise<string>;
+}) {
+  const session = createSessionForWorkspaceTests({
+    onMessage: input.onMessage,
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(input.workspaces.values()),
+      get: async (workspaceId: string) => input.workspaces.get(workspaceId) ?? null,
+      upsert: async (workspace) => {
+        input.workspaces.set(workspace.workspaceId, workspace);
+      },
+      archive: async (workspaceId: string, archivedAt: string) => {
+        const current = input.workspaces.get(workspaceId);
+        if (current) input.workspaces.set(workspaceId, { ...current, archivedAt });
+      },
+      remove: async () => {},
+    },
+  });
+  session.listAgentPayloads = async () => [];
+  if (input.projects) {
+    const projects = input.projects;
+    session.projectRegistry.get = async (projectId: string) => projects.get(projectId) ?? null;
+    session.projectRegistry.list = async () => Array.from(projects.values());
+  }
+  if (input.resolveRepoRoot) {
+    const resolveRepoRoot = input.resolveRepoRoot;
+    session.workspaceGitService.resolveRepoRoot = resolveRepoRoot;
+  }
+  return session;
+}
+
+test("workspace.create retries the same ID without creating another workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-same",
+    source: { kind: "directory", path: REPO_CWD },
+    firstAgentContext: { prompt: "original prompt" },
+  });
+  const first = findByType(emitted, "workspace.create.response");
+  expect(first?.payload.error).toBeNull();
+  const workspaceId = first?.payload.workspace?.id;
+  expect(workspaceId).toEqual(expect.any(String));
+  expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
+  const workspaceUpdatesBeforeRetry = filterByType(emitted, "workspace_update").length;
+
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-same",
+    source: { kind: "directory", path: REPO_CWD },
+    firstAgentContext: { prompt: "original prompt" },
+  });
+  const retry = findByType(emitted, "workspace.create.response");
+  expect(retry?.payload).toMatchObject({
+    requestId: "req-retry-same",
+    error: null,
+    creationRequestId: "req-retry-same",
+    creationReconciled: true,
+  });
+  expect(retry?.payload.workspace?.id).toBe(workspaceId);
+  expect(workspaces.size).toBe(1);
+  expect(filterByType(emitted, "workspace_update")).toHaveLength(workspaceUpdatesBeforeRetry);
+});
+
+test("workspace.create rejects the same ID with changed input and archived IDs stay archived", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-mismatch",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  expect(findByType(emitted, "workspace.create.response")?.payload.error).toBeNull();
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-mismatch",
+    source: { kind: "directory", path: REPO_CWD },
+    firstAgentContext: { prompt: "changed" },
+  });
+  expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+    workspace: null,
+    errorCode: "creation_request_mismatch",
+  });
+  expect(workspaces.size).toBe(1);
+
+  const persistedId = Array.from(workspaces.keys())[0] as string;
+  const persisted = workspaces.get(persistedId);
+  if (persisted)
+    workspaces.set(persistedId, { ...persisted, archivedAt: "2026-09-11T00:00:00.000Z" });
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-mismatch",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+    workspace: null,
+    errorCode: "creation_attempt_archived",
+    creationArchived: true,
+  });
+  expect(workspaces.size).toBe(1);
+});
+
+test("workspace.create keeps different IDs in the same directory distinct", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-same-dir-one",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-same-dir-two",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  const responses = emitted.filter((message) => message.type === "workspace.create.response");
+  expect(responses).toHaveLength(2);
+  expect(responses[0]?.payload.workspace?.id).not.toBe(responses[1]?.payload.workspace?.id);
+  expect(workspaces.size).toBe(2);
+});
+
+test("workspace.create coalesces simultaneous same-ID requests into one workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await Promise.all([
+    session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-concurrent-same",
+      source: { kind: "directory", path: REPO_CWD },
+    }),
+    session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-concurrent-same",
+      source: { kind: "directory", path: REPO_CWD },
+    }),
+  ]);
+  const responses = emitted.filter((message) => message.type === "workspace.create.response");
+  expect(responses).toHaveLength(2);
+  expect(responses[0]?.payload.workspace?.id).toBe(responses[1]?.payload.workspace?.id);
+  expect(workspaces.size).toBe(1);
+});
+
+test("workspace.create rejects an orphan normalized target instead of a suffixed duplicate", async () => {
+  const tempRoot = mkdtempSync(path.join(tmpdir(), "workspace-create-orphan-"));
+  const repoRoot = path.join(tempRoot, "repo");
+  const paseoHome = path.join(tempRoot, "home");
+  mkdirSync(repoRoot, { recursive: true });
+  try {
+    const emitted: SessionOutboundMessage[] = [];
+    const workspaces = new Map<string, PersistedWorkspaceRecord>();
+    const session = createCreationRetrySession({
+      onMessage: (message) => emitted.push(message),
+      workspaces,
+      resolveRepoRoot: async () => repoRoot,
+    });
+    session.listAgentPayloads = async () => [];
+    session.paseoHome = paseoHome;
+    const orphanPath = await computeWorktreePath(repoRoot, "my-feature", paseoHome);
+    mkdirSync(orphanPath, { recursive: true });
+
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-orphan-normalized",
+      source: { kind: "worktree", cwd: repoRoot, worktreeSlug: "My Feature" },
+    });
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      workspace: null,
+      errorCode: "creation_target_ambiguous",
+    });
+    expect(workspaces.size).toBe(0);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace.create shares a flight across sessions and recovers its identity after registry reload", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "workspace-create-reload-"));
+  const registryPath = path.join(root, "workspaces.json");
+  const logger = asSessionLogger(createTestLogger());
+  try {
+    const registry = new FileBackedWorkspaceRegistry(registryPath, logger);
+    await registry.initialize();
+    const emitted: SessionOutboundMessage[] = [];
+    const options = {
+      workspaceRegistry: registry,
+      onMessage: (message: SessionOutboundMessage) => emitted.push(message),
+    };
+    const first = createSessionForWorkspaceTests(options);
+    const second = createSessionForWorkspaceTests(options);
+    const request = {
+      type: "workspace.create.request" as const,
+      requestId: "persisted-flight",
+      source: { kind: "directory" as const, path: REPO_CWD },
+    };
+    await Promise.all([first.handleMessage(request), second.handleMessage(request)]);
+    const responses = filterByType(emitted, "workspace.create.response");
+    expect(responses).toHaveLength(2);
+    expect(responses[0]?.payload.error).toBeNull();
+    expect(responses[0]?.payload.workspace?.id).toBe(responses[1]?.payload.workspace?.id);
+    expect(await registry.list()).toHaveLength(1);
+    const reloaded = new FileBackedWorkspaceRegistry(registryPath, logger);
+    await reloaded.initialize();
+    const writes = vi.spyOn(reloaded, "upsert");
+    const third = createSessionForWorkspaceTests({ ...options, workspaceRegistry: reloaded });
+    emitted.length = 0;
+    await third.handleMessage(request);
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      error: null,
+      creationReconciled: true,
+      workspace: { id: responses[0]?.payload.workspace?.id },
+    });
+    expect(writes).not.toHaveBeenCalled();
+    expect((await reloaded.list())[0]).toMatchObject({
+      creationRequestId: request.requestId,
+      creationFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

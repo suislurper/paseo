@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { WorkspaceCreationRetryButton } from "@/components/workspace-creation-retry-button";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Image, Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
@@ -31,7 +32,13 @@ import { requireWorkspaceDirectory } from "@/utils/workspace-directory";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import type { MessagePayload } from "@/composer/types";
-
+import {
+  createWorkspaceCreationAttempt,
+  retryWorkspaceCreationAttempt,
+  runWorkspaceCreationAttempt,
+  WorkspaceCreationAttemptError,
+  type WorkspaceCreationAttempt,
+} from "@/screens/workspace-creation-attempt";
 function toProjectIconDataUri(icon: { mimeType: string; data: string } | null): string | null {
   if (!icon) {
     return null;
@@ -85,32 +92,29 @@ function buildChatDraftComposerArgs({
 }
 
 async function callWorkspaceCreation({
-  creationMethod,
   connectedClient,
-  input,
+  attempt,
+  retry,
 }: {
-  creationMethod: "create_worktree" | "open_project";
   connectedClient: DaemonClient;
-  input: { cwd: string };
+  attempt: WorkspaceCreationAttempt;
+  retry: boolean;
 }) {
-  if (creationMethod === "create_worktree") {
-    return connectedClient.createPaseoWorktree({
-      cwd: input.cwd,
-      worktreeSlug: createNameId(),
-    });
-  }
-  return connectedClient.createWorkspace({
-    source: { kind: "directory", path: input.cwd },
-  });
-}
-
-function failureMessageForCreationMethod(
-  method: "create_worktree" | "open_project",
-  t: ReturnType<typeof useTranslation>["t"],
-) {
-  return method === "create_worktree"
-    ? t("workspaceSetup.errors.failedCreateWorktree")
-    : t("workspaceSetup.errors.failedOpenProject");
+  if (retry) return retryWorkspaceCreationAttempt({ client: connectedClient, attempt });
+  const source = attempt.source;
+  // COMPAT(workspaceCreationRetry): preserve first creation on old hosts, never replay it; remove after 2027-03-11.
+  const legacyCreate =
+    source.kind === "worktree" && !connectedClient.supportsWorkspaceCreationRetry()
+      ? (requestId: string) => {
+          const { kind: _kind, ...worktreeInput } = source;
+          if (!worktreeInput.cwd) throw new Error("A source directory is required for this host.");
+          return connectedClient.createPaseoWorktree(
+            { ...worktreeInput, cwd: worktreeInput.cwd },
+            requestId,
+          );
+        }
+      : undefined;
+  return runWorkspaceCreationAttempt({ client: connectedClient, attempt, legacyCreate });
 }
 
 function buildCreateAgentOptions({
@@ -171,6 +175,13 @@ export function WorkspaceSetupDialog() {
   const [createdWorkspace, setCreatedWorkspace] = useState<ReturnType<
     typeof normalizeWorkspaceDescriptor
   > | null>(null);
+  const [pendingCreationAttempt, setPendingCreationAttempt] =
+    useState<WorkspaceCreationAttempt | null>(null);
+  const pendingCreationServerRef = useRef<string | null>(null);
+  const creationInFlightRef = useRef(false);
+  const creationGenerationRef = useRef(0);
+  const submitInFlightRef = useRef(false);
+  const pendingSubmissionRef = useRef<MessagePayload | null>(null);
   const [pendingAction, setPendingAction] = useState<"chat" | null>(null);
 
   const serverId = pendingWorkspaceSetup?.serverId ?? "";
@@ -207,6 +218,12 @@ export function WorkspaceSetupDialog() {
     setErrorMessage(null);
     setCreatedWorkspace(null);
     setPendingAction(null);
+    setPendingCreationAttempt(null);
+    pendingCreationServerRef.current = null;
+    creationGenerationRef.current += 1;
+    creationInFlightRef.current = false;
+    submitInFlightRef.current = false;
+    pendingSubmissionRef.current = null;
   }, [pendingWorkspaceSetup?.creationMethod, serverId, sourceDirectory]);
 
   const handleClose = useCallback(() => {
@@ -246,7 +263,6 @@ export function WorkspaceSetupDialog() {
     }
     return client;
   }, [client, isConnected, t]);
-
   const ensureWorkspace = useCallback(
     async (input: { cwd: string; attachments: MessagePayload["attachments"] }) => {
       if (!pendingWorkspaceSetup) {
@@ -256,31 +272,77 @@ export function WorkspaceSetupDialog() {
       if (createdWorkspace) {
         return createdWorkspace;
       }
-
-      const connectedClient = withConnectedClient();
-      const payload = await callWorkspaceCreation({
-        creationMethod: pendingWorkspaceSetup.creationMethod,
-        connectedClient,
-        input,
-      });
-
-      if (payload.error || !payload.workspace) {
-        throw new Error(
-          payload.error ?? failureMessageForCreationMethod(pendingWorkspaceSetup.creationMethod, t),
+      if (creationInFlightRef.current) {
+        throw new WorkspaceCreationAttemptError(
+          "connection",
+          "Workspace creation is already running. Check again once it settles.",
+          true,
         );
       }
-
-      const normalizedWorkspace = normalizeWorkspaceDescriptor(payload.workspace);
-      mergeWorkspaces(pendingWorkspaceSetup.serverId, [normalizedWorkspace]);
-      if (pendingWorkspaceSetup.creationMethod === "open_project") {
-        setHasHydratedWorkspaces(pendingWorkspaceSetup.serverId, true);
+      if (
+        pendingCreationAttempt &&
+        pendingCreationServerRef.current !== pendingWorkspaceSetup.serverId
+      ) {
+        throw new WorkspaceCreationAttemptError(
+          "connection",
+          "Return to the original host to check the pending workspace creation.",
+          true,
+        );
       }
-      setCreatedWorkspace(normalizedWorkspace);
-      return normalizedWorkspace;
+      const connectedClient = withConnectedClient();
+      const isRetry = pendingCreationAttempt !== null;
+      const attempt =
+        pendingCreationAttempt ??
+        createWorkspaceCreationAttempt(
+          pendingWorkspaceSetup.creationMethod === "open_project"
+            ? { source: { kind: "directory", path: input.cwd } }
+            : {
+                source: {
+                  kind: "worktree",
+                  cwd: input.cwd,
+                  worktreeSlug: createNameId(),
+                },
+              },
+        );
+      if (!pendingCreationAttempt) {
+        pendingCreationServerRef.current = pendingWorkspaceSetup.serverId;
+      }
+      setPendingCreationAttempt(attempt);
+      const generation = creationGenerationRef.current;
+      creationInFlightRef.current = true;
+      try {
+        const payload = await callWorkspaceCreation({
+          connectedClient,
+          attempt,
+          retry: isRetry,
+        });
+
+        const normalizedWorkspace = normalizeWorkspaceDescriptor(payload.workspace);
+        mergeWorkspaces(pendingWorkspaceSetup.serverId, [normalizedWorkspace]);
+        if (pendingWorkspaceSetup.creationMethod === "open_project") {
+          setHasHydratedWorkspaces(pendingWorkspaceSetup.serverId, true);
+        }
+        if (generation === creationGenerationRef.current) {
+          setCreatedWorkspace(normalizedWorkspace);
+          setPendingCreationAttempt(null);
+        }
+        return normalizedWorkspace;
+      } catch (error) {
+        if (
+          generation === creationGenerationRef.current &&
+          !(error instanceof WorkspaceCreationAttemptError && error.retryable)
+        ) {
+          setPendingCreationAttempt(null);
+        }
+        throw error;
+      } finally {
+        if (generation === creationGenerationRef.current) creationInFlightRef.current = false;
+      }
     },
     [
       createdWorkspace,
       mergeWorkspaces,
+      pendingCreationAttempt,
       pendingWorkspaceSetup,
       setHasHydratedWorkspaces,
       t,
@@ -302,11 +364,19 @@ export function WorkspaceSetupDialog() {
   ]);
 
   const handleCreateChatAgent = useCallback(
-    async ({ text, attachments, cwd }: MessagePayload) => {
+    async (payload: MessagePayload) => {
+      if (submitInFlightRef.current) return;
+      submitInFlightRef.current = true;
+      const generation = creationGenerationRef.current;
+      if (pendingCreationAttempt && pendingSubmissionRef.current)
+        payload = pendingSubmissionRef.current;
+      else pendingSubmissionRef.current = payload;
+      const { text, attachments, cwd } = payload;
       try {
         setPendingAction("chat");
         setErrorMessage(null);
         const ensuredWorkspace = await ensureWorkspace({ cwd, attachments });
+        if (!getIsStillActive()) return;
         const connectedClient = withConnectedClient();
         if (!composerState) {
           throw new Error(t("workspaceSetup.errors.composerStateRequired"));
@@ -354,10 +424,12 @@ export function WorkspaceSetupDialog() {
         });
         navigateAfterCreation(ensuredWorkspace.id, { kind: "agent", agentId: agent.id });
       } catch (error) {
+        if (!getIsStillActive()) return;
         const message = toErrorMessage(error);
         setErrorMessage(message);
         toast.error(message);
       } finally {
+        if (generation === creationGenerationRef.current) submitInFlightRef.current = false;
         if (getIsStillActive()) {
           setPendingAction(null);
         }
@@ -365,6 +437,7 @@ export function WorkspaceSetupDialog() {
     },
     [
       composerState,
+      pendingCreationAttempt,
       getIsStillActive,
       navigateAfterCreation,
       serverId,
@@ -376,6 +449,10 @@ export function WorkspaceSetupDialog() {
       supportsForgeSearch,
     ],
   );
+
+  const handleCheckAgain = useCallback(() => {
+    if (pendingSubmissionRef.current) void handleCreateChatAgent(pendingSubmissionRef.current);
+  }, [handleCreateChatAgent]);
 
   const workspaceTitle = resolveWorkspaceTitle({ workspace, displayName, sourceDirectory });
 
@@ -462,6 +539,15 @@ export function WorkspaceSetupDialog() {
       </FileDropZone>
 
       {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+      <WorkspaceCreationRetryButton
+        attempt={pendingCreationAttempt}
+        errorMessage={errorMessage}
+        created={createdWorkspace !== null}
+        disabled={pendingAction !== null}
+        onPress={handleCheckAgain}
+        label={t("newWorkspace.checkAgain", { defaultValue: "Check again" })}
+        testID="workspace-setup-check-again"
+      />
     </AdaptiveModalSheet>
   );
 }

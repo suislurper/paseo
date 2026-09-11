@@ -26,6 +26,7 @@ import {
   type WorkspaceCreationOutcome,
 } from "./workspace-creation-identity.js";
 import { WorkspaceCreationReconciliationError } from "./workspace-creation-errors.js";
+import { normalizeWorktreeSlug } from "./worktree-core.js";
 import { computeWorktreePath } from "../utils/worktree.js";
 import type {
   TerminalManager,
@@ -5057,7 +5058,8 @@ export class Session {
       cwd: source.cwd,
       projectId: source.projectId,
     });
-    const worktreeSlug = source.worktreeSlug ?? `workspace-${fingerprint.slice(0, 16)}`;
+    const rawSlug = source.worktreeSlug ?? `workspace-${fingerprint.slice(0, 16)}`;
+    const worktreeSlug = normalizeWorktreeSlug(rawSlug);
     await this.assertFrozenWorktreeTargetAvailable(worktreeSlug, sourceCwd);
     const result = await this.createPaseoWorktreeWorkflow(
       {

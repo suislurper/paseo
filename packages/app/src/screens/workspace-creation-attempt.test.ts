@@ -5,6 +5,12 @@ import {
   runWorkspaceCreationAttempt,
 } from "./workspace-creation-attempt";
 
+function rejectAfterClientDeadline(): Promise<never> {
+  return new Promise((_resolve, reject) =>
+    setTimeout(() => reject(new Error("request timed out")), 60_000),
+  );
+}
+
 describe("frozen workspace creation attempt", () => {
   it("keeps the target and initial prompt when the form input later changes", () => {
     const input = {
@@ -91,5 +97,63 @@ describe("frozen workspace creation attempt", () => {
       kind: "mismatch",
       retryable: false,
     });
+  });
+  it("reconciles a creation that finishes after the 60-second client deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const attempt = createWorkspaceCreationAttempt({
+        source: { kind: "directory", path: "/repo" },
+      });
+      const operation = new Promise<{ workspace: { id: string }; error: null }>((resolve) =>
+        setTimeout(() => resolve({ workspace: { id: "late-workspace" }, error: null }), 90_000),
+      );
+      const createWorkspace = vi.fn((_input, requestId: string) => {
+        expect(requestId).toBe(attempt.requestId);
+        return Promise.race([operation, rejectAfterClientDeadline()]);
+      });
+      const client = {
+        createWorkspace,
+        supportsWorkspaceCreationRetry: () => true,
+        requireWorkspaceCreationRetrySupport: () => {},
+      };
+      const first = expect(runWorkspaceCreationAttempt({ client, attempt })).rejects.toMatchObject({
+        kind: "timeout",
+        retryable: true,
+      });
+      await vi.advanceTimersByTimeAsync(60_001);
+      await first;
+      const retry = retryWorkspaceCreationAttempt({ client, attempt });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(retry).resolves.toMatchObject({ workspaceId: "late-workspace" });
+      expect(createWorkspace.mock.calls[1]).toEqual(createWorkspace.mock.calls[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never replays an uncertain legacy dispatch, even after the host is upgraded", async () => {
+    const attempt = createWorkspaceCreationAttempt({
+      source: { kind: "worktree", cwd: "/repo", worktreeSlug: "frozen" },
+    });
+    let upgraded = false;
+    const client = {
+      createWorkspace: vi.fn(),
+      supportsWorkspaceCreationRetry: () => upgraded,
+      requireWorkspaceCreationRetrySupport: vi.fn(),
+    };
+    const legacyCreate = vi.fn(async () => {
+      throw new Error("request timed out");
+    });
+    await expect(
+      runWorkspaceCreationAttempt({ client, attempt, legacyCreate }),
+    ).rejects.toMatchObject({ retryable: true });
+    expect(legacyCreate).toHaveBeenCalledWith(attempt.requestId);
+    upgraded = true;
+    await expect(retryWorkspaceCreationAttempt({ client, attempt })).rejects.toMatchObject({
+      kind: "host-update-required",
+      retryable: true,
+    });
+    expect(legacyCreate).toHaveBeenCalledOnce();
+    expect(client.createWorkspace).not.toHaveBeenCalled();
   });
 });

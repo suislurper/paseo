@@ -74,7 +74,7 @@ function decodeMountPath(value: string): string {
 interface CheckoutMount {
   id: string;
   device: string;
-  root: string;
+  root: string | null;
   mountpoint: string;
 }
 
@@ -82,11 +82,20 @@ function parseCheckoutMount(line: string): CheckoutMount {
   const fields = line.split(" ");
   const root = decodeMountPath(fields[3] ?? "");
   const mountpoint = decodeMountPath(fields[4] ?? "");
+  const separator = fields.indexOf("-");
+  // Namespace handles are opaque kernel objects, not filesystem source paths.
+  // Docker commonly mounts net:[inode] handles under /run/docker/netns.
+  const namespaceHandle =
+    separator >= 6 &&
+    fields[separator + 1] === "nsfs" &&
+    /^(?:net|mnt|pid|pid_for_children|user|uts|ipc|cgroup|time|time_for_children):\[\d+\]$/.test(
+      root,
+    );
   if (
     fields.length < 6 ||
     !/^\d+$/.test(fields[0] ?? "") ||
     !/^\d+:\d+$/.test(fields[2] ?? "") ||
-    !isAbsolute(root) ||
+    (!isAbsolute(root) && !namespaceHandle) ||
     !isAbsolute(mountpoint)
   ) {
     throw new WorktreeCleanupHold("Mount ownership could not be checked.");
@@ -94,7 +103,7 @@ function parseCheckoutMount(line: string): CheckoutMount {
   return {
     id: fields[0]!,
     device: fields[2]!,
-    root: resolve(root),
+    root: namespaceHandle ? null : resolve(root),
     mountpoint: resolve(mountpoint),
   };
 }
@@ -117,11 +126,13 @@ export async function assertNoCheckoutMounts(worktree: string, procRoot = "/proc
   const containing = mounts
     .filter((mount) => inside(worktree, mount.mountpoint))
     .sort((left, right) => right.mountpoint.length - left.mountpoint.length)[0];
-  if (!containing)
+  if (!containing || containing.root === null)
     throw new WorktreeCleanupHold("The checkout mount source could not be resolved.");
   const filesystemPath = resolve(containing.root, relative(containing.mountpoint, worktree));
   for (const mount of mounts) {
     if (mount.id === containing.id || mount.device !== containing.device) continue;
+    if (mount.root === null)
+      throw new WorktreeCleanupHold("The checkout mount source could not be resolved.");
     if (inside(mount.root, filesystemPath)) {
       throw new WorktreeCleanupHold("The checkout is a source for another mount.");
     }

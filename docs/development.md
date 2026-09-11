@@ -258,7 +258,10 @@ A read timeout leaves the client pending until a later confirmation.
 Cleanup checks Linux mount source paths as well as mount points, using filesystem
 roots and device identities from mountinfo. A checkout bind-mounted elsewhere,
 including through an ancestor alias or a separate home filesystem, is retained.
-Unresolvable mount metadata also prevents removal.
+Known `nsfs` namespace handles such as Docker's `net:[inode]` mounts are not
+filesystem source paths. Their mount points remain protected; unrelated namespace
+handles do not block cleanup on a different filesystem. Unresolvable mount
+metadata still prevents removal.
 
 ### Agent Tool Catalog Measurement
 

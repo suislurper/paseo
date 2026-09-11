@@ -7,8 +7,8 @@
 wrong-namespace, or dangling targets yield `unverifiable` with null
 counts/ref as appropriate — there is **no** fall back to local `main`/`master`
 for this safety field (local heuristics remain only for unrelated non-safety
-base operations such as `baseRef`). It is additive protocol data so already-landed
-work is not treated as unpushed risk.
+base operations such as `baseRef`). It is additive protocol data about merge
+history. It does not establish whether an unmerged branch is preserved remotely.
 
 ## Ancestry vs patch equivalence
 
@@ -27,20 +27,58 @@ already reachable from origin default. The work has landed in the history sense.
 **Patch equivalence** is weaker. A squash merge can leave a feature tip with a
 different commit graph that happens to produce the same tree (or cherry-equivalent
 patches). That is **not** ancestral inclusion. The branch is still treated as
-protected: sidebar/archive copy says changes landed on the default tip while the
-branch itself is not merged, and auto-archive will not remove it on that evidence
-alone.
+protected: the sidebar says "Changes equivalent to merged work", and auto-archive
+will not remove it on that evidence alone.
 
 Legacy `aheadOfOrigin` / `behindOfOrigin` continue to mean "ahead of the branch's
 configured upstream," not "ahead of origin default." Do not conflate the two.
+
+## Remote preservation is separate
+
+`remotePreservation` describes whether fetched remote-tracking history contains the
+exact local tip. Its `state` is `preserved`, `unpreserved`, or `unknown`; `ref`
+identifies a containing remote ref, and `localCommitCount` is unknown when the
+count could not be established. Being ahead of the default branch never means
+"unpushed" by itself.
+
+The sidebar, archive confirmation and project archive share these meanings:
+
+- Merged into the resolved default branch.
+- Preserved remotely; not merged (or merge status unknown).
+- Local commits not preserved remotely.
+- Changes equivalent to merged work.
+- Status unknown.
+
+These are display observations from fetched refs, not deletion authority. Cleanup
+freshly checks remote advertisements for a ref containing the exact tip, with a
+bounded lookup; an offline remote or stale tracking ref retains the checkout.
 
 ## Explicit archive authority
 
 ### Manual archive
 
-The user always retains archive authority. Confirmation still runs when the
-worktree is dirty or carries unique / unpushed risk. Inclusion may suppress a
-stale "N unpushed commits" warning, but never forces an archive.
+Archival keeps conversations. Its structured `cleanup` result separately reports
+`removed`, `retained` with a reason, or `failed`. External workspaces can archive
+their records; their files remain under the owning repository's closeout procedure.
+`archive_only` never runs worktree teardown or deletes checkout files. New clients
+require the host's `workspaceArchiveModes` capability for record-only archival and
+`workspaceSafeCleanup` for reclamation; old hosts cannot silently ignore a mode.
+
+For cleanup, the server requires an isolated Paseo-owned checkout, no active
+workspace/agent/process reference, and the released implementation-writer lock.
+It holds that same lock through inspection, teardown, fresh preservation checks
+and Git removal. Dirty/hidden-index changes, unknown ignored files, protected
+evidence, model artifacts, mounts, and uncertain ownership retain files. Required
+agent/terminal or script teardown failures also retain them. There is no forced
+Git removal or recursive deletion fallback in archival.
+
+Before removal, the exact commit is saved on every archived workspace record that
+uses the checkout. Git removes the worktree without force, then attempts normal
+branch deletion only while the branch still points to the saved tip. Restore uses
+the saved commit on a fresh branch, so later reuse of a branch name cannot restore
+different code. Historical records without a saved commit keep their branch-based
+recovery. Failed cleanup and notification do not resurrect an archived record;
+repeating archival can finish eligible residual cleanup.
 
 ### Auto-archive after merge
 

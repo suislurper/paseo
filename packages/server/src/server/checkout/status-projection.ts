@@ -63,6 +63,7 @@ export function buildCheckoutStatusPayloadFromSnapshot({
       aheadBehind: snapshot.git.aheadBehind ?? null,
       aheadOfOrigin: snapshot.git.aheadOfOrigin ?? null,
       behindOfOrigin: snapshot.git.behindOfOrigin ?? null,
+      remotePreservation: snapshot.git.remotePreservation,
       ...(snapshot.git.originDefaultRelation
         ? { originDefaultRelation: snapshot.git.originDefaultRelation }
         : {}),
@@ -85,6 +86,7 @@ export function buildCheckoutStatusPayloadFromSnapshot({
     aheadBehind: snapshot.git.aheadBehind ?? null,
     aheadOfOrigin: snapshot.git.aheadOfOrigin ?? null,
     behindOfOrigin: snapshot.git.behindOfOrigin ?? null,
+    remotePreservation: snapshot.git.remotePreservation,
     ...(snapshot.git.originDefaultRelation
       ? { originDefaultRelation: snapshot.git.originDefaultRelation }
       : {}),

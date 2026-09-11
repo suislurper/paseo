@@ -29,6 +29,7 @@ interface CreateAgentLifecycleDispatchDependencies {
   findWorkspaceIdForCwd: (cwd: string) => Promise<string | null>;
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
   archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
+  persistRecoveryHead: (path: string, head: string) => Promise<void>;
   emit: (message: SessionOutboundMessage) => void;
   emitAgentRemove: (agentId: string) => void;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
@@ -209,6 +210,7 @@ export class CreateAgentLifecycleDispatch {
         findWorkspaceIdForCwd: this.dependencies.findWorkspaceIdForCwd,
         listActiveWorkspaces: this.dependencies.listActiveWorkspaces,
         archiveWorkspaceRecord: this.dependencies.archiveWorkspaceRecord,
+        persistRecoveryHead: this.dependencies.persistRecoveryHead,
         emitWorkspaceUpdatesForWorkspaceIds: this.dependencies.emitWorkspaceUpdatesForWorkspaceIds,
         markWorkspaceArchiving: this.dependencies.markWorkspaceArchiving,
         clearWorkspaceArchiving: this.dependencies.clearWorkspaceArchiving,

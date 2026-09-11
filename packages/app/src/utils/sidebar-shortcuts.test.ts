@@ -38,7 +38,7 @@ function workspace(input: {
     diffStat: null,
     prHint: null,
     archiveHasUncommittedChanges: null,
-    archiveUnpushedCommitCount: null,
+    archiveRemotePreservation: null,
     archiveOriginDefaultRelation: null,
     originDefaultRelationLabel: null,
     scripts: [],

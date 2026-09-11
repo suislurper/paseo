@@ -25,7 +25,7 @@ function workspace(overrides: Partial<SidebarWorkspaceEntry> = {}): SidebarWorks
     diffStat: null,
     prHint: null,
     archiveHasUncommittedChanges: null,
-    archiveUnpushedCommitCount: null,
+    archiveRemotePreservation: null,
     archiveOriginDefaultRelation: null,
     originDefaultRelationLabel: null,
     scripts: [],

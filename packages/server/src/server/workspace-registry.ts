@@ -55,6 +55,12 @@ const PersistedWorkspaceRecordSchema = z.object({
   // archive and recovery do not need the directory to still exist in order to
   // recover placement.
   worktreeRoot: z.string().nullable().default(null),
+  // Exact tip saved before checkout removal; historical records may lack it.
+  archivedHead: z
+    .string()
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+    .nullable()
+    .optional(),
   // The base branch the worktree was created from (normalized like worktree.json's
   // baseRefName). Only worktree workspaces carry a base branch; checkout-branch
   // worktrees and directory/local_checkout workspaces leave it null.
@@ -426,6 +432,7 @@ export function createPersistedWorkspaceRecord(input: {
   title?: string | null;
   branch?: string | null;
   worktreeRoot?: string | null;
+  archivedHead?: string | null;
   baseBranch?: string | null;
   isPaseoOwnedWorktree?: boolean;
   mainRepoRoot?: string | null;

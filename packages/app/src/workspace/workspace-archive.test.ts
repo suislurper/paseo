@@ -122,6 +122,26 @@ describe("archiveWorkspaceOptimistically", () => {
     expect(storedWorkspace(archived.id)).toBeUndefined();
   });
 
+  it.each(["retained", "failed"] as const)(
+    "keeps an archived workspace hidden when cleanup is %s",
+    async (status) => {
+      const archived = workspace();
+      useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+      const cleanup = { status, reason: "files are still in use" };
+      const client = createClient(
+        vi.fn(async () => ({
+          ...archivePayload({ workspaceId: archived.id, error: "cleanup did not complete" }),
+          archivedAt: "2026-09-11T00:00:00Z",
+          cleanup,
+        })),
+      );
+      await expect(
+        archiveWorkspaceOptimistically({ client, workspace: target() }),
+      ).resolves.toEqual(cleanup);
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+    },
+  );
+
   it("restores the workspace and clears pending state when the daemon rejects the archive", async () => {
     const archived = workspace();
     useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);

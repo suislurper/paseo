@@ -8,11 +8,18 @@ import { fileURLToPath } from "node:url";
 
 const productionScript = fileURLToPath(new URL("./verify-desktop-bundle.mjs", import.meta.url));
 
-const UI_BUNDLE = ["originDefaultRelation", "patch_equivalent", "archiveUnpushedCommitCount"].join(
-  "\n",
-);
+const UI_BUNDLE = [
+  "originDefaultRelation",
+  "patch_equivalent",
+  "archiveRemotePreservation",
+  "workspaceCreationRetry",
+  "archivedFilesRetained",
+].join("\n");
 
 const SERVER_ASAR = [
+  "workspaceSafeCleanup",
+  "workspaceCreationRetry",
+  "archivedHead",
   "originDefaultRelation",
   "claude-opus-5",
   "PASEO_AGENT_ARTIFACT_DIR",

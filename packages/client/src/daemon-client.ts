@@ -2194,6 +2194,13 @@ export class DaemonClient {
     ) {
       throw new Error("Update the host to archive workspace records without deleting files.");
     }
+    // COMPAT(workspaceSafeCleanup): added 2026-09-11; remove after 2027-03-11.
+    if (
+      options?.mode !== "archive_only" &&
+      this.lastServerInfoMessage?.features?.workspaceSafeCleanup !== true
+    ) {
+      throw new Error("Update the host to archive workspaces with verified checkout cleanup.");
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
@@ -3912,6 +3919,9 @@ export class DaemonClient {
     },
     requestId?: string,
   ): Promise<PaseoWorktreeArchivePayload> {
+    if (this.lastServerInfoMessage?.features?.workspaceSafeCleanup !== true) {
+      throw new Error("Update the host to archive worktrees with verified checkout cleanup.");
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {

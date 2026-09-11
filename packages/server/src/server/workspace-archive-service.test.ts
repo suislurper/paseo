@@ -8,6 +8,8 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ForgeService } from "../services/forge-service.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import { createWorktree, type WorktreeConfig } from "../utils/worktree.js";
+import * as cleanupSafety from "../utils/worktree-cleanup-safety.js";
+const inspectDisposableCheckout = cleanupSafety.inspectDisposableCheckout;
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
@@ -23,6 +25,7 @@ import {
 const cleanupPaths: string[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });
   }
@@ -79,6 +82,17 @@ function createGitHubServiceStub(): ForgeService {
 function createGitRepo(): { tempDir: string; repoDir: string } {
   const tempDir = mkdtempSync(path.join(tmpdir(), "workspace-archive-service-"));
   cleanupPaths.push(tempDir);
+  const procRoot = path.join(tempDir, "proc");
+  mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  writeFileSync(
+    path.join(procRoot, "self", "mountinfo"),
+    "1 0 0:1 / / rw - ext4 /dev/fixture rw\n",
+  );
+  // Host-independent census fixture; real ownership/mount holds are exercised
+  // by worktree-cleanup-safety.test.ts. Git and filesystem inspection stay real.
+  vi.spyOn(cleanupSafety, "inspectDisposableCheckout").mockImplementation((cwd) =>
+    inspectDisposableCheckout(cwd, { procRoot }),
+  );
   const repoDir = path.join(tempDir, "repo");
   mkdirSync(repoDir, { recursive: true });
   execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "pipe" });
@@ -102,7 +116,7 @@ async function createPaseoOwnedWorktree(
   paseoHome: string,
   worktreeSlug: string,
 ): Promise<WorktreeConfig> {
-  return createWorktree({
+  const worktree = await createWorktree({
     cwd: repoDir,
     worktreeSlug,
     source: {
@@ -113,6 +127,16 @@ async function createPaseoOwnedWorktree(
     runSetup: false,
     paseoHome,
   });
+  const remote = path.join(path.dirname(repoDir), "remote.git");
+  if (!existsSync(remote)) {
+    execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+    execFileSync("git", ["remote", "add", "origin", remote], { cwd: repoDir, stdio: "pipe" });
+  }
+  execFileSync("git", ["push", "origin", `HEAD:refs/heads/fixtures/${worktreeSlug}`], {
+    cwd: worktree.worktreePath,
+    stdio: "pipe",
+  });
+  return worktree;
 }
 
 interface ArchiveDepsInput {
@@ -158,6 +182,7 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     findWorkspaceIdForCwd: input.findWorkspaceIdForCwd ?? vi.fn(async () => null),
     listActiveWorkspaces: async () =>
       active.filter((workspace) => !archivedWorkspaceIds.has(workspace.workspaceId)),
+    persistRecoveryHead: vi.fn(async () => {}),
     archiveWorkspaceRecord: async (workspaceId: string) => {
       archivedWorkspaceIds.add(workspaceId);
       const index = active.findIndex((workspace) => workspace.workspaceId === workspaceId);
@@ -338,7 +363,7 @@ describe("archiveByScope", () => {
     expect(readFileSync(lateFile, "utf8")).toBe("must survive");
   });
 
-  test("workspace scope runs teardown while keeping a directory referenced by a sibling", async () => {
+  test("workspace scope retains a referenced directory without running teardown", async () => {
     const { tempDir, repoDir } = createGitRepo();
     writeFileSync(
       path.join(repoDir, "paseo.json"),
@@ -379,7 +404,7 @@ describe("archiveByScope", () => {
       removedDirectory: false,
     });
     expect(existsSync(worktree.worktreePath)).toBe(true);
-    expect(readFileSync(path.join(repoDir, "shared-teardown.log"), "utf8")).toBe("ok");
+    expect(existsSync(path.join(repoDir, "shared-teardown.log"))).toBe(false);
   });
 
   test("workspace scope keeps a worktree for an active workspace in a subdirectory", async () => {
@@ -810,7 +835,12 @@ describe("archiveByScope", () => {
       ],
     });
     deps.agentManager = {
-      listAgents: () => [{ id: liveAgentId, workspaceId: targetWorkspaceId }] as ManagedAgent[],
+      listAgents: () =>
+        deps.archivedAgentIds.includes(liveAgentId)
+          ? []
+          : ([
+              { id: liveAgentId, cwd: worktree.worktreePath, workspaceId: targetWorkspaceId },
+            ] as ManagedAgent[]),
       archiveAgent: vi.fn(async (agentId: string) => {
         deps.archivedAgentIds.push(agentId);
         return { archivedAt: new Date().toISOString() };
@@ -823,8 +853,20 @@ describe("archiveByScope", () => {
     deps.agentStorage = {
       list: async () =>
         [
-          { id: targetStoredAgentId, workspaceId: targetWorkspaceId, archivedAt: null },
-          { id: otherStoredAgentId, workspaceId: otherWorkspaceId, archivedAt: null },
+          {
+            id: targetStoredAgentId,
+            cwd: worktree.worktreePath,
+            workspaceId: targetWorkspaceId,
+            archivedAt: deps.archivedSnapshotIds.includes(targetStoredAgentId)
+              ? new Date().toISOString()
+              : null,
+          },
+          {
+            id: otherStoredAgentId,
+            cwd: path.join(tempDir, "other"),
+            workspaceId: otherWorkspaceId,
+            archivedAt: null,
+          },
         ] as StoredAgentRecord[],
     } as Pick<AgentStorage, "list">;
 

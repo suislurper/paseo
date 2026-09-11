@@ -193,7 +193,7 @@ describe("paseo worktree manager", () => {
     });
   });
 
-  it("deletes a worktree whose .git admin dir has already been removed", async () => {
+  it("retains a worktree whose Git metadata cannot be verified", async () => {
     const created = await createLegacyWorktreeForTest({
       branchName: "orphan-delete-branch",
       cwd: repoDir,
@@ -208,13 +208,14 @@ describe("paseo worktree manager", () => {
     });
     expect(existsSync(created.worktreePath)).toBe(true);
 
-    await deletePaseoWorktree({
-      cwd: repoDir,
-      worktreePath: created.worktreePath,
-      paseoHome,
-    });
-
-    expect(existsSync(created.worktreePath)).toBe(false);
+    await expect(
+      deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: created.worktreePath,
+        paseoHome,
+      }),
+    ).rejects.toThrow();
+    expect(existsSync(created.worktreePath)).toBe(true);
   });
 
   it("is idempotent: deleting an already-absent worktree succeeds", async () => {
@@ -226,11 +227,7 @@ describe("paseo worktree manager", () => {
       paseoHome,
     });
 
-    await deletePaseoWorktree({
-      cwd: repoDir,
-      worktreePath: created.worktreePath,
-      paseoHome,
-    });
+    execFileSync("git", ["worktree", "remove", created.worktreePath], { cwd: repoDir });
     expect(existsSync(created.worktreePath)).toBe(false);
 
     // Second call — nothing left on disk and no admin entry — must not throw.
@@ -239,7 +236,7 @@ describe("paseo worktree manager", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("deletes a worktree when the parent repo root is not available", async () => {
+  it("retains a worktree when the parent repo root is not available", async () => {
     const created = await createLegacyWorktreeForTest({
       branchName: "no-cwd-branch",
       cwd: repoDir,
@@ -254,14 +251,15 @@ describe("paseo worktree manager", () => {
 
     // Simulate the handler path when git has forgotten about the worktree:
     // caller forwards the path-derived worktreesRoot from the ownership check.
-    await deletePaseoWorktree({
-      cwd: null,
-      worktreePath: created.worktreePath,
-      worktreesRoot: ownership.worktreeRoot,
-      paseoHome,
-    });
-
-    expect(existsSync(created.worktreePath)).toBe(false);
+    await expect(
+      deletePaseoWorktree({
+        cwd: null,
+        worktreePath: created.worktreePath,
+        worktreesRoot: ownership.worktreeRoot,
+        paseoHome,
+      }),
+    ).rejects.toThrow();
+    expect(existsSync(created.worktreePath)).toBe(true);
   });
 });
 

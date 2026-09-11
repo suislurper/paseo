@@ -9,7 +9,8 @@ export interface ProjectWorkspaceArchiveEntry extends Pick<
   | "workspaceKind"
   | "name"
   | "archiveHasUncommittedChanges"
-  | "archiveUnpushedCommitCount"
+  | "archiveRemotePreservation"
+  | "archiveOriginDefaultRelation"
   | "diffStat"
 > {}
 

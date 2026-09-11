@@ -71,6 +71,34 @@ function decodeMountPath(value: string): string {
   );
 }
 
+interface CheckoutMount {
+  id: string;
+  device: string;
+  root: string;
+  mountpoint: string;
+}
+
+function parseCheckoutMount(line: string): CheckoutMount {
+  const fields = line.split(" ");
+  const root = decodeMountPath(fields[3] ?? "");
+  const mountpoint = decodeMountPath(fields[4] ?? "");
+  if (
+    fields.length < 6 ||
+    !/^\d+$/.test(fields[0] ?? "") ||
+    !/^\d+:\d+$/.test(fields[2] ?? "") ||
+    !isAbsolute(root) ||
+    !isAbsolute(mountpoint)
+  ) {
+    throw new WorktreeCleanupHold("Mount ownership could not be checked.");
+  }
+  return {
+    id: fields[0]!,
+    device: fields[2]!,
+    root: resolve(root),
+    mountpoint: resolve(mountpoint),
+  };
+}
+
 export async function assertNoCheckoutMounts(worktree: string, procRoot = "/proc"): Promise<void> {
   let text: string;
   try {
@@ -78,12 +106,30 @@ export async function assertNoCheckoutMounts(worktree: string, procRoot = "/proc
   } catch {
     throw new WorktreeCleanupHold("Mount ownership could not be checked.");
   }
-  for (const line of text.trim().split("\n")) {
-    const fields = line.split(" ");
-    if (fields.length < 6) throw new WorktreeCleanupHold("Mount ownership could not be checked.");
-    const mount = decodeMountPath(fields[4]!);
-    if (inside(mount, worktree))
+  const mounts = text.trim().split("\n").map(parseCheckoutMount);
+  for (const mount of mounts) {
+    if (inside(mount.mountpoint, worktree))
       throw new WorktreeCleanupHold("The checkout contains a mounted path.");
+  }
+  // mountinfo roots are paths within a filesystem, not necessarily host paths.
+  // Resolve the checkout through its deepest containing mount before comparing
+  // same-device roots (e.g. /repo in a filesystem mounted at /home/user).
+  const containing = mounts
+    .filter((mount) => inside(worktree, mount.mountpoint))
+    .sort((left, right) => right.mountpoint.length - left.mountpoint.length)[0];
+  if (!containing)
+    throw new WorktreeCleanupHold("The checkout mount source could not be resolved.");
+  const filesystemPath = resolve(containing.root, relative(containing.mountpoint, worktree));
+  for (const mount of mounts) {
+    if (mount.id === containing.id || mount.device !== containing.device) continue;
+    if (inside(mount.root, filesystemPath)) {
+      throw new WorktreeCleanupHold("The checkout is a source for another mount.");
+    }
+    if (inside(filesystemPath, mount.root)) {
+      const alias = resolve(mount.mountpoint, relative(mount.root, filesystemPath));
+      if (alias !== worktree)
+        throw new WorktreeCleanupHold("The checkout is exposed through another mount.");
+    }
   }
 }
 

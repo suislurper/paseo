@@ -8951,3 +8951,34 @@ function prepareArchiveRemovalFixture(tempDir: string, repoDir: string, worktree
     inspectDisposableCheckout(cwd, { procRoot }),
   );
 }
+
+test.each(["unknown_project", "archived_project"] as const)(
+  "workspace.create worktree source reports definitive %s",
+  async (code) => {
+    const emitted: SessionOutboundMessage[] = [];
+    const session = createSessionForWorkspaceTests({
+      onMessage: (message) => emitted.push(message),
+    });
+    session.projectRegistry.get = async () =>
+      code === "unknown_project"
+        ? null
+        : createPersistedProjectRecord({
+            projectId: "stale-project",
+            rootPath: REPO_CWD,
+            kind: "git",
+            displayName: "stale",
+            createdAt: "2026-09-11T00:00:00Z",
+            updatedAt: "2026-09-11T00:00:00Z",
+            archivedAt: "2026-09-11T00:00:00Z",
+          });
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "stale-worktree-" + code,
+      source: { kind: "worktree", projectId: "stale-project" },
+    });
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      workspace: null,
+      errorCode: code,
+    });
+  },
+);

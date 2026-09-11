@@ -152,7 +152,9 @@ export async function runWorkspaceCreationAttempt<TWorkspace extends { id?: stri
     throw new WorkspaceCreationAttemptError(
       "failed",
       payload.error ?? "Failed to create workspace",
-      !["directory_not_found", "source_required", "project_not_found"].includes(code ?? ""),
+      !["directory_not_found", "source_required", "unknown_project", "archived_project"].includes(
+        code ?? "",
+      ),
     );
   }
   const workspaceId = typeof payload.workspace.id === "string" ? payload.workspace.id : null;

@@ -1,7 +1,13 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { useSessionStore } from "@/stores/session-store";
+import {
+  clearWorkspaceArchivePending,
+  isWorkspaceArchivePending,
+  markWorkspaceArchivePending,
+  markWorkspaceArchiveUncertain,
+} from "@/contexts/session-workspace-upserts";
 import { DirectoryRefreshSupersededError, DirectorySync } from "./index";
 
 type WorkspaceFetchResult = Awaited<ReturnType<DaemonClient["fetchWorkspaces"]>>;
@@ -255,3 +261,92 @@ describe("DirectorySync session readiness", () => {
     directory.dispose();
   });
 });
+
+describe("uncertain workspace archive reconciliation", () => {
+  it.each([true, false])(
+    "reconciles a fresh authoritative directory (active=%s)",
+    async (active) => {
+      const serverId = `archive-fresh-${active}`;
+      const { client, directory } = createReadyDirectory(serverId);
+      const input = { serverId, workspaceId: "archive-workspace" };
+      markWorkspaceArchivePending(input);
+      markWorkspaceArchiveUncertain(input);
+      const finish = client.holdWorkspaceFetch();
+      const refresh = directory.refreshWorkspaces();
+      await Promise.resolve();
+      finish(archiveSnapshot(active));
+      await refresh;
+      expect(isWorkspaceArchivePending(input)).toBe(false);
+      expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(input.workspaceId)).toBe(
+        active,
+      );
+      directory.dispose();
+    },
+  );
+
+  it.each(["new-uncertainty", "new-attempt"])(
+    "does not reconcile an archive newer than the fetch: %s",
+    async (scenario) => {
+      const serverId = `archive-stale-${scenario}`;
+      const { client, directory } = createReadyDirectory(serverId);
+      const input = { serverId, workspaceId: "archive-workspace" };
+      markWorkspaceArchivePending(input);
+      if (scenario === "new-attempt") markWorkspaceArchiveUncertain(input);
+      const finish = client.holdWorkspaceFetch();
+      const refresh = directory.refreshWorkspaces();
+      await Promise.resolve();
+      await vi.waitFor(() => expect(client.fetchWorkspacesCalls).toBe(1));
+      if (scenario === "new-attempt") markWorkspaceArchivePending(input);
+      markWorkspaceArchiveUncertain(input);
+      finish(archiveSnapshot(true));
+      await refresh;
+      expect(isWorkspaceArchivePending(input)).toBe(true);
+      expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(input.workspaceId)).toBe(
+        false,
+      );
+      clearWorkspaceArchivePending(input);
+      directory.dispose();
+    },
+  );
+});
+
+function createReadyDirectory(serverId: string) {
+  const result = createDirectory(serverId);
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, result.client as unknown as DaemonClient, 1);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: "test",
+    features: { workspaceMultiplicity: true },
+  });
+  return result;
+}
+
+function archiveSnapshot(active: boolean): WorkspaceFetchResult {
+  return {
+    requestId: "archive-snapshot",
+    emptyProjects: [],
+    entries: active
+      ? [
+          {
+            id: "archive-workspace",
+            projectId: "project",
+            projectDisplayName: "Project",
+            projectRootPath: "/repo",
+            workspaceDirectory: "/repo/worktree",
+            projectKind: "git",
+            workspaceKind: "worktree",
+            name: "worktree",
+            status: "done",
+            archivingAt: null,
+            activityAt: null,
+            statusEnteredAt: null,
+            diffStat: null,
+            scripts: [],
+          },
+        ]
+      : [],
+    pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+  };
+}

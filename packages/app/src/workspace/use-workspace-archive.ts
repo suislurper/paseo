@@ -77,12 +77,13 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
         },
       });
       purgeArchivedWorkspaceState({ serverId, workspaceId });
-      const message =
-        cleanup?.status === "removed"
-          ? t("sidebar.workspace.toasts.archivedFilesRemoved")
-          : t("sidebar.workspace.toasts.archivedFilesRetained", {
-              reason: cleanup?.reason ?? t("sidebar.workspace.toasts.cleanupUnknown"),
-            });
+      let message = t("sidebar.workspace.toasts.archivedCleanupUnknown");
+      if (cleanup?.status === "removed")
+        message = t("sidebar.workspace.toasts.archivedFilesRemoved");
+      if (cleanup?.status === "retained")
+        message = t("sidebar.workspace.toasts.archivedFilesRetained", {
+          reason: cleanup.reason ?? t("sidebar.workspace.toasts.cleanupUnknown"),
+        });
       toast.show(message, { durationMs: 6000 });
     } catch (error) {
       toast.error(

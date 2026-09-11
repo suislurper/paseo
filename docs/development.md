@@ -239,6 +239,21 @@ dispatch. An uncertain first creation on an older host must be inspected before
 starting another attempt; upgrading the host does not make that old request
 replayable. Repeated clicks are held while a submission is running.
 
+### Archive confirmation and cleanup
+
+An archive transport timeout leaves the workspace hidden and pending. The client
+uses a read-only recovery inspection to confirm durable archival or an active
+workspace; it never repeats archival to discover the outcome. If the host cannot
+confirm either state, reconnecting reconciles the pending operation against a
+fresh complete directory snapshot. A fetch started before the uncertain result,
+or before a newer archive attempt, cannot clear that attempt's suppression.
+Unknown cleanup status is shown explicitly instead of claiming files were retained.
+
+Cleanup checks Linux mount source paths as well as mount points, using filesystem
+roots and device identities from mountinfo. A checkout bind-mounted elsewhere,
+including through an ancestor alias or a separate home filesystem, is retained.
+Unresolvable mount metadata also prevents removal.
+
 ### Agent Tool Catalog Measurement
 
 Measure the MCP `tools/list` payload that Paseo injects into agents with:

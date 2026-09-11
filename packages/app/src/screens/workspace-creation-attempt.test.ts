@@ -156,4 +156,30 @@ describe("frozen workspace creation attempt", () => {
     expect(legacyCreate).toHaveBeenCalledOnce();
     expect(client.createWorkspace).not.toHaveBeenCalled();
   });
+  it.each(["unknown_project", "archived_project"])(
+    "treats %s as a definitive failure so the form can start a corrected attempt",
+    async (errorCode) => {
+      const attempt = createWorkspaceCreationAttempt({
+        source: { kind: "directory", path: "/repo", projectId: "stale" },
+      });
+      const client = {
+        createWorkspace: vi.fn(async () => ({
+          workspace: null,
+          error: "stale project",
+          errorCode,
+        })),
+        supportsWorkspaceCreationRetry: () => true,
+        requireWorkspaceCreationRetrySupport: vi.fn(),
+      };
+      await expect(runWorkspaceCreationAttempt({ client, attempt })).rejects.toMatchObject({
+        kind: "failed",
+        retryable: false,
+      });
+      const corrected = createWorkspaceCreationAttempt({
+        source: { kind: "directory", path: "/repo", projectId: "valid" },
+      });
+      expect(corrected.requestId).not.toBe(attempt.requestId);
+      expect(corrected.source).toMatchObject({ projectId: "valid" });
+    },
+  );
 });

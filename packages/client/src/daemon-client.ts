@@ -925,6 +925,11 @@ class DaemonRpcError extends Error {
   }
 }
 
+/** The capability check rejected archival before any request was sent. */
+export class WorkspaceArchiveNotDispatchedError extends Error {
+  override readonly name = "WorkspaceArchiveNotDispatchedError";
+}
+
 class DaemonProtocolError extends Error {
   readonly requestId: string;
   readonly responseType?: string;
@@ -2192,14 +2197,18 @@ export class DaemonClient {
       options?.mode === "archive_only" &&
       this.lastServerInfoMessage?.features?.workspaceArchiveModes !== true
     ) {
-      throw new Error("Update the host to archive workspace records without deleting files.");
+      throw new WorkspaceArchiveNotDispatchedError(
+        "Update the host to archive workspace records without deleting files.",
+      );
     }
     // COMPAT(workspaceSafeCleanup): added 2026-09-11; remove after 2027-03-11.
     if (
       options?.mode !== "archive_only" &&
       this.lastServerInfoMessage?.features?.workspaceSafeCleanup !== true
     ) {
-      throw new Error("Update the host to archive workspaces with verified checkout cleanup.");
+      throw new WorkspaceArchiveNotDispatchedError(
+        "Update the host to archive workspaces with verified checkout cleanup.",
+      );
     }
     return this.sendCorrelatedSessionRequest({
       requestId,

@@ -1,8 +1,12 @@
-import { it } from "vitest";
+import { it, expect } from "vitest";
 import { promises as fs } from "node:fs";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { inspectDisposableCheckout, assertNoCheckoutProcesses } from "./worktree-cleanup-safety.js";
+import {
+  inspectDisposableCheckout,
+  assertNoCheckoutProcesses,
+  assertNoCheckoutMounts,
+} from "./worktree-cleanup-safety.js";
 import { getRemotePreservation, verifyRemotePreservation } from "./worktree-preservation.js";
 async function main() {
   const temp = await fs.mkdtemp("/tmp/paseo-cleanup-proof-");
@@ -82,3 +86,64 @@ async function main() {
   }
 }
 it("retains dirty, hidden-index, protected, mounted and process-owned checkouts", main, 30_000);
+
+it.each([
+  {
+    name: "direct bind source",
+    checkout: "/home/fixture/project",
+    mounts:
+      "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 8:1 /home/fixture/project /elsewhere rw - ext4 /dev/a rw\n",
+  },
+  {
+    name: "bind source on a separate home filesystem",
+    checkout: "/home/fixture/project",
+    mounts:
+      "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 8:2 / /home rw - ext4 /dev/b rw\n3 1 8:2 /fixture/project /elsewhere rw - ext4 /dev/b rw\n",
+  },
+  {
+    name: "bind source through a non-root filesystem mount",
+    checkout: "/home/fixture/project",
+    mounts:
+      "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 8:2 /users /home rw - ext4 /dev/b rw\n3 1 8:2 /users/fixture/project /elsewhere rw - ext4 /dev/b rw\n",
+  },
+  {
+    name: "escaped bind source",
+    checkout: "/home/fixture/my project",
+    mounts:
+      "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 8:1 /home/fixture/my\\040project /elsewhere rw - ext4 /dev/a rw\n",
+  },
+  {
+    name: "parent bind exposes the checkout",
+    checkout: "/home/fixture/project",
+    mounts:
+      "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 8:1 /home/fixture /elsewhere rw - ext4 /dev/a rw\n",
+  },
+  {
+    name: "unresolved source",
+    checkout: "/home/fixture/project",
+    mounts: "1 0 8:1 /other /elsewhere rw - ext4 /dev/a rw\n",
+  },
+])("retains checkout with $name", async ({ checkout, mounts }) => {
+  const proc = await fs.mkdtemp("/tmp/paseo-mount-source-");
+  try {
+    await fs.mkdir(proc + "/self");
+    await fs.writeFile(proc + "/self/mountinfo", mounts);
+    await expect(assertNoCheckoutMounts(checkout, proc)).rejects.toThrow(/mount/);
+  } finally {
+    await fs.rm(proc, { recursive: true });
+  }
+});
+
+it("allows unrelated same-filesystem bind mounts", async () => {
+  const proc = await fs.mkdtemp("/tmp/paseo-unrelated-mount-");
+  try {
+    await fs.mkdir(proc + "/self");
+    await fs.writeFile(
+      proc + "/self/mountinfo",
+      "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 8:1 /other /elsewhere rw - ext4 /dev/a rw\n",
+    );
+    await expect(assertNoCheckoutMounts("/home/fixture/project", proc)).resolves.toBeUndefined();
+  } finally {
+    await fs.rm(proc, { recursive: true });
+  }
+});

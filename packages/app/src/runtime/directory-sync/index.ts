@@ -1,3 +1,7 @@
+import {
+  captureUncertainWorkspaceArchives,
+  clearReconciledWorkspaceArchives,
+} from "@/contexts/session-workspace-upserts";
 import type {
   DaemonClient,
   FetchAgentsEntry,
@@ -243,6 +247,7 @@ export class DirectorySync {
         if (deltas) for (const delta of deltas) this.workspaces.applyDelta(delta);
         return;
       }
+      const uncertainArchives = captureUncertainWorkspaceArchives(this.serverId);
       await this.fetchWorkspaceSnapshot(client, source, transaction, input?.subscribe === true);
       if (!this.isCurrent(client, source) || !this.hasMatchingSession(client, source)) {
         throw new DirectoryRefreshSupersededError("workspace completion no longer current");
@@ -251,6 +256,9 @@ export class DirectorySync {
       if (completion.kind === "stale") {
         throw new DirectoryRefreshSupersededError("workspace completion was superseded");
       }
+      // Only this successful, current fetch can resolve pre-existing uncertainty.
+      // A newly started archive has a different token and stays suppressed.
+      clearReconciledWorkspaceArchives(this.serverId, uncertainArchives);
       this.workspaces.commitSnapshot(completion.snapshot, completion.deltas);
     } catch (error) {
       const deltas = this.workspaceTransactions.fail(transaction);

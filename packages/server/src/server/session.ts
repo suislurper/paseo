@@ -5136,9 +5136,10 @@ export class Session {
       return expandTilde(input.cwd);
     }
     const project = await this.projectRegistry.get(input.projectId as string);
-    if (!project || project.archivedAt) {
-      throw new Error(`Project not found: ${input.projectId}`);
-    }
+    if (!project)
+      throw new WorkspaceProvisioningError("unknown_project", input.projectId as string);
+    if (project.archivedAt)
+      throw new WorkspaceProvisioningError("archived_project", project.projectId);
     return project.rootPath;
   }
 

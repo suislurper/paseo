@@ -976,6 +976,8 @@ export const es: TranslationResources = {
         archivedFilesRemoved: "Archived; files removed",
         archivedFilesRetained: "Archived; files retained: {{reason}}",
         cleanupUnknown: "cleanup status is unknown",
+        archivedCleanupUnknown: "Archived; cleanup status is unknown",
+        archiveUnconfirmed: "Archival has not been confirmed. Reconnect to check its status.",
         archiveFailed: "No se pudo archivar el espacio de trabajo",
       },
     },

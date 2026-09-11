@@ -16,6 +16,14 @@ if (!head) {
 }
 
 const requiredHistory = [
+  [
+    "3b280b68ab79212931babbc2cf3bfe2ca2fdf591",
+    "verified remote preservation and owned workspace cleanup",
+  ],
+  [
+    "d77231d257921e82eb7768bf9ee6be7740d25a02",
+    "durable workspace creation identity and safe GUI retries",
+  ],
   ["70c329efcc7d9d128df5c6712a04f503a28aa12e", "archive cleanup and live-chat fixes"],
   ["39486271a", "per-profile provider usage"],
   ["4a1eb23a7", "Claude permission-safe control plane"],

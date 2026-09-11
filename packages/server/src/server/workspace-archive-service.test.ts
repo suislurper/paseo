@@ -8,11 +8,14 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ForgeService } from "../services/forge-service.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import { createWorktree, type WorktreeConfig } from "../utils/worktree.js";
+import * as cleanupSafety from "../utils/worktree-cleanup-safety.js";
+const inspectDisposableCheckout = cleanupSafety.inspectDisposableCheckout;
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
   archiveByScope,
+  archiveWorkspaceContents,
   type ActiveWorkspaceRef,
   type ArchiveDependencies,
   type ArchiveResult,
@@ -22,6 +25,7 @@ import {
 const cleanupPaths: string[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });
   }
@@ -78,6 +82,17 @@ function createGitHubServiceStub(): ForgeService {
 function createGitRepo(): { tempDir: string; repoDir: string } {
   const tempDir = mkdtempSync(path.join(tmpdir(), "workspace-archive-service-"));
   cleanupPaths.push(tempDir);
+  const procRoot = path.join(tempDir, "proc");
+  mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  writeFileSync(
+    path.join(procRoot, "self", "mountinfo"),
+    "1 0 0:1 / / rw - ext4 /dev/fixture rw\n",
+  );
+  // Host-independent census fixture; real ownership/mount holds are exercised
+  // by worktree-cleanup-safety.test.ts. Git and filesystem inspection stay real.
+  vi.spyOn(cleanupSafety, "inspectDisposableCheckout").mockImplementation((cwd) =>
+    inspectDisposableCheckout(cwd, { procRoot }),
+  );
   const repoDir = path.join(tempDir, "repo");
   mkdirSync(repoDir, { recursive: true });
   execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "pipe" });
@@ -101,7 +116,7 @@ async function createPaseoOwnedWorktree(
   paseoHome: string,
   worktreeSlug: string,
 ): Promise<WorktreeConfig> {
-  return createWorktree({
+  const worktree = await createWorktree({
     cwd: repoDir,
     worktreeSlug,
     source: {
@@ -112,6 +127,16 @@ async function createPaseoOwnedWorktree(
     runSetup: false,
     paseoHome,
   });
+  const remote = path.join(path.dirname(repoDir), "remote.git");
+  if (!existsSync(remote)) {
+    execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+    execFileSync("git", ["remote", "add", "origin", remote], { cwd: repoDir, stdio: "pipe" });
+  }
+  execFileSync("git", ["push", "origin", `HEAD:refs/heads/fixtures/${worktreeSlug}`], {
+    cwd: worktree.worktreePath,
+    stdio: "pipe",
+  });
+  return worktree;
 }
 
 interface ArchiveDepsInput {
@@ -157,6 +182,7 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     findWorkspaceIdForCwd: input.findWorkspaceIdForCwd ?? vi.fn(async () => null),
     listActiveWorkspaces: async () =>
       active.filter((workspace) => !archivedWorkspaceIds.has(workspace.workspaceId)),
+    persistRecoveryHead: vi.fn(async () => {}),
     archiveWorkspaceRecord: async (workspaceId: string) => {
       archivedWorkspaceIds.add(workspaceId);
       const index = active.findIndex((workspace) => workspace.workspaceId === workspaceId);
@@ -180,13 +206,93 @@ function assertArchiveResult(
   expected: {
     archivedWorkspaceIds: string[];
     removedDirectory: boolean;
+    cleanup?: { status: "removed" | "retained" | "failed"; reason?: string };
   },
 ): void {
   expect(result.archivedWorkspaceIds).toEqual(expected.archivedWorkspaceIds);
   expect(result.removedDirectory).toBe(expected.removedDirectory);
+  if (expected.cleanup) {
+    expect(result.cleanup?.status).toBe(expected.cleanup.status);
+    if (expected.cleanup.reason !== undefined) {
+      expect(result.cleanup?.reason).toBe(expected.cleanup.reason);
+    }
+  }
 }
 
 describe("archiveByScope", () => {
+  test("failed teardown waits for the remaining terminal shutdown before settling", async () => {
+    const deps = createArchiveDeps({ paseoHome: "/unused", activeWorkspaces: [] });
+    let releaseTerminal!: () => void;
+    let terminalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      terminalStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseTerminal = resolve;
+    });
+    deps.agentManager.listAgents = () => [{ id: "agent-1", workspaceId: "ws-1" }] as ManagedAgent[];
+    deps.agentManager.archiveAgent = vi.fn(async () => {
+      throw new Error("agent shutdown failed");
+    });
+    deps.killTerminalsForWorkspace = async () => {
+      terminalStarted();
+      await gate;
+    };
+    let settled = false;
+    const result = archiveWorkspaceContents(deps, "ws-1");
+    void result.then(
+      () => {
+        settled = true;
+        return settled;
+      },
+      () => {
+        settled = true;
+        return settled;
+      },
+    );
+    const rejected = expect(result).rejects.toThrow("Required workspace teardown failed");
+    await started;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseTerminal();
+    await rejected;
+    expect(settled).toBe(true);
+  });
+
+  test("unknown stored-agent inventory prevents archive", async () => {
+    const deps = createArchiveDeps({ paseoHome: "/unused", activeWorkspaces: [] });
+    deps.agentStorage.list = async () => {
+      throw new Error("inventory unreadable");
+    };
+    await expect(archiveWorkspaceContents(deps, "ws-1")).rejects.toThrow("inventory unreadable");
+  });
+
+  test("an archived retry rechecks live teardown before deleting residual files", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "retry-live-hold");
+    const deps = createArchiveDeps({ paseoHome, activeWorkspaces: [] });
+    deps.killTerminalsForWorkspace = vi.fn(async () => {
+      throw new Error("terminal still live");
+    });
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: "ws-retry" },
+      requestId: "retry",
+      existingPlacement: {
+        workspaceId: "ws-retry",
+        cwd: worktree.worktreePath,
+        kind: "worktree",
+        worktreeRoot: worktree.worktreePath,
+        mainRepoRoot: repoDir,
+        isPaseoOwnedWorktree: true,
+      },
+    });
+    expect(result.cleanup).toEqual({ status: "retained", reason: "teardown failure" });
+    expect(deps.killTerminalsForWorkspace).toHaveBeenCalledWith("ws-retry");
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+    expect(result.archivedWorkspaceIds).toEqual([]);
+  });
+
   test("workspace scope archives the record and removes the directory on last reference", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const paseoHome = path.join(tempDir, ".paseo");
@@ -257,7 +363,7 @@ describe("archiveByScope", () => {
     expect(readFileSync(lateFile, "utf8")).toBe("must survive");
   });
 
-  test("workspace scope runs teardown while keeping a directory referenced by a sibling", async () => {
+  test("workspace scope retains a referenced directory without running teardown", async () => {
     const { tempDir, repoDir } = createGitRepo();
     writeFileSync(
       path.join(repoDir, "paseo.json"),
@@ -298,7 +404,7 @@ describe("archiveByScope", () => {
       removedDirectory: false,
     });
     expect(existsSync(worktree.worktreePath)).toBe(true);
-    expect(readFileSync(path.join(repoDir, "shared-teardown.log"), "utf8")).toBe("ok");
+    expect(existsSync(path.join(repoDir, "shared-teardown.log"))).toBe(false);
   });
 
   test("workspace scope keeps a worktree for an active workspace in a subdirectory", async () => {
@@ -729,7 +835,12 @@ describe("archiveByScope", () => {
       ],
     });
     deps.agentManager = {
-      listAgents: () => [{ id: liveAgentId, workspaceId: targetWorkspaceId }] as ManagedAgent[],
+      listAgents: () =>
+        deps.archivedAgentIds.includes(liveAgentId)
+          ? []
+          : ([
+              { id: liveAgentId, cwd: worktree.worktreePath, workspaceId: targetWorkspaceId },
+            ] as ManagedAgent[]),
       archiveAgent: vi.fn(async (agentId: string) => {
         deps.archivedAgentIds.push(agentId);
         return { archivedAt: new Date().toISOString() };
@@ -742,8 +853,20 @@ describe("archiveByScope", () => {
     deps.agentStorage = {
       list: async () =>
         [
-          { id: targetStoredAgentId, workspaceId: targetWorkspaceId, archivedAt: null },
-          { id: otherStoredAgentId, workspaceId: otherWorkspaceId, archivedAt: null },
+          {
+            id: targetStoredAgentId,
+            cwd: worktree.worktreePath,
+            workspaceId: targetWorkspaceId,
+            archivedAt: deps.archivedSnapshotIds.includes(targetStoredAgentId)
+              ? new Date().toISOString()
+              : null,
+          },
+          {
+            id: otherStoredAgentId,
+            cwd: path.join(tempDir, "other"),
+            workspaceId: otherWorkspaceId,
+            archivedAt: null,
+          },
         ] as StoredAgentRecord[],
     } as Pick<AgentStorage, "list">;
 
@@ -792,6 +915,198 @@ describe("archiveByScope", () => {
     expect(result.archivedWorkspaceIds).toHaveLength(3);
     expect(result.removedDirectory).toBe(true);
     expect(existsSync(worktree.worktreePath)).toBe(false);
+  });
+
+  test("archive_only archives the record without teardown or directory removal", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    writeFileSync(
+      path.join(repoDir, "paseo.json"),
+      JSON.stringify({ worktree: { teardown: ['node -e "process.exit(2)"'] } }),
+    );
+    execFileSync("git", ["add", "."], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "teardown"], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "archive-only");
+    const workspaceId = "ws-archive-only";
+    const killTerminals = vi.fn(async () => {});
+
+    const result = await archiveByScope(
+      {
+        ...createArchiveDeps({
+          paseoHome,
+          activeWorkspaces: [
+            {
+              workspaceId,
+              cwd: worktree.worktreePath,
+              kind: "worktree",
+              worktreeRoot: worktree.worktreePath,
+              isPaseoOwnedWorktree: true,
+              mainRepoRoot: repoDir,
+            },
+          ],
+        }),
+        killTerminalsForWorkspace: killTerminals,
+      },
+      {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-archive-only",
+        mode: "archive_only",
+      },
+    );
+
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [workspaceId],
+      removedDirectory: false,
+      cleanup: { status: "retained", reason: "archive-only request" },
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+    expect(killTerminals).toHaveBeenCalledWith(workspaceId);
+  });
+
+  test("retrying an already-archived workspace finishes residual directory cleanup", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "archived-retry");
+    const workspaceId = "ws-archived-retry";
+    const placement: ActiveWorkspaceRef = {
+      workspaceId,
+      cwd: worktree.worktreePath,
+      kind: "worktree",
+      worktreeRoot: worktree.worktreePath,
+      isPaseoOwnedWorktree: true,
+      mainRepoRoot: repoDir,
+    };
+
+    const result = await archiveByScope(createArchiveDeps({ paseoHome, activeWorkspaces: [] }), {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-archived-retry",
+      existingPlacement: placement,
+    });
+
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [],
+      removedDirectory: true,
+      cleanup: { status: "removed" },
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(false);
+  });
+
+  test("required live-agent teardown failure prevents directory removal", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "teardown-failure");
+    const workspaceId = "ws-teardown-failure";
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId,
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: repoDir,
+        },
+      ],
+    });
+    deps.agentManager = {
+      listAgents: () => [{ id: "agent-live", workspaceId }] as ManagedAgent[],
+      archiveAgent: vi.fn(async () => {
+        throw new Error("live teardown failed");
+      }),
+      archiveSnapshot: vi.fn(async () => ({})),
+    };
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-teardown-failure",
+    });
+
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [],
+      removedDirectory: false,
+      cleanup: { status: "retained", reason: "teardown failure" },
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("required terminal teardown failure prevents directory removal", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "terminal-failure");
+    const workspaceId = "ws-terminal-failure";
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId,
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: repoDir,
+        },
+      ],
+    });
+    deps.killTerminalsForWorkspace = vi.fn(async () => {
+      throw new Error("terminal teardown failed");
+    });
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-terminal-failure",
+    });
+
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [],
+      removedDirectory: false,
+      cleanup: { status: "retained", reason: "teardown failure" },
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("slow metadata snapshot does not block record archive or directory cleanup", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "slow-snapshot");
+    const workspaceId = "ws-slow-snapshot";
+    let releaseSnapshot!: () => void;
+    const snapshotGate = new Promise<null>((resolveGate) => {
+      releaseSnapshot = () => resolveGate(null);
+    });
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId,
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: repoDir,
+        },
+      ],
+    });
+    deps.workspaceGitService = {
+      getSnapshot: vi.fn(async () => snapshotGate),
+    } as unknown as Pick<WorkspaceGitService, "getSnapshot">;
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-slow-snapshot",
+    });
+
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [workspaceId],
+      removedDirectory: true,
+      cleanup: { status: "removed" },
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(false);
+    releaseSnapshot();
+    await snapshotGate;
   });
 });
 

@@ -157,6 +157,7 @@ import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   archiveByScope,
+  persistArchivedWorkspaceHeads,
   archivePersistedWorkspaceRecord,
   killTerminalsForWorkspace,
   type ActiveWorkspaceRef,
@@ -1014,6 +1015,8 @@ export async function createPaseoDaemon(
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+    persistRecoveryHead: (checkoutPath, head) =>
+      persistArchivedWorkspaceHeads(workspaceRegistry, checkoutPath, head),
     markWorkspaceArchiving: markWorkspaceArchivingExternal,
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
     emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
@@ -1113,6 +1116,8 @@ export async function createPaseoDaemon(
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+    persistRecoveryHead: (checkoutPath, head) =>
+      persistArchivedWorkspaceHeads(workspaceRegistry, checkoutPath, head),
     emit: emitExternalSessionMessage,
     emitAgentRemove: () => undefined,
     emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
@@ -1200,6 +1205,8 @@ export async function createPaseoDaemon(
         findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
         listActiveWorkspaces: listActiveWorkspacesExternal,
         archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+        persistRecoveryHead: (checkoutPath, head) =>
+          persistArchivedWorkspaceHeads(workspaceRegistry, checkoutPath, head),
         emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
         markWorkspaceArchiving: markWorkspaceArchivingExternal,
         clearWorkspaceArchiving: clearWorkspaceArchivingExternal,

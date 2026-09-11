@@ -1,5 +1,7 @@
+import * as cleanupSafety from "../../utils/worktree-cleanup-safety.js";
+const inspectDisposableCheckout = cleanupSafety.inspectDisposableCheckout;
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Logger } from "pino";
@@ -124,6 +126,7 @@ function createHarness(overrides?: {
     terminalManager: {} as AutoArchiveArchiveOptions["terminalManager"],
     findWorkspaceIdForCwd: vi.fn(async () => "ws-auto-archive"),
     listActiveWorkspaces: vi.fn(async () => []),
+    persistRecoveryHead: async () => {},
     archiveWorkspaceRecord: vi.fn(),
     markWorkspaceArchiving: vi.fn(),
     clearWorkspaceArchiving: vi.fn(),
@@ -195,6 +198,12 @@ const cleanupPaths: string[] = [];
 function createGitRepo(): { tempDir: string; repoDir: string } {
   const tempDir = mkdtempSync(path.join(tmpdir(), "archive-if-safe-"));
   cleanupPaths.push(tempDir);
+  const procRoot = path.join(tempDir, "proc");
+  mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  writeFileSync(path.join(procRoot, "self", "mountinfo"), "1 0 0:1 / / rw - ext4 /dev/root rw\n");
+  vi.spyOn(cleanupSafety, "inspectDisposableCheckout").mockImplementation((cwd) =>
+    inspectDisposableCheckout(cwd, { procRoot }),
+  );
   const repoDir = path.join(tempDir, "repo");
   mkdirSync(repoDir, { recursive: true });
   execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "pipe" });
@@ -218,7 +227,7 @@ async function createPaseoOwnedWorktree(
   paseoHome: string,
   worktreeSlug: string,
 ): Promise<WorktreeConfig> {
-  return createWorktree({
+  const created = await createWorktree({
     cwd: repoDir,
     worktreeSlug,
     source: {
@@ -229,6 +238,14 @@ async function createPaseoOwnedWorktree(
     runSetup: false,
     paseoHome,
   });
+  const remote = path.join(paseoHome, "preservation.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+  execFileSync("git", ["remote", "add", "preservation", remote], { cwd: repoDir });
+  execFileSync("git", ["push", "preservation", "HEAD:refs/heads/saved"], {
+    cwd: created.worktreePath,
+    stdio: "pipe",
+  });
+  return created;
 }
 
 function createGitHubServiceStub(): ForgeService {
@@ -337,6 +354,7 @@ function createRealOutcomeHarness(input: {
     },
     listActiveWorkspaces: async () =>
       active.filter((workspace) => !input.archivedWorkspaceIds.has(workspace.workspaceId)),
+    persistRecoveryHead: async () => {},
     archiveWorkspaceRecord: async (workspaceId: string) => {
       input.archivedWorkspaceIds.add(workspaceId);
       const index = active.findIndex((workspace) => workspace.workspaceId === workspaceId);
@@ -357,6 +375,7 @@ function createRealOutcomeHarness(input: {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });
   }

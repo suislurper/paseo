@@ -3,6 +3,7 @@ import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 
 interface PendingWorkspaceArchive {
   workspaceId: string;
+  uncertain: boolean;
 }
 
 const pendingWorkspaceArchivesByServer = new Map<string, Map<string, PendingWorkspaceArchive>>();
@@ -24,6 +25,7 @@ export function markWorkspaceArchivePending(input: {
   const archives = pendingWorkspaceArchivesByServer.get(serverId) ?? new Map();
   archives.set(pendingArchiveKey({ serverId, workspaceId }), {
     workspaceId,
+    uncertain: false,
   });
   pendingWorkspaceArchivesByServer.set(serverId, archives);
 }
@@ -74,4 +76,35 @@ export function shouldSuppressWorkspaceForLocalArchive(input: {
     serverId: input.serverId,
     workspaceId: input.workspace.id,
   });
+}
+
+export function markWorkspaceArchiveUncertain(input: {
+  serverId: string;
+  workspaceId: string;
+}): void {
+  const record = pendingWorkspaceArchivesByServer
+    .get(input.serverId.trim())
+    ?.get(pendingArchiveKey(input));
+  if (record) record.uncertain = true;
+}
+
+/** Capture before a fresh complete directory fetch, never from an old buffered snapshot. */
+export function captureUncertainWorkspaceArchives(
+  serverId: string,
+): readonly PendingWorkspaceArchive[] {
+  return [...(pendingWorkspaceArchivesByServer.get(serverId.trim())?.values() ?? [])].filter(
+    (record) => record.uncertain,
+  );
+}
+
+export function clearReconciledWorkspaceArchives(
+  serverId: string,
+  records: readonly PendingWorkspaceArchive[],
+): void {
+  const current = pendingWorkspaceArchivesByServer.get(serverId.trim());
+  for (const record of records) {
+    const input = { serverId, workspaceId: record.workspaceId };
+    if (current?.get(pendingArchiveKey(input)) === record && record.uncertain)
+      clearWorkspaceArchivePending(input);
+  }
 }

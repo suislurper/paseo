@@ -1,3 +1,4 @@
+import type { RemotePreservation } from "@getpaseo/protocol/messages";
 import { useState, useCallback, useEffect, useMemo, type ReactElement } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useTranslation } from "react-i18next";
@@ -225,14 +226,14 @@ function resolveWorkspaceArchiveRisk(
   gitStatus: CheckoutStatusPayload | null,
 ): {
   isDirty: boolean | null | undefined;
-  aheadOfOrigin: number | null | undefined;
+  remotePreservation: RemotePreservation | null | undefined;
   originDefaultRelation: OriginDefaultRelation | null | undefined;
 } {
   const statusRelation =
     gitStatus && gitStatus.isGit ? (gitStatus.originDefaultRelation ?? undefined) : undefined;
   return {
     isDirty: gitStatus?.isDirty ?? workspace?.gitRuntime?.isDirty,
-    aheadOfOrigin: gitStatus?.aheadOfOrigin ?? workspace?.gitRuntime?.aheadOfOrigin,
+    remotePreservation: gitStatus?.remotePreservation ?? workspace?.gitRuntime?.remotePreservation,
     originDefaultRelation: statusRelation ?? workspace?.gitRuntime?.originDefaultRelation ?? null,
   };
 }
@@ -244,7 +245,7 @@ function canArchiveWorkspace(
   return (
     workspace !== null &&
     (workspace.workspaceKind !== "worktree" ||
-      (risk.isDirty !== undefined && risk.aheadOfOrigin !== undefined))
+      (risk.isDirty !== undefined && risk.remotePreservation !== undefined))
   );
 }
 
@@ -275,7 +276,7 @@ function useWorkspaceScreenArchiveController({
     workspaceKind: workspaceDescriptor?.workspaceKind ?? "directory",
     name: workspaceDescriptor?.name ?? branchLabel,
     isDirty: archiveRisk.isDirty,
-    aheadOfOrigin: archiveRisk.aheadOfOrigin,
+    remotePreservation: archiveRisk.remotePreservation,
     originDefaultRelation: archiveRisk.originDefaultRelation,
     diffStat: workspaceDescriptor?.diffStat ?? null,
     warningLabels: getWorktreeArchiveWarningLabels(t),
@@ -1104,20 +1105,14 @@ function getWorktreeArchiveWarningLabels(
           : "workspace.git.actions.archiveWarning.deletedLines",
         { count },
       ),
-    unpushedCommit: (count) =>
-      t(
-        count === 1
-          ? "workspace.git.actions.archiveWarning.unpushedCommit"
-          : "workspace.git.actions.archiveWarning.unpushedCommits",
-        { count },
-      ),
+    unpreservedCommits: (count) =>
+      t("workspace.git.actions.archiveWarning.unpreservedCommits", { count }),
+    preservedNotMerged: t("workspace.git.actions.archiveWarning.preservedNotMerged"),
+    preservedMergeUnknown: t("workspace.git.actions.archiveWarning.preservedMergeUnknown"),
+    statusUnknown: t("workspace.git.actions.archiveWarning.statusUnknown"),
     includedInOriginDefault: (resolvedRef) =>
-      t("workspace.git.actions.archiveWarning.includedInOriginDefault", {
-        resolvedRef: resolvedRef || "origin/default",
-      }),
+      t("workspace.git.actions.archiveWarning.mergedIntoDefault", { resolvedRef }),
     patchEquivalentToOriginDefault: (resolvedRef) =>
-      t("workspace.git.actions.archiveWarning.patchEquivalentToOriginDefault", {
-        resolvedRef: resolvedRef || "origin/default",
-      }),
+      t("workspace.git.actions.archiveWarning.equivalentToMerged", { resolvedRef }),
   };
 }

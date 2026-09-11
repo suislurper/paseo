@@ -54,15 +54,35 @@ The provider still owns the underlying runtime. Paseo keeps an agent record so t
 
 Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is closed, and the agent disappears from active lists. Archive is **global** — it lives on the server and propagates to every connected client.
 
-Archiving a worktree-kind workspace is also a filesystem operation. It is
-accepted only when Paseo owns the backing worktree; on the last active
-workspace reference, Paseo runs teardown and removes that worktree. An
-externally created worktree is rejected before its workspace or agents are
-archived, so the UI cannot report success while leaving an unexpected checkout
-on disk. External worktrees must be removed with Git or explicitly hidden
-without deleting files. When a repository defines its own worktree closeout,
-that procedure overrides generic `archive_worktree`. The shared parent
-workspace of a temporary child is never the child's cleanup target.
+Workspace archival and checkout removal are separate outcomes. Archival keeps
+conversation records; `cleanup.status` reports `removed`, `retained` with the
+specific hold, or `failed`. External workspaces can archive records while retaining
+their files. On eligible Paseo-owned worktrees, cleanup checks active references,
+processes, the shared implementation lock, ignored/protected files and fresh remote
+preservation before non-forced Git removal. Teardown failures retain files. See
+[origin-default-relation.md](origin-default-relation.md) for the complete contract.
+
+Use `archive_workspace` with `{ workspaceId, mode: "archive_only" }`, or
+`paseo workspace archive <workspace-id> --record-only`, when the repository owns
+checkout closeout. The record-only mode stops owned agents/terminals but never runs
+worktree teardown or removes files. A host capability gate prevents an older daemon
+from ignoring the mode. Never archive a shared parent workspace just to clean up a
+temporary child.
+
+Complete temporary-work closeout in order:
+
+1. Finish or preserve code and verify any required remote preservation.
+2. Prove workers are terminal and their write locks released; inspect partial work.
+3. Archive temporary agents after consuming their results.
+4. Release their exact scratch generations with `release_agent_scratch`; an archived
+   GUI record or old timestamp is insufficient ownership evidence.
+5. Archive the owned workspace record, then use repository closeout where defined.
+6. Report retained checkout/scratch holds separately from archival success.
+
+Released scratch is a separate retention category from retained artifacts and
+conversations. The existing maintenance lane can collect eligible released scratch
+after ten days; historical active manifests require ownership reconciliation before
+release. No new cleanup agent or schedule is required.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). If the same request created a Paseo worktree through its `worktree` field, auto-archive archives that worktree too, which removes the agent records inside the worktree.
 
@@ -77,8 +97,8 @@ Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/
 Cascade is what keeps subagent fleets from outliving their orchestrator.
 
 Workspace archive is a separate lifecycle. Archiving an agent does not archive its
-workspace. Archiving or removing a worktree can close a surviving
-agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the
+workspace. Historical cleanup paths may have left a closed
+agent record without setting its `archivedAt`, while its `workspaceId` still points at the
 archived workspace. History navigation must not infer workspace lifecycle from `agent.archivedAt`
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state;
 only the route's explicit Unarchive or Restore action changes the archived workspace.

@@ -4,6 +4,7 @@ export interface TerminalRow {
   id: string;
   name: string;
   cwd: string;
+  workspaceId?: string;
 }
 
 export interface TerminalKillRow {
@@ -33,6 +34,7 @@ export function toTerminalRow(
     id: string;
     name: string;
     cwd?: string;
+    workspaceId?: string;
   },
   cwd?: string,
 ): TerminalRow {
@@ -40,5 +42,6 @@ export function toTerminalRow(
     id: terminal.id,
     name: terminal.name,
     cwd: terminal.cwd ?? cwd ?? "-",
+    ...(terminal.workspaceId === undefined ? {} : { workspaceId: terminal.workspaceId }),
   };
 }

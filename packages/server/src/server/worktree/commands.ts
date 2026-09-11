@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { getPaseoWorktreesRoot, isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
 import {
   archiveByScope,
+  type ArchiveCleanup,
   resolveWorkspaceIdAtPath,
   type ArchiveDependencies,
   type ArchiveScope,
@@ -113,6 +114,7 @@ export type ArchiveCommandResult =
   | {
       ok: true;
       removedAgents: string[];
+      cleanup?: ArchiveCleanup;
     }
   | {
       ok: false;
@@ -147,9 +149,18 @@ export async function archiveCommand(
       requestId: input.requestId,
     });
 
+    if (!result.archivalComplete) {
+      return {
+        ok: false,
+        code: "NOT_ALLOWED",
+        message: "Some workspace records could not be archived; files retained.",
+        removedAgents: [],
+      };
+    }
     return {
       ok: true,
       removedAgents: result.archivedAgentIds,
+      cleanup: result.cleanup,
     };
   }
 
@@ -172,9 +183,18 @@ export async function archiveCommand(
     requestId: input.requestId,
   });
 
+  if (!result.archivalComplete) {
+    return {
+      ok: false,
+      code: "NOT_ALLOWED",
+      message: "Workspace records could not be archived; files retained.",
+      removedAgents: [],
+    };
+  }
   return {
     ok: true,
     removedAgents: result.archivedAgentIds,
+    cleanup: result.cleanup,
   };
 }
 

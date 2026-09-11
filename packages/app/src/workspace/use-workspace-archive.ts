@@ -1,3 +1,4 @@
+import type { RemotePreservation } from "@getpaseo/protocol/messages";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -30,7 +31,7 @@ export interface ArchiveWorkspaceInput {
   workspaceKind: WorkspaceDescriptor["workspaceKind"];
   name: string;
   isDirty?: boolean | null;
-  aheadOfOrigin?: number | null;
+  remotePreservation?: RemotePreservation | null;
   originDefaultRelation?: OriginDefaultRelation | null;
   diffStat?: { additions: number; deletions: number } | null;
   warningLabels?: WorktreeArchiveWarningLabels;
@@ -49,7 +50,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
     workspaceKind,
     name,
     isDirty,
-    aheadOfOrigin,
+    remotePreservation,
     originDefaultRelation,
     diffStat,
     warningLabels = DEFAULT_WORKTREE_ARCHIVE_WARNING_LABELS,
@@ -68,7 +69,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
     onSetHiding?.(true);
     try {
       onArchiveStarted();
-      await archiveWorkspaceOptimistically({
+      const cleanup = await archiveWorkspaceOptimistically({
         client,
         workspace: {
           serverId,
@@ -76,6 +77,14 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
         },
       });
       purgeArchivedWorkspaceState({ serverId, workspaceId });
+      let message = t("sidebar.workspace.toasts.archivedCleanupUnknown");
+      if (cleanup?.status === "removed")
+        message = t("sidebar.workspace.toasts.archivedFilesRemoved");
+      if (cleanup?.status === "retained")
+        message = t("sidebar.workspace.toasts.archivedFilesRetained", {
+          reason: cleanup.reason ?? t("sidebar.workspace.toasts.cleanupUnknown"),
+        });
+      toast.show(message, { durationMs: 6000 });
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : t("sidebar.workspace.toasts.archiveFailed"),
@@ -92,7 +101,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
           {
             workspaceName: name,
             isDirty,
-            aheadOfOrigin,
+            remotePreservation,
             originDefaultRelation,
             diffStat,
           },
@@ -105,7 +114,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
       await archiveWorkspaceRecord();
     })();
   }, [
-    aheadOfOrigin,
+    remotePreservation,
     archiveWorkspaceRecord,
     diffStat,
     isDirty,

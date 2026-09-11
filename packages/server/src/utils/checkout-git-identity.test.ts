@@ -108,3 +108,52 @@ test("preserves Paseo-owned worktree identity", async () => {
     isPaseoOwnedWorktree: true,
   });
 });
+test("coalesces identical concurrent identity reads", async () => {
+  const { repo } = createRepository();
+  const nested = join(repo, "nested-coalesced");
+  mkdirSync(nested);
+  const callsBefore = vi.mocked(runGitCommand).mock.calls.length;
+  const [firstResult, secondResult] = await Promise.all([
+    getCheckoutIdentity(nested),
+    getCheckoutIdentity(nested),
+  ]);
+  expect(secondResult).toEqual(firstResult);
+  const sharedCalls = vi.mocked(runGitCommand).mock.calls.length - callsBefore;
+  expect(sharedCalls).toBeGreaterThan(0);
+  vi.clearAllMocks();
+  const solo = join(repo, "nested-solo");
+  mkdirSync(solo);
+  await getCheckoutIdentity(solo);
+  const soloCalls = vi.mocked(runGitCommand).mock.calls.length;
+  expect(soloCalls).toBeGreaterThan(0);
+  expect(sharedCalls).toBe(soloCalls);
+});
+
+test("distinct checkout contexts do not share inflight identity reads", async () => {
+  const { repo } = createRepository();
+  const nested = join(repo, "nested-contexts");
+  mkdirSync(nested);
+  vi.clearAllMocks();
+  const [firstResult, secondResult] = await Promise.all([
+    getCheckoutIdentity(nested, { paseoHome: join(repo, "home-a") }),
+    getCheckoutIdentity(nested, { paseoHome: join(repo, "home-b") }),
+  ]);
+  expect(firstResult).toEqual(secondResult);
+  const sharedCalls = vi.mocked(runGitCommand).mock.calls.length;
+  vi.clearAllMocks();
+  await getCheckoutIdentity(nested, { paseoHome: join(repo, "home-a") });
+  const soloCalls = vi.mocked(runGitCommand).mock.calls.length;
+  expect(soloCalls).toBeGreaterThan(0);
+  expect(sharedCalls).toBeGreaterThan(soloCalls);
+});
+
+test("context tuples cannot collide at field boundaries", async () => {
+  const { repo } = createRepository();
+  const nested = join(repo, "boundary");
+  mkdirSync(nested);
+  // Concatenating fields makes these distinct contexts share a key.
+  const first = getCheckoutIdentity(nested, { paseoHome: "a", worktreesRoot: "bc" });
+  const second = getCheckoutIdentity(nested, { paseoHome: "ab", worktreesRoot: "c" });
+  expect(first).not.toBe(second);
+  await Promise.all([first, second]);
+});

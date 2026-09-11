@@ -1328,4 +1328,173 @@ describe("WorkspaceReconciliationService", () => {
       mainRepoRoot: "/tmp/main-repo",
     });
   });
+  test("concurrent whole scans sharing a registry coalesce into one read", async () => {
+    const rootPath = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-coalesce-")));
+    tempDirs.push(rootPath);
+    const { projects, workspaces, projectRegistry, workspaceRegistry } = createTestRegistries();
+    projects.set(
+      "p1",
+      createPersistedProjectRecord({
+        projectId: "p1",
+        rootPath,
+        kind: "non_git",
+        displayName: "coalesce",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    workspaces.set(
+      "w1",
+      createPersistedWorkspaceRecord({
+        workspaceId: "w1",
+        projectId: "p1",
+        cwd: rootPath,
+        kind: "directory",
+        displayName: "coalesce",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    let reads = 0;
+    const gate = Promise.withResolvers<void>();
+    const first = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      workspaceGitService: {
+        getCheckout: async (cwd: string) => {
+          reads += 1;
+          await gate.promise;
+          return createCheckout(cwd);
+        },
+      },
+      logger: createTestLogger(),
+    });
+    const second = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      workspaceGitService: {
+        getCheckout: async (cwd: string) => {
+          reads += 1;
+          return createCheckout(cwd);
+        },
+      },
+      logger: createTestLogger(),
+    });
+
+    const pending = Promise.all([first.runOnce(), second.runOnce()]);
+    await Promise.resolve();
+    await Promise.resolve();
+    gate.resolve();
+    const [firstResult, secondResult] = await pending;
+
+    expect(firstResult.changesApplied).toEqual(secondResult.changesApplied);
+    expect(reads).toBe(1);
+  });
+
+  test("whole scans with isolated registries do not share inflight reads", async () => {
+    const rootPath = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-isolated-")));
+    tempDirs.push(rootPath);
+    const firstRegistries = createTestRegistries();
+    const secondRegistries = createTestRegistries();
+    for (const registries of [firstRegistries, secondRegistries]) {
+      registries.projects.set(
+        "p1",
+        createPersistedProjectRecord({
+          projectId: "p1",
+          rootPath,
+          kind: "non_git",
+          displayName: "isolated",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+      registries.workspaces.set(
+        "w1",
+        createPersistedWorkspaceRecord({
+          workspaceId: "w1",
+          projectId: "p1",
+          cwd: rootPath,
+          kind: "directory",
+          displayName: "isolated",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    }
+    let reads = 0;
+    const gate = Promise.withResolvers<void>();
+    const delayedCheckout = async (cwd: string) => {
+      reads += 1;
+      await gate.promise;
+      return createCheckout(cwd);
+    };
+    const first = new WorkspaceReconciliationService({
+      projectRegistry: firstRegistries.projectRegistry,
+      workspaceRegistry: firstRegistries.workspaceRegistry,
+      workspaceGitService: { getCheckout: delayedCheckout },
+      logger: createTestLogger(),
+    });
+    const second = new WorkspaceReconciliationService({
+      projectRegistry: secondRegistries.projectRegistry,
+      workspaceRegistry: secondRegistries.workspaceRegistry,
+      workspaceGitService: { getCheckout: delayedCheckout },
+      logger: createTestLogger(),
+    });
+    const pending = Promise.all([first.runOnce(), second.runOnce()]);
+    gate.resolve();
+    await pending;
+
+    expect(reads).toBe(2);
+  });
+
+  test("a failed whole scan clears inflight state so the next scan retries", async () => {
+    const rootPath = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-retry-")));
+    tempDirs.push(rootPath);
+    const { projects, workspaces, projectRegistry, workspaceRegistry } = createTestRegistries();
+    projects.set(
+      "p1",
+      createPersistedProjectRecord({
+        projectId: "p1",
+        rootPath,
+        kind: "non_git",
+        displayName: "retry",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    workspaces.set(
+      "w1",
+      createPersistedWorkspaceRecord({
+        workspaceId: "w1",
+        projectId: "p1",
+        cwd: rootPath,
+        kind: "directory",
+        displayName: "retry",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    let reads = 0;
+    const service = new WorkspaceReconciliationService({
+      projectRegistry: {
+        ...projectRegistry,
+        list: async () => {
+          reads += 1;
+          if (reads === 1) throw new Error("registry unavailable");
+          return projectRegistry.list();
+        },
+      },
+      workspaceRegistry,
+      workspaceGitService: {
+        getCheckout: async (cwd: string) => createCheckout(cwd),
+      },
+      logger: createTestLogger(),
+    });
+
+    await expect(service.runOnce()).rejects.toThrow("registry unavailable");
+    const result = await service.runOnce();
+
+    expect(result.changesApplied).toEqual([]);
+    expect(reads).toBe(2);
+  });
 });

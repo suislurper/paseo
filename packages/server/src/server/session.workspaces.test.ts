@@ -1,3 +1,5 @@
+import * as cleanupSafety from "../utils/worktree-cleanup-safety.js";
+const inspectDisposableCheckout = cleanupSafety.inspectDisposableCheckout;
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -32,7 +34,7 @@ import type {
   AgentSessionConfig,
   AgentStreamEvent,
 } from "./agent/agent-sdk-types.js";
-import { createWorktree } from "../utils/worktree.js";
+import { computeWorktreePath, createWorktree } from "../utils/worktree.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import {
   readPaseoWorktreeMetadata,
@@ -5517,40 +5519,240 @@ test("archive_workspace_request hides non-destructive workspace records", async 
   expect(response?.payload.error).toBeNull();
 });
 
-test("archive_workspace_request refuses to hide an unmanaged worktree", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "session-unmanaged-worktree-archive-"));
+test("archive_workspace_request preserves archivedAt when the first response fails", async () => {
+  const session = createSessionForWorkspaceTests();
+  const record = createPersistedWorkspaceRecord({
+    workspaceId: "ws-response-failure",
+    projectId: "project",
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  session.workspaceRegistry.get = async () => record;
+  session.workspaceRegistry.list = async () => [record];
+  session.workspaceRegistry.archive = async (_id, archivedAt) => {
+    record.archivedAt = archivedAt;
+  };
+  const emitted: SessionOutboundMessage[] = [];
+  let failed = false;
+  session.emit = (message) => {
+    if (message.type === "archive_workspace_response" && !failed) {
+      failed = true;
+      throw new Error("response failed");
+    }
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  await session.handleMessage({
+    type: "archive_workspace_request",
+    workspaceId: record.workspaceId,
+    requestId: "response-failure",
+  });
+  expect(record.archivedAt).toBeTruthy();
+  expect(findByType(emitted, "archive_workspace_response")?.payload).toMatchObject({
+    archivedAt: record.archivedAt,
+    error: "response failed",
+  });
+});
+
+test("archive_workspace_request archives an external worktree record without deleting files", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-external-worktree-archive-"));
   const workspace = createPersistedWorkspaceRecord({
-    workspaceId: "ws-unmanaged-worktree",
-    projectId: "proj-unmanaged-worktree",
+    workspaceId: "ws-external-worktree",
+    projectId: "proj-external-worktree",
     cwd: tempDir,
     kind: "worktree",
-    displayName: "unmanaged-worktree",
+    displayName: "external-worktree",
     createdAt: "2026-03-01T12:00:00.000Z",
     updatedAt: "2026-03-01T12:00:00.000Z",
   });
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests();
-  let archiveCalls = 0;
 
   session.emit = (message) => {
     if (isSessionOutboundMessage(message)) emitted.push(message);
   };
   session.workspaceRegistry.get = async () => workspace;
-  session.workspaceRegistry.archive = async () => {
-    archiveCalls += 1;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.archive = async (_workspaceId: string, archivedAt: string) => {
+    workspace.archivedAt = archivedAt;
   };
 
   try {
     await session.handleMessage({
       type: "archive_workspace_request",
       workspaceId: workspace.workspaceId,
-      requestId: "req-unmanaged-worktree-archive",
+      requestId: "req-external-worktree-archive",
     });
 
-    expect(archiveCalls).toBe(0);
-    expect(workspace.archivedAt).toBeNull();
+    expect(workspace.archivedAt).toBeTruthy();
+    expect(existsSync(tempDir)).toBe(true);
     const response = findByType(emitted, "archive_workspace_response");
-    expect(response?.payload.error).toContain("not a Paseo-managed worktree");
+    expect(response?.payload.error).toBeNull();
+    expect(response?.payload.archivedAt).toBeTruthy();
+    expect(response?.payload.cleanup).toMatchObject({ status: "retained" });
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("archive_only keeps sibling records and the backing directory", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-archive-only-sibling-"));
+  const target = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-only-target",
+    projectId: "proj-archive-only",
+    cwd: tempDir,
+    kind: "directory",
+    displayName: "target",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const sibling = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-only-sibling",
+    projectId: "proj-archive-only",
+    cwd: tempDir,
+    kind: "directory",
+    displayName: "sibling",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => target;
+  session.workspaceRegistry.list = async () => [target, sibling];
+  session.workspaceRegistry.archive = async (_workspaceId: string, archivedAt: string) => {
+    target.archivedAt = archivedAt;
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: target.workspaceId,
+      requestId: "req-archive-only-sibling",
+      mode: "archive_only",
+    });
+
+    expect(target.archivedAt).toBeTruthy();
+    expect(sibling.archivedAt).toBeNull();
+    expect(existsSync(tempDir)).toBe(true);
+    expect(findByType(emitted, "archive_workspace_response")?.payload.error).toBeNull();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("archive_workspace_request retries residual cleanup for an already-archived record", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-archived-retry-"));
+  const repoDir = path.join(tempDir, "repo");
+  mkdirSync(repoDir, { recursive: true });
+  execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "pipe" });
+  execFileSync("git", ["config", "user.email", "test@getpaseo.local"], {
+    cwd: repoDir,
+    stdio: "pipe",
+  });
+  execFileSync("git", ["config", "user.name", "Paseo Test"], { cwd: repoDir, stdio: "pipe" });
+  execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial"], {
+    cwd: repoDir,
+    stdio: "pipe",
+  });
+  const paseoHome = path.join(tempDir, ".paseo");
+  const worktree = await createWorktree({
+    cwd: repoDir,
+    worktreeSlug: "archived-retry",
+    source: { kind: "branch-off", baseBranch: "main", branchName: "archived-retry" },
+    runSetup: false,
+    paseoHome,
+  });
+  prepareArchiveRemovalFixture(tempDir, repoDir, worktree.worktreePath);
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archived-retry",
+    projectId: "proj-archived-retry",
+    cwd: worktree.worktreePath,
+    kind: "worktree",
+    displayName: "archived-retry",
+    worktreeRoot: worktree.worktreePath,
+    isPaseoOwnedWorktree: true,
+    mainRepoRoot: repoDir,
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  workspace.archivedAt = "2026-03-02T12:00:00.000Z";
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    paseoHome,
+    workspaceGitService: createNoopWorkspaceGitService(),
+  });
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.update = async (_id, updater) => {
+    Object.assign(workspace, updater(workspace));
+    return workspace;
+  };
+  session.workspaceRegistry.archive = async () => {
+    throw new Error("must not unarchive or duplicate an archived record");
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-archived-retry",
+    });
+
+    expect(workspace.archivedAt).toBe("2026-03-02T12:00:00.000Z");
+    expect(existsSync(worktree.worktreePath)).toBe(false);
+    const response = findByType(emitted, "archive_workspace_response");
+    expect(response?.payload.error).toBeNull();
+    expect(response?.payload.archivedAt).toBe("2026-03-02T12:00:00.000Z");
+  } finally {
+    vi.restoreAllMocks();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("archive_workspace_request reports required teardown failure without marking success", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "session-teardown-failure-"));
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-teardown-failure",
+    projectId: "proj-teardown-failure",
+    cwd: tempDir,
+    kind: "directory",
+    displayName: "teardown-failure",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  // A required terminal shutdown failure must not report successful archival.
+  const controller = session.terminalController as {
+    killTerminalsForWorkspace: (workspaceId: string) => Promise<void>;
+  };
+  controller.killTerminalsForWorkspace = async () => {
+    throw new Error("terminal teardown failed");
+  };
+
+  try {
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-teardown-failure",
+    });
+
+    const response = findByType(emitted, "archive_workspace_response");
+    expect(response?.payload.archivedAt).toBeNull();
+    expect(response?.payload.error).toContain("required teardown failed");
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -5593,6 +5795,7 @@ test.each([
       paseoHome,
     });
 
+    prepareArchiveRemovalFixture(tempDir, repoDir, worktree.worktreePath);
     const workspaceId = "ws-worktree-kind-archive";
     const projectId = "proj-worktree-kind-archive";
     const workspace = createPersistedWorkspaceRecord({
@@ -5651,6 +5854,10 @@ test.each([
     };
     session.workspaceRegistry.get = async () => workspace;
     session.workspaceRegistry.list = async () => [workspace];
+    session.workspaceRegistry.update = async (_id, updater) => {
+      Object.assign(workspace, updater(workspace));
+      return workspace;
+    };
     session.workspaceRegistry.archive = async (_id: string, archivedAt: string) => {
       workspace.archivedAt = archivedAt;
     };
@@ -5670,6 +5877,7 @@ test.each([
         | undefined;
       expect(response?.payload.error).toBeNull();
     } finally {
+      vi.restoreAllMocks();
       rmSync(tempDir, { recursive: true, force: true });
     }
   },
@@ -8473,3 +8681,378 @@ test("workspace.create.request reports an archived explicit project", async () =
     errorCode: "archived_project",
   });
 });
+
+function createCreationRetrySession(input: {
+  onMessage?: (message: SessionOutboundMessage) => void;
+  workspaces: Map<string, PersistedWorkspaceRecord>;
+  projects?: Map<string, PersistedProjectRecord>;
+  resolveRepoRoot?: (cwd: string) => Promise<string>;
+}) {
+  const session = createSessionForWorkspaceTests({
+    onMessage: input.onMessage,
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(input.workspaces.values()),
+      get: async (workspaceId: string) => input.workspaces.get(workspaceId) ?? null,
+      upsert: async (workspace) => {
+        input.workspaces.set(workspace.workspaceId, workspace);
+      },
+      archive: async (workspaceId: string, archivedAt: string) => {
+        const current = input.workspaces.get(workspaceId);
+        if (current) input.workspaces.set(workspaceId, { ...current, archivedAt });
+      },
+      remove: async () => {},
+    },
+  });
+  session.listAgentPayloads = async () => [];
+  if (input.projects) {
+    const projects = input.projects;
+    session.projectRegistry.get = async (projectId: string) => projects.get(projectId) ?? null;
+    session.projectRegistry.list = async () => Array.from(projects.values());
+  }
+  if (input.resolveRepoRoot) {
+    const resolveRepoRoot = input.resolveRepoRoot;
+    session.workspaceGitService.resolveRepoRoot = resolveRepoRoot;
+  }
+  return session;
+}
+
+test("workspace.create retries the same ID without creating another workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-same",
+    source: { kind: "directory", path: REPO_CWD },
+    firstAgentContext: { prompt: "original prompt" },
+  });
+  const first = findByType(emitted, "workspace.create.response");
+  expect(first?.payload.error).toBeNull();
+  const workspaceId = first?.payload.workspace?.id;
+  expect(workspaceId).toEqual(expect.any(String));
+  expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
+  const workspaceUpdatesBeforeRetry = filterByType(emitted, "workspace_update").length;
+
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-same",
+    source: { kind: "directory", path: REPO_CWD },
+    firstAgentContext: { prompt: "original prompt" },
+  });
+  const retry = findByType(emitted, "workspace.create.response");
+  expect(retry?.payload).toMatchObject({
+    requestId: "req-retry-same",
+    error: null,
+    creationRequestId: "req-retry-same",
+    creationReconciled: true,
+  });
+  expect(retry?.payload.workspace?.id).toBe(workspaceId);
+  expect(workspaces.size).toBe(1);
+  expect(filterByType(emitted, "workspace_update")).toHaveLength(workspaceUpdatesBeforeRetry);
+});
+
+test("workspace.create rejects the same ID with changed input and archived IDs stay archived", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-mismatch",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  expect(findByType(emitted, "workspace.create.response")?.payload.error).toBeNull();
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-mismatch",
+    source: { kind: "directory", path: REPO_CWD },
+    firstAgentContext: { prompt: "changed" },
+  });
+  expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+    workspace: null,
+    errorCode: "creation_request_mismatch",
+  });
+  expect(workspaces.size).toBe(1);
+
+  const persistedId = Array.from(workspaces.keys())[0] as string;
+  const persisted = workspaces.get(persistedId);
+  if (persisted)
+    workspaces.set(persistedId, { ...persisted, archivedAt: "2026-09-11T00:00:00.000Z" });
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-retry-mismatch",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+    workspace: null,
+    errorCode: "creation_attempt_archived",
+    creationArchived: true,
+  });
+  expect(workspaces.size).toBe(1);
+});
+
+test("workspace.create keeps different IDs in the same directory distinct", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-same-dir-one",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-same-dir-two",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+  const responses = emitted.filter((message) => message.type === "workspace.create.response");
+  expect(responses).toHaveLength(2);
+  expect(responses[0]?.payload.workspace?.id).not.toBe(responses[1]?.payload.workspace?.id);
+  expect(workspaces.size).toBe(2);
+});
+
+test("workspace.create coalesces simultaneous same-ID requests into one workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createCreationRetrySession({
+    onMessage: (message) => emitted.push(message),
+    workspaces,
+  });
+  session.listAgentPayloads = async () => [];
+
+  await Promise.all([
+    session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-concurrent-same",
+      source: { kind: "directory", path: REPO_CWD },
+    }),
+    session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-concurrent-same",
+      source: { kind: "directory", path: REPO_CWD },
+    }),
+  ]);
+  const responses = emitted.filter((message) => message.type === "workspace.create.response");
+  expect(responses).toHaveLength(2);
+  expect(responses[0]?.payload.workspace?.id).toBe(responses[1]?.payload.workspace?.id);
+  expect(workspaces.size).toBe(1);
+});
+
+test("workspace.create rejects an orphan normalized target instead of a suffixed duplicate", async () => {
+  const tempRoot = mkdtempSync(path.join(tmpdir(), "workspace-create-orphan-"));
+  const repoRoot = path.join(tempRoot, "repo");
+  const paseoHome = path.join(tempRoot, "home");
+  mkdirSync(repoRoot, { recursive: true });
+  try {
+    const emitted: SessionOutboundMessage[] = [];
+    const workspaces = new Map<string, PersistedWorkspaceRecord>();
+    const session = createCreationRetrySession({
+      onMessage: (message) => emitted.push(message),
+      workspaces,
+      resolveRepoRoot: async () => repoRoot,
+    });
+    session.listAgentPayloads = async () => [];
+    session.paseoHome = paseoHome;
+    const orphanPath = await computeWorktreePath(repoRoot, "my-feature", paseoHome);
+    mkdirSync(orphanPath, { recursive: true });
+
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-orphan-normalized",
+      source: { kind: "worktree", cwd: repoRoot, worktreeSlug: "My Feature" },
+    });
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      workspace: null,
+      errorCode: "creation_target_ambiguous",
+    });
+    expect(workspaces.size).toBe(0);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace.create shares a flight across sessions and recovers its identity after registry reload", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "workspace-create-reload-"));
+  const registryPath = path.join(root, "workspaces.json");
+  const logger = asSessionLogger(createTestLogger());
+  try {
+    const registry = new FileBackedWorkspaceRegistry(registryPath, logger);
+    await registry.initialize();
+    const emitted: SessionOutboundMessage[] = [];
+    const options = {
+      workspaceRegistry: registry,
+      onMessage: (message: SessionOutboundMessage) => emitted.push(message),
+    };
+    const first = createSessionForWorkspaceTests(options);
+    const second = createSessionForWorkspaceTests(options);
+    const request = {
+      type: "workspace.create.request" as const,
+      requestId: "persisted-flight",
+      source: { kind: "directory" as const, path: REPO_CWD },
+    };
+    await Promise.all([first.handleMessage(request), second.handleMessage(request)]);
+    const responses = filterByType(emitted, "workspace.create.response");
+    expect(responses).toHaveLength(2);
+    expect(responses[0]?.payload.error).toBeNull();
+    expect(responses[0]?.payload.workspace?.id).toBe(responses[1]?.payload.workspace?.id);
+    expect(await registry.list()).toHaveLength(1);
+    const reloaded = new FileBackedWorkspaceRegistry(registryPath, logger);
+    await reloaded.initialize();
+    const writes = vi.spyOn(reloaded, "upsert");
+    const third = createSessionForWorkspaceTests({ ...options, workspaceRegistry: reloaded });
+    emitted.length = 0;
+    await third.handleMessage(request);
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      error: null,
+      creationReconciled: true,
+      workspace: { id: responses[0]?.payload.workspace?.id },
+    });
+    expect(writes).not.toHaveBeenCalled();
+    expect((await reloaded.list())[0]).toMatchObject({
+      creationRequestId: request.requestId,
+      creationFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function prepareArchiveRemovalFixture(tempDir: string, repoDir: string, worktree: string): void {
+  const remote = path.join(tempDir, "preservation.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+  execFileSync("git", ["remote", "add", "preservation", remote], { cwd: repoDir });
+  execFileSync("git", ["push", "preservation", "HEAD:refs/heads/saved"], {
+    cwd: worktree,
+    stdio: "pipe",
+  });
+  const procRoot = path.join(tempDir, "proc");
+  mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  writeFileSync(path.join(procRoot, "self", "mountinfo"), "1 0 0:1 / / rw - ext4 /dev/root rw\n");
+  vi.spyOn(cleanupSafety, "inspectDisposableCheckout").mockImplementation((cwd) =>
+    inspectDisposableCheckout(cwd, { procRoot }),
+  );
+}
+
+test.each(["unknown_project", "archived_project"] as const)(
+  "workspace.create worktree source reports definitive %s",
+  async (code) => {
+    const emitted: SessionOutboundMessage[] = [];
+    const session = createSessionForWorkspaceTests({
+      onMessage: (message) => emitted.push(message),
+    });
+    session.projectRegistry.get = async () =>
+      code === "unknown_project"
+        ? null
+        : createPersistedProjectRecord({
+            projectId: "stale-project",
+            rootPath: REPO_CWD,
+            kind: "git",
+            displayName: "stale",
+            createdAt: "2026-09-11T00:00:00Z",
+            updatedAt: "2026-09-11T00:00:00Z",
+            archivedAt: "2026-09-11T00:00:00Z",
+          });
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "stale-worktree-" + code,
+      source: { kind: "worktree", projectId: "stale-project" },
+    });
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      workspace: null,
+      errorCode: code,
+    });
+  },
+);
+
+test.each([true, false])(
+  "archive reads on a reconnected session await pre-record teardown (success=%s)",
+  async (success) => {
+    const root = mkdtempSync(path.join(tmpdir(), "archive-read-barrier-"));
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(root, "workspaces.json"),
+      asSessionLogger(createTestLogger()),
+    );
+    await registry.initialize();
+    const record = createPersistedWorkspaceRecord({
+      workspaceId: "barrier-workspace",
+      projectId: "barrier-project",
+      cwd: root,
+      kind: "directory",
+      displayName: "barrier",
+      createdAt: "2026-09-11T00:00:00Z",
+      updatedAt: "2026-09-11T00:00:00Z",
+    });
+    await registry.upsert(record);
+    const emitted: SessionOutboundMessage[] = [];
+    const first = createSessionForWorkspaceTests({ workspaceRegistry: registry });
+    const second = createSessionForWorkspaceTests({
+      workspaceRegistry: registry,
+      onMessage: (message) => emitted.push(message),
+    });
+    let finishTeardown!: () => void;
+    let startedTeardown!: () => void;
+    const teardownStarted = new Promise<void>((resolve) => {
+      startedTeardown = resolve;
+    });
+    const teardown = new Promise<void>((resolve) => {
+      finishTeardown = resolve;
+    });
+    first.terminalController.killTerminalsForWorkspace = async () => {
+      startedTeardown();
+      await teardown;
+      if (!success) throw new Error("teardown failed");
+    };
+    try {
+      const archive = first.handleMessage({
+        type: "archive_workspace_request",
+        workspaceId: record.workspaceId,
+        requestId: "slow-archive",
+        mode: "archive_only",
+      });
+      await teardownStarted;
+      const inspection = second.handleMessage({
+        type: "workspace.recovery.inspect.request",
+        workspaceId: record.workspaceId,
+        requestId: "reconnect-inspect",
+      });
+      const fetch = second.handleMessage({
+        type: "fetch_workspaces_request",
+        requestId: "reconnect-fetch",
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(findByType(emitted, "workspace.recovery.inspect.response")).toBeUndefined();
+      expect(findByType(emitted, "fetch_workspaces_response")).toBeUndefined();
+      expect((await registry.get(record.workspaceId))?.archivedAt).toBeNull();
+      finishTeardown();
+      await Promise.all([archive, inspection, fetch]);
+      const state = findByType(emitted, "workspace.recovery.inspect.response")?.payload.state;
+      expect(state).toBeDefined();
+      if (success) expect(state).not.toMatchObject({ reason: "workspace_not_archived" });
+      else expect(state).toMatchObject({ reason: "workspace_not_archived" });
+      const entries = findByType(emitted, "fetch_workspaces_response")?.payload.entries;
+      expect(entries?.some((entry) => entry.id === record.workspaceId)).toBe(!success);
+    } finally {
+      finishTeardown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

@@ -215,6 +215,51 @@ The supervisor rotates `daemon.log`. Persisted `log.file.rotate` settings in
 `PASEO_LOG_ROTATE_SIZE` and `PASEO_LOG_ROTATE_COUNT` env vars override the
 defaults. The default rotation is `10m` x `3` files everywhere.
 
+Git command metrics (`startGitCommandMetrics` / `stopGitCommandMetrics` in
+`packages/server/src/utils/run-git-command.ts`) record `queueWaitMs` (time spent
+waiting for the shared git limiter), `durationMs` (execution only), and
+`totalDurationMs` (queue plus execution). The CLI identifies each invocation with
+an ephemeral process-scoped client id; it performs no `HOME` IO for identity.
+
+### Pending workspace creation
+
+A client timeout does not cancel daemon work. Both GUI creation interfaces retain a
+frozen request ID, source, slug and initial prompt until creation is confirmed or
+a definitive failure is returned. Use **Check again** to reconcile that same
+attempt; a separate intentional workspace gets a new ID, even in the same directory.
+
+The daemon coalesces same-ID requests across sessions using the shared registry
+and persists the ID plus an input fingerprint on the workspace record. A reconnect
+or registry reload returns that record without repeating creation. Changed input,
+archived attempts and leftover target directories have explicit errors. Target
+preflight uses the same slug normalization as worktree creation.
+
+Safe retries require `server_info.features.workspaceCreationRetry` at the original
+dispatch. An uncertain first creation on an older host must be inspected before
+starting another attempt; upgrading the host does not make that old request
+replayable. Repeated clicks are held while a submission is running.
+
+### Archive confirmation and cleanup
+
+An archive transport timeout leaves the workspace hidden and pending. The client
+uses a read-only recovery inspection to confirm durable archival or an active
+workspace; it never repeats archival to discover the outcome. If the host cannot
+confirm either state, reconnecting reconciles the pending operation against a
+fresh complete directory snapshot. A fetch started before the uncertain result,
+or before a newer archive attempt, cannot clear that attempt's suppression.
+Unknown cleanup status is shown explicitly instead of claiming files were retained.
+
+Recovery and directory reads wait for archive requests on the shared registry to
+finish before reporting active state. Requests register before their first await;
+reads retry if another archive starts or finishes while the snapshot is being
+read. Thus a slow pre-record agent shutdown cannot produce false rollback proof.
+A read timeout leaves the client pending until a later confirmation.
+
+Cleanup checks Linux mount source paths as well as mount points, using filesystem
+roots and device identities from mountinfo. A checkout bind-mounted elsewhere,
+including through an ancestor alias or a separate home filesystem, is retained.
+Unresolvable mount metadata also prevents removal.
+
 ### Agent Tool Catalog Measurement
 
 Measure the MCP `tools/list` payload that Paseo injects into agents with:

@@ -122,6 +122,140 @@ describe("archiveWorkspaceOptimistically", () => {
     expect(storedWorkspace(archived.id)).toBeUndefined();
   });
 
+  it.each(["retained", "failed"] as const)(
+    "keeps an archived workspace hidden when cleanup is %s",
+    async (status) => {
+      const archived = workspace();
+      useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+      const cleanup = { status, reason: "files are still in use" };
+      const client = createClient(
+        vi.fn(async () => ({
+          ...archivePayload({ workspaceId: archived.id, error: "cleanup did not complete" }),
+          archivedAt: "2026-09-11T00:00:00Z",
+          cleanup,
+        })),
+      );
+      await expect(
+        archiveWorkspaceOptimistically({ client, workspace: target() }),
+      ).resolves.toEqual(cleanup);
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+    },
+  );
+
+  it("keeps durable archival hidden when cleanup exceeds the 60-second client deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const archived = workspace();
+      useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+      let serverArchived = false;
+      const client = {
+        archiveWorkspace: async () => {
+          serverArchived = true;
+          return new Promise<ArchiveWorkspacePayload>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("RPC timed out")), 60_000),
+          );
+        },
+        inspectWorkspaceRecovery: async () => {
+          expect(serverArchived).toBe(true);
+          return {
+            kind: "recoverable" as const,
+            workspaceId: archived.id,
+            workspaceName: "archived",
+            action: "unarchive",
+            branch: "feature",
+          };
+        },
+      };
+      const outcome = archiveWorkspaceOptimistically({ client, workspace: target() });
+      await vi.advanceTimersByTimeAsync(60_001);
+      await expect(outcome).resolves.toMatchObject({ status: "failed" });
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays hidden while pre-record teardown continues beyond the RPC deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const archived = workspace();
+      useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+      let serverArchived = false;
+      let finishServer!: () => void;
+      const serverFinished = new Promise<void>((resolve) => {
+        finishServer = resolve;
+      });
+      const client = {
+        archiveWorkspace: async () =>
+          new Promise<ArchiveWorkspacePayload>((_resolve, reject) => {
+            setTimeout(() => reject(new Error("RPC timed out")), 60_000);
+          }),
+        inspectWorkspaceRecovery: async () => {
+          // The daemon's shared-registry barrier waits before reading active state.
+          expect(serverArchived).toBe(false);
+          await serverFinished;
+          return {
+            kind: "recoverable" as const,
+            workspaceId: archived.id,
+            workspaceName: "archived",
+            action: "unarchive",
+            branch: "feature",
+          };
+        },
+      };
+      const outcome = archiveWorkspaceOptimistically({ client, workspace: target() });
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(serverArchived).toBe(false);
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+      expect(isWorkspaceArchivePending({ serverId: SERVER_ID, workspaceId: archived.id })).toBe(
+        true,
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      serverArchived = true;
+      finishServer();
+      await expect(outcome).resolves.toMatchObject({ status: "failed" });
+      expect(storedWorkspace(archived.id)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an ambiguous disconnected archive hidden until authoritative reconciliation", async () => {
+    const archived = workspace();
+    useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+    const client = createClient(
+      vi.fn(async () => {
+        throw new Error("connection closed");
+      }),
+    );
+    await expect(archiveWorkspaceOptimistically({ client, workspace: target() })).rejects.toThrow(
+      "not been confirmed",
+    );
+    expect(storedWorkspace(archived.id)).toBeUndefined();
+    expect(isWorkspaceArchivePending({ serverId: SERVER_ID, workspaceId: archived.id })).toBe(true);
+  });
+
+  it("restores after a transport failure only when the host proves the record is active", async () => {
+    const archived = workspace();
+    useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);
+    const client = {
+      archiveWorkspace: vi.fn(async () => {
+        throw new Error("connection closed");
+      }),
+      inspectWorkspaceRecovery: vi.fn(async () => ({
+        kind: "unavailable" as const,
+        workspaceId: archived.id,
+        reason: "workspace_not_archived",
+        message: "active",
+      })),
+    };
+    await expect(archiveWorkspaceOptimistically({ client, workspace: target() })).rejects.toThrow(
+      "connection closed",
+    );
+    expect(client.inspectWorkspaceRecovery).toHaveBeenCalledWith(archived.id);
+    expect(storedWorkspace(archived.id)).toEqual(archived);
+  });
+
   it("restores the workspace and clears pending state when the daemon rejects the archive", async () => {
     const archived = workspace();
     useSessionStore.getState().mergeWorkspaces(SERVER_ID, [archived]);

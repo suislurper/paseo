@@ -81,7 +81,7 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
     };
   }
 
-  it("labels exact and included as Included in origin/default rather than unpushed", () => {
+  it("labels exact and included as merged without inferring remote preservation", () => {
     for (const state of ["exact", "included"] as const) {
       const entry = createSidebarWorkspaceEntry({
         serverId: "srv",
@@ -94,9 +94,28 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
         }),
       });
       // Feature branch currentBranch in workspaceWithRelation — not a tautology.
-      expect(entry.originDefaultRelationLabel).toBe("Included in origin/master");
-      expect(entry.archiveUnpushedCommitCount).toBe(3);
+      expect(entry.originDefaultRelationLabel).toBe("Merged into master");
+      expect(entry.archiveRemotePreservation).toBeNull();
     }
+  });
+
+  it("threads preserved remote history independently of ahead-of-default counts", () => {
+    const preservedWorkspace = workspaceWithRelation({
+      state: "ahead",
+      resolvedRef: "origin/master",
+      ahead: 9,
+      behind: 0,
+      uniquePatchCount: 9,
+    });
+    const remotePreservation = {
+      state: "preserved" as const,
+      ref: "origin/archive/feature",
+      localCommitCount: 0,
+    };
+    preservedWorkspace.gitRuntime = { ...preservedWorkspace.gitRuntime, remotePreservation };
+    const entry = createSidebarWorkspaceEntry({ serverId: "srv", workspace: preservedWorkspace });
+    expect(entry.archiveRemotePreservation).toEqual(remotePreservation);
+    expect(entry.originDefaultRelationLabel).toBe("Preserved remotely; not merged");
   });
 
   it("suppresses exact label on ordinary default-branch checkout", () => {
@@ -134,7 +153,7 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
         uniquePatchCount: 0,
       }),
     });
-    expect(entry.originDefaultRelationLabel).toBe("Included in origin/master");
+    expect(entry.originDefaultRelationLabel).toBe("Merged into master");
   });
 
   it("labels patch-equivalent with short plain copy", () => {
@@ -148,12 +167,10 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
         uniquePatchCount: 0,
       }),
     });
-    expect(entry.originDefaultRelationLabel).toBe(
-      "Changes landed in origin/master (branch not merged)",
-    );
+    expect(entry.originDefaultRelationLabel).toBe("Changes equivalent to merged work");
   });
 
-  it("labels ahead with the unpushed count", () => {
+  it("keeps preservation unknown when only ahead counts are available", () => {
     const entry = createSidebarWorkspaceEntry({
       serverId: "srv",
       workspace: workspaceWithRelation(
@@ -167,10 +184,10 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
         2,
       ),
     });
-    expect(entry.originDefaultRelationLabel).toBe("2 unpushed commits");
+    expect(entry.originDefaultRelationLabel).toBe("Status unknown");
   });
 
-  it("labels unverifiable with the unpushed count when present", () => {
+  it("keeps unverifiable status unknown despite upstream counts", () => {
     const entry = createSidebarWorkspaceEntry({
       serverId: "srv",
       workspace: workspaceWithRelation({
@@ -181,10 +198,10 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
         uniquePatchCount: null,
       }),
     });
-    expect(entry.originDefaultRelationLabel).toBe("3 unpushed commits");
+    expect(entry.originDefaultRelationLabel).toBe("Status unknown");
   });
 
-  it("falls back to legacy unpushed labeling when relation is missing (old daemon)", () => {
+  it("shows unknown when the old daemon omits preservation evidence", () => {
     const entry = createSidebarWorkspaceEntry({
       serverId: "srv",
       workspace: {
@@ -197,18 +214,16 @@ describe("createSidebarWorkspaceEntry originDefaultRelation labels", () => {
       },
     });
     expect(entry.archiveOriginDefaultRelation).toBeNull();
-    expect(entry.originDefaultRelationLabel).toBe("4 unpushed commits");
+    expect(entry.originDefaultRelationLabel).toBe("Status unknown");
   });
 });
 
 describe("appendSidebarRelationLabel", () => {
   it("appends relation labels to project/host subtitles", () => {
-    expect(appendSidebarRelationLabel("paseo", "Included in origin/master")).toBe(
-      "paseo · Included in origin/master",
+    expect(appendSidebarRelationLabel("paseo", "Merged into master")).toBe(
+      "paseo · Merged into master",
     );
-    expect(appendSidebarRelationLabel(null, "Included in origin/master")).toBe(
-      "Included in origin/master",
-    );
+    expect(appendSidebarRelationLabel(null, "Merged into master")).toBe("Merged into master");
     expect(appendSidebarRelationLabel("paseo", null)).toBe("paseo");
   });
 });

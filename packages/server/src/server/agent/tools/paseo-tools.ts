@@ -24,6 +24,8 @@ import { ensureAgentLoaded } from "../agent-loading.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
 import {
   killTerminalsForWorkspace,
+  archiveByScope,
+  persistArchivedWorkspaceHeads,
   type ArchiveDependencies,
 } from "../../workspace-archive-service.js";
 import {
@@ -106,7 +108,7 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "upsert">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "upsert" | "list" | "update">;
   markWorkspaceArchiving?: ArchiveDependencies["markWorkspaceArchiving"];
   clearWorkspaceArchiving?: ArchiveDependencies["clearWorkspaceArchiving"];
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
@@ -2539,10 +2541,64 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   );
 
   registerTool(
+    "archive_workspace",
+    {
+      title: "Archive workspace",
+      description:
+        "Archive one exact workspace record and its owned agents/terminals. Use archive_only for repository-owned checkout closeout; conversations are retained.",
+      inputSchema: {
+        workspaceId: z.string(),
+        mode: z.enum(["archive_and_cleanup", "archive_only"]).optional(),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        archivedWorkspaceIds: z.array(z.string()),
+        cleanup: z
+          .object({
+            status: z.enum(["removed", "retained", "failed"]),
+            reason: z.string().optional(),
+          })
+          .optional(),
+      },
+    },
+    async ({ workspaceId, mode }) => {
+      if (!options.workspaceRegistry) throw new Error("Workspace registry is required");
+      const existing = await options.workspaceRegistry.get(workspaceId);
+      if (!existing) throw new Error(`Workspace not found: ${workspaceId}`);
+      const result = await archiveByScope(
+        archiveWorktreeDependencies(options, {
+          agentManager,
+          agentStorage,
+          terminalManager: terminalManager ?? null,
+          logger: childLogger,
+        }),
+        {
+          scope: { kind: "workspace", workspaceId },
+          requestId: "mcp:archive_workspace",
+          mode,
+          existingPlacement: existing.archivedAt ? existing : undefined,
+        },
+      );
+      if (!existing.archivedAt && !result.archivedWorkspaceIds.includes(workspaceId)) {
+        throw new Error("Required workspace teardown failed; files retained.");
+      }
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          workspaceId,
+          archivedWorkspaceIds: result.archivedWorkspaceIds,
+          cleanup: result.cleanup,
+        }),
+      };
+    },
+  );
+
+  registerTool(
     "archive_worktree",
     {
       title: "Archive worktree",
-      description: "Delete a Paseo-managed git worktree.",
+      description:
+        "Archive worktree workspaces and reclaim eligible checkout files after preservation and ownership checks. Reports retained files separately.",
       inputSchema: {
         cwd: z
           .string()
@@ -2553,6 +2609,12 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
       outputSchema: {
         success: z.boolean(),
+        cleanup: z
+          .object({
+            status: z.enum(["removed", "retained", "failed"]),
+            reason: z.string().optional(),
+          })
+          .optional(),
       },
     },
     async ({ cwd, worktreePath, worktreeSlug }) => {
@@ -2585,14 +2647,16 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       if (!result.ok) {
         throw new Error(result.message);
       }
-      await options.workspaceGitService.listWorktrees(repoRoot, {
-        force: true,
-        reason: "mcp:archive-worktree",
-      });
+      void options.workspaceGitService
+        .listWorktrees(repoRoot, {
+          force: true,
+          reason: "mcp:archive-worktree",
+        })
+        .catch((error) => childLogger.warn({ err: error }, "Archived worktree refresh failed"));
 
       return {
         content: [],
-        structuredContent: ensureValidJson({ success: true }),
+        structuredContent: ensureValidJson({ success: true, cleanup: result.cleanup }),
       };
     },
   );
@@ -2794,6 +2858,10 @@ function archiveWorktreeDependencies(
     findWorkspaceIdForCwd: options.findWorkspaceIdForCwd,
     listActiveWorkspaces: options.listActiveWorkspaces,
     archiveWorkspaceRecord: options.archiveWorkspaceRecord,
+    persistRecoveryHead: async (path, head) => {
+      if (!options.workspaceRegistry) throw new Error("Workspace recovery storage is unavailable");
+      await persistArchivedWorkspaceHeads(options.workspaceRegistry, path, head);
+    },
     emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,
     markWorkspaceArchiving: options.markWorkspaceArchiving,
     clearWorkspaceArchiving: options.clearWorkspaceArchiving,

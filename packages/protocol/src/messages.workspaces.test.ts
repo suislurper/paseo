@@ -1043,4 +1043,52 @@ describe("workspace message schemas", () => {
     expect(newDirectory.type).toBe("workspace.create.request");
     expect(newDirectory.source.kind).toBe("directory");
   });
+
+  test("archive_workspace_request mode is optional and round-trips cleanup", () => {
+    const legacy = SessionInboundMessageSchema.parse({
+      type: "archive_workspace_request",
+      workspaceId: "ws-legacy",
+      requestId: "req-legacy",
+    });
+    expect(legacy).toEqual({
+      type: "archive_workspace_request",
+      workspaceId: "ws-legacy",
+      requestId: "req-legacy",
+    });
+
+    const archiveOnly = SessionInboundMessageSchema.parse({
+      type: "archive_workspace_request",
+      workspaceId: "ws-only",
+      requestId: "req-only",
+      mode: "archive_only",
+    });
+    expect(archiveOnly).toMatchObject({ mode: "archive_only" });
+
+    const legacyResponse = SessionOutboundMessageSchema.parse({
+      type: "archive_workspace_response",
+      payload: {
+        requestId: "req-legacy",
+        workspaceId: "ws-legacy",
+        archivedAt: "2026-09-11T00:00:00.000Z",
+        error: null,
+      },
+    });
+    expect(legacyResponse).toMatchObject({
+      payload: { archivedAt: "2026-09-11T00:00:00.000Z", error: null },
+    });
+
+    const cleanupResponse = SessionOutboundMessageSchema.parse({
+      type: "archive_workspace_response",
+      payload: {
+        requestId: "req-only",
+        workspaceId: "ws-only",
+        archivedAt: "2026-09-11T00:00:00.000Z",
+        error: null,
+        cleanup: { status: "retained", reason: "archive-only request" },
+      },
+    });
+    expect(cleanupResponse).toMatchObject({
+      payload: { cleanup: { status: "retained", reason: "archive-only request" } },
+    });
+  });
 });

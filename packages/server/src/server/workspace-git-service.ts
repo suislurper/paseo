@@ -1,3 +1,4 @@
+import type { RemotePreservation } from "@getpaseo/protocol/messages";
 import { watch, type FSWatcher } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -83,6 +84,7 @@ export interface WorkspaceGitRuntimeSnapshot {
     behindOfOrigin: number | null;
     /** COMPAT(originDefaultRelation): optional; absent means old-shape / unknown. */
     originDefaultRelation?: OriginDefaultRelation;
+    remotePreservation?: RemotePreservation;
     hasRemote: boolean;
     diffStat: { additions: number; deletions: number } | null;
   };
@@ -1901,6 +1903,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       aheadOfOrigin: checkoutStatus.aheadOfOrigin,
       behindOfOrigin: checkoutStatus.behindOfOrigin,
       originDefaultRelation: checkoutStatus.originDefaultRelation,
+      remotePreservation: checkoutStatus.remotePreservation,
       hasRemote: checkoutStatus.hasRemote,
       diffStat,
     };

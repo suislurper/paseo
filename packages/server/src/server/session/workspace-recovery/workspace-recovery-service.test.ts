@@ -191,6 +191,58 @@ describe("workspace recovery", () => {
     expect(unarchived).toEqual([workspace.workspaceId]);
   });
 
+  test("restores the saved commit when the original branch name was reused", async () => {
+    const { tempDir, repoDir } = createGitRepository();
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: repoDir, encoding: "utf8" }).trim();
+    const savedHead = git("rev-parse", "HEAD");
+    const branch = "feature/reused";
+    writeFileSync(join(repoDir, "later.txt"), "unrelated later work");
+    git("add", "later.txt");
+    git("commit", "-m", "later work");
+    const laterHead = git("rev-parse", "HEAD");
+    git("branch", branch);
+    const paseoHome = join(tempDir, "paseo-home");
+    const worktreesRoot = join(tempDir, "worktrees");
+    const created = await createWorktree({
+      cwd: repoDir,
+      worktreeSlug: "saved-head",
+      source: { kind: "branch-off", branchName: "temporary-branch", baseBranch: "main" },
+      runSetup: false,
+      paseoHome,
+      worktreesRoot,
+    });
+    git("worktree", "remove", created.worktreePath);
+    const record = createWorkspace({
+      cwd: created.worktreePath,
+      worktreeRoot: created.worktreePath,
+      mainRepoRoot: repoDir,
+      branch,
+      archivedHead: savedHead,
+    });
+    const restored: PersistedWorkspaceRecord[] = [];
+    const service = createWorkspaceRecoveryService({
+      paseoHome,
+      worktreesRoot,
+      getWorkspace: async () => record,
+      getProject: async () => createProject({ rootPath: repoDir }),
+      isDirectory: async (directory) => existsSync(directory) && statSync(directory).isDirectory(),
+      unarchiveWorkspace: async (value) => {
+        restored.push(value);
+      },
+    });
+    await service.restore(record.workspaceId);
+    expect(
+      execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: created.worktreePath,
+        encoding: "utf8",
+      }).trim(),
+    ).toBe(savedHead);
+    expect(git("rev-parse", branch)).toBe(laterHead);
+    expect(restored[0]?.branch).not.toBe(branch);
+    expect(restored[0]?.archivedHead).toBeNull();
+  });
+
   test("keeps an exact-subdirectory workspace archived when its branch lacks that directory", async () => {
     const { tempDir, repoDir } = createGitRepository();
     const branch = "feature/without-subproject";

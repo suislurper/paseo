@@ -74,6 +74,8 @@ describe("runArchiveCommand", () => {
       data: {
         name: "feature",
         status: "archived",
+        cleanup: "unknown",
+        reason: null,
         removedAgents: ["agent-1"],
       },
       schema: expect.any(Object),

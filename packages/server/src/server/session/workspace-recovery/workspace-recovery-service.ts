@@ -109,7 +109,7 @@ export function createWorkspaceRecoveryService(deps: {
         message: "The archived workspace directory no longer exists and cannot be recreated.",
       };
     }
-    if (!workspace.branch) {
+    if (!workspace.branch && !workspace.archivedHead) {
       return {
         kind: "unavailable",
         workspaceId,
@@ -146,18 +146,20 @@ export function createWorkspaceRecoveryService(deps: {
       throw new Error(resolved.message);
     }
 
-    if (resolved.kind === "restore") {
-      await recreateArchivedWorktree(resolved.workspace, resolved.sourceRepoRoot);
-    }
-    await deps.unarchiveWorkspace(resolved.workspace);
+    const branch =
+      resolved.kind === "restore"
+        ? await recreateArchivedWorktree(resolved.workspace, resolved.sourceRepoRoot)
+        : resolved.workspace.branch;
+    await deps.unarchiveWorkspace({ ...resolved.workspace, branch, archivedHead: null });
     return { workspaceId, action: resolved.kind };
   }
 
   async function recreateArchivedWorktree(
     workspace: PersistedWorkspaceRecord,
     sourceRepoRoot: string,
-  ): Promise<void> {
-    const branch = workspace.branch;
+  ): Promise<string> {
+    const branch =
+      workspace.branch ?? (workspace.archivedHead ? `restored-${workspace.workspaceId}` : null);
     if (!branch) {
       throw new WorktreeRequestError({
         code: "unknown",
@@ -185,16 +187,22 @@ export function createWorkspaceRecoveryService(deps: {
     }
 
     let recreatedWorktreePath: string;
+    let recreatedBranch: string;
     try {
       const result = await createWorktree({
         cwd: sourceRepoRoot,
         worktreeSlug: basename(previousWorktreePath),
-        source: { kind: "checkout-branch", branchName: branch },
+        // Historical records without a captured tip retain their original branch
+        // recovery. New cleanups always restore the exact commit on a fresh branch.
+        source: workspace.archivedHead
+          ? { kind: "restore-commit", commit: workspace.archivedHead, branchName: branch }
+          : { kind: "checkout-branch", branchName: branch },
         runSetup: false,
         paseoHome: deps.paseoHome,
         worktreesRoot: deps.worktreesRoot,
       });
       recreatedWorktreePath = result.worktreePath;
+      recreatedBranch = result.branchName;
     } catch (error) {
       throw toWorktreeRequestError(error);
     }
@@ -229,6 +237,7 @@ export function createWorkspaceRecoveryService(deps: {
         error,
       );
     }
+    return recreatedBranch;
   }
 
   return { inspect, restore };

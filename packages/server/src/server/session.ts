@@ -19,6 +19,15 @@ import {
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
 } from "./messages.js";
+import {
+  computeWorkspaceCreationFingerprint,
+  runWorkspaceCreationIdempotent,
+  WorkspaceCreationMismatchError,
+  type WorkspaceCreationOutcome,
+} from "./workspace-creation-identity.js";
+import { WorkspaceCreationReconciliationError } from "./workspace-creation-errors.js";
+import { normalizeWorktreeSlug } from "./worktree-core.js";
+import { computeWorktreePath } from "../utils/worktree.js";
 import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
@@ -123,6 +132,10 @@ import {
   checkoutFromPersistedWorkspacePlacement,
   deriveWorkspaceDisplayName,
 } from "./workspace-registry-model.js";
+import {
+  trackWorkspaceArchiveRequest,
+  readAfterWorkspaceArchives,
+} from "./workspace-archive-flight.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   resolveProjectDisplayName,
@@ -229,7 +242,11 @@ import {
   handlePaseoWorktreeListRequest as handleWorktreeListRequest,
   handleWorkspaceSetupStatusRequest as handleWorkspaceSetupStatusRequestMessage,
 } from "./worktree-session.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
+import {
+  archiveByScope,
+  persistArchivedWorkspaceHeads,
+  type ActiveWorkspaceRef,
+} from "./workspace-archive-service.js";
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import {
@@ -237,7 +254,6 @@ import {
   ProjectDirectoryRequestError,
 } from "./project-directory-service.js";
 import { runGitCommand } from "../utils/run-git-command.js";
-import { isPaseoOwnedWorktreeCwd } from "../utils/worktree.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 
 // TODO: Remove once all app store clients are on >=0.1.45 and understand arbitrary provider strings.
@@ -898,6 +914,8 @@ export class Session {
       archiveAgentForClose: (agentId) => this.archiveAgentForClose(agentId),
       findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
       listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+      persistRecoveryHead: (path, head) =>
+        persistArchivedWorkspaceHeads(this.workspaceRegistry, path, head),
       archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
       emit: (message) => this.emit(message),
       emitAgentRemove: (agentId) => this.agentUpdates.removeAgent(agentId),
@@ -1939,7 +1957,9 @@ export class Session {
       case "project.github.clone.request":
         return this.handleProjectGithubCloneRequest(msg);
       case "archive_workspace_request":
-        return this.handleArchiveWorkspaceRequest(msg);
+        return trackWorkspaceArchiveRequest(this.workspaceRegistry, msg.workspaceId, () =>
+          this.handleArchiveWorkspaceRequest(msg),
+        );
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
       case "workspace.create.request":
@@ -2702,7 +2722,11 @@ export class Session {
   private async handleWorkspaceRecoveryInspectRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.inspect.request" }>,
   ): Promise<void> {
-    const state = await this.workspaceRecovery.inspect(request.workspaceId);
+    const state = await readAfterWorkspaceArchives(
+      this.workspaceRegistry,
+      () => this.workspaceRecovery.inspect(request.workspaceId),
+      request.workspaceId,
+    );
     this.emit({
       type: "workspace.recovery.inspect.response",
       payload: {
@@ -3596,6 +3620,8 @@ export class Session {
         agentStorage: this.agentStorage,
         findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
         listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+        persistRecoveryHead: (path, head) =>
+          persistArchivedWorkspaceHeads(this.workspaceRegistry, path, head),
         archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
         emit: (message) => this.emit(message),
         emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
@@ -4033,6 +4059,7 @@ export class Session {
       aheadBehind: snapshot.git.aheadBehind,
       aheadOfOrigin: snapshot.git.aheadOfOrigin,
       behindOfOrigin: snapshot.git.behindOfOrigin,
+      remotePreservation: snapshot.git.remotePreservation,
       ...(snapshot.git.originDefaultRelation
         ? { originDefaultRelation: snapshot.git.originDefaultRelation }
         : {}),
@@ -4702,7 +4729,9 @@ export class Session {
         };
       }
 
-      const payload = await this.listFetchWorkspacesEntries(request);
+      const payload = await readAfterWorkspaceArchives(this.workspaceRegistry, () =>
+        this.listFetchWorkspacesEntries(request),
+      );
       this.workspaceGitObserver.syncObservers(payload.entries);
       this.sessionLogger.debug(
         {
@@ -4810,19 +4839,40 @@ export class Session {
   private async handleWorkspaceCreateRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
   ): Promise<void> {
+    const fingerprint = computeWorkspaceCreationFingerprint({
+      requestId: request.requestId,
+      title: request.title,
+      firstAgentContext: request.firstAgentContext,
+      source: request.source,
+    });
     try {
-      if (request.source.kind === "directory") {
-        await this.handleWorkspaceCreateLocal(request);
+      const persisted = await this.findWorkspaceByCreationRequestId(request.requestId, fingerprint);
+      if (persisted) {
+        await this.emitWorkspaceCreateResponseForRecord(request, persisted, true);
         return;
       }
-      await this.handleWorkspaceCreateWorktree(request);
+      const { outcome, reconciled } = await runWorkspaceCreationIdempotent({
+        owner: this.workspaceRegistry,
+        requestId: request.requestId,
+        fingerprint,
+        runner: () => this.runWorkspaceCreateAttempt(request, fingerprint),
+      });
+      await this.emitWorkspaceCreateOutcome(request, outcome, reconciled);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create workspace";
       this.sessionLogger.error(
         { err: error, sourceKind: request.source.kind, requestId: request.requestId },
         "Failed to create workspace",
       );
-      const errorCode = error instanceof WorkspaceProvisioningError ? error.code : undefined;
+      let errorCode: string | undefined;
+      if (
+        error instanceof WorkspaceProvisioningError ||
+        error instanceof WorkspaceCreationReconciliationError
+      ) {
+        errorCode = error.code;
+      } else if (error instanceof WorkspaceCreationMismatchError) {
+        errorCode = "creation_request_mismatch";
+      }
       this.emit({
         type: "workspace.create.response",
         payload: {
@@ -4831,42 +4881,48 @@ export class Session {
           setupTerminalId: null,
           error: message,
           errorCode,
+          creationRequestId: request.requestId,
         },
       });
     }
   }
 
-  private async handleWorkspaceCreateLocal(
-    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
-  ): Promise<void> {
-    if (request.source.kind !== "directory") {
-      return;
+  private async findWorkspaceByCreationRequestId(
+    requestId: string,
+    fingerprint: string,
+  ): Promise<PersistedWorkspaceRecord | null> {
+    const workspaces = await this.workspaceRegistry.list();
+    const match = workspaces.find((workspace) => workspace.creationRequestId === requestId) ?? null;
+    if (!match) {
+      return null;
     }
+    if (match.creationFingerprint !== fingerprint) {
+      throw new WorkspaceCreationMismatchError(requestId);
+    }
+    return match;
+  }
 
-    const cwd = expandTilde(request.source.path);
-    const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
-    if (!directoryExists) {
+  private async emitWorkspaceCreateResponseForRecord(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    workspace: PersistedWorkspaceRecord,
+    reconciled: boolean,
+  ): Promise<void> {
+    if (workspace.archivedAt) {
       this.emit({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
           workspace: null,
           setupTerminalId: null,
-          error: `Directory not found: ${cwd}`,
-          errorCode: "directory_not_found",
+          error: `Workspace creation attempt "${request.requestId}" was already archived; start a new workspace action for a new attempt.`,
+          errorCode: "creation_attempt_archived",
+          creationRequestId: request.requestId,
+          creationReconciled: reconciled,
+          creationArchived: true,
         },
       });
       return;
     }
-
-    const explicitTitle = request.title?.trim() || null;
-    const promptTitle = resolveFirstAgentPromptTitle(request.firstAgentContext);
-    const workspace = await this.workspaceProvisioning.createWorkspaceForDirectory(
-      cwd,
-      explicitTitle ?? promptTitle,
-      request.source.projectId,
-    );
-    await this.syncWorkspaceGitObserverForWorkspace(workspace);
     const descriptor = await this.describeWorkspaceRecord(workspace);
     this.emit({
       type: "workspace.create.response",
@@ -4875,74 +4931,174 @@ export class Session {
         workspace: descriptor,
         setupTerminalId: null,
         error: null,
+        creationRequestId: request.requestId,
+        creationReconciled: reconciled,
       },
     });
-    await this.emitCreatedWorkspaceUpdate(descriptor);
-    void this.workspaceGitService
-      .getSnapshot(workspace.cwd, { force: true, includeForge: true, reason: "open_project" })
-      .catch((error) => {
-        this.sessionLogger.warn(
-          { err: error, cwd: workspace.cwd },
-          "Background snapshot refresh failed after workspace.create",
-        );
-      });
-    if (request.firstAgentContext) {
-      const firstAgentContext = request.firstAgentContext;
-      this.workspaceAutoName.scheduleForDirectory(
-        {
-          workspaceId: workspace.workspaceId,
-          cwd: workspace.cwd,
-          firstAgentContext,
-        },
-        { currentSelection: this.getFocusedAgentSelectionForCwd(workspace.cwd) },
-      );
+    try {
+      await this.emitCreatedWorkspaceUpdate(descriptor);
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Created workspace notification failed");
     }
   }
 
-  private async handleWorkspaceCreateWorktree(
+  private async emitWorkspaceCreateOutcome(
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    outcome: WorkspaceCreationOutcome,
+    reconciled: boolean,
   ): Promise<void> {
-    if (request.source.kind !== "worktree") {
-      return;
-    }
-
-    const source = request.source;
-
-    if (!source.cwd && !source.projectId) {
+    if (!outcome.workspace || outcome.error) {
       this.emit({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
           workspace: null,
           setupTerminalId: null,
-          error: "cwd or projectId is required for a worktree-backed workspace",
-          errorCode: "source_required",
+          error: outcome.error ?? "Failed to create workspace",
+          errorCode: outcome.errorCode,
+          creationRequestId: request.requestId,
+          creationReconciled: reconciled || outcome.reconciled,
         },
       });
       return;
     }
+    this.emit({
+      type: "workspace.create.response",
+      payload: {
+        requestId: request.requestId,
+        workspace: outcome.workspace,
+        setupTerminalId: null,
+        error: null,
+        creationRequestId: request.requestId,
+        creationReconciled: reconciled || outcome.reconciled,
+      },
+    });
+    try {
+      await this.emitCreatedWorkspaceUpdate(outcome.workspace);
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Created workspace notification failed");
+    }
+  }
 
+  private async runWorkspaceCreateAttempt(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    fingerprint: string,
+  ): Promise<WorkspaceCreationOutcome> {
+    // A persisted retry check inside the coalesced runner: the first execution
+    // may have persisted while this attempt waited for the shared in-flight slot.
+    const persisted = await this.findWorkspaceByCreationRequestId(request.requestId, fingerprint);
+    if (persisted) {
+      if (persisted.archivedAt) {
+        return {
+          workspace: null,
+          error: `Workspace creation attempt "${request.requestId}" was already archived; start a new workspace action for a new attempt.`,
+          errorCode: "creation_attempt_archived",
+          reconciled: true,
+          archived: true,
+        };
+      }
+      const descriptor = await this.describeWorkspaceRecord(persisted);
+      return { workspace: descriptor, error: null, reconciled: true, archived: false };
+    }
+    if (request.source.kind === "directory") {
+      return this.runWorkspaceCreateLocal(request, fingerprint);
+    }
+    return this.runWorkspaceCreateWorktree(request, fingerprint);
+  }
+
+  private async runWorkspaceCreateLocal(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    fingerprint: string,
+  ): Promise<WorkspaceCreationOutcome> {
+    if (request.source.kind !== "directory") {
+      throw new Error("Mismatched workspace.create source");
+    }
+    const cwd = expandTilde(request.source.path);
+    const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
+    if (!directoryExists) {
+      return {
+        workspace: null,
+        error: `Directory not found: ${cwd}`,
+        errorCode: "directory_not_found",
+        reconciled: false,
+        archived: false,
+      };
+    }
+    const explicitTitle = request.title?.trim() || null;
+    const promptTitle = resolveFirstAgentPromptTitle(request.firstAgentContext);
+    const workspace = await this.workspaceProvisioning.createWorkspaceForDirectory(
+      cwd,
+      explicitTitle ?? promptTitle,
+      request.source.projectId,
+      { creationRequestId: request.requestId, creationFingerprint: fingerprint },
+    );
+    await this.syncWorkspaceGitObserverForWorkspace(workspace);
+    const descriptor = await this.describeWorkspaceRecord(workspace);
+    // Response-critical path stays minimal: full Git snapshots, forge refreshes,
+    // and generated titles run outside the response via background work below.
+    void this.refreshWorkspaceGitSnapshotAfterCreate(workspace.cwd);
+    if (request.firstAgentContext) {
+      const firstAgentContext = request.firstAgentContext;
+      this.workspaceAutoName.scheduleForDirectory(
+        { workspaceId: workspace.workspaceId, cwd: workspace.cwd, firstAgentContext },
+        { currentSelection: this.getFocusedAgentSelectionForCwd(workspace.cwd) },
+      );
+    }
+    return { workspace: descriptor, error: null, reconciled: false, archived: false };
+  }
+
+  private refreshWorkspaceGitSnapshotAfterCreate(cwd: string): void {
+    void this.workspaceGitService
+      .getSnapshot(cwd, { force: true, includeForge: true, reason: "open_project" })
+      .catch((error) => {
+        this.sessionLogger.warn(
+          { err: error, cwd },
+          "Background snapshot refresh failed after workspace.create",
+        );
+      });
+  }
+
+  private async runWorkspaceCreateWorktree(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+    fingerprint: string,
+  ): Promise<WorkspaceCreationOutcome> {
+    if (request.source.kind !== "worktree") {
+      throw new Error("Mismatched workspace.create source");
+    }
+    const source = request.source;
+    if (!source.cwd && !source.projectId) {
+      return {
+        workspace: null,
+        error: "cwd or projectId is required for a worktree-backed workspace",
+        errorCode: "source_required",
+        reconciled: false,
+        archived: false,
+      };
+    }
     const sourceCwd = await this.resolveWorktreeSourceCwd({
       cwd: source.cwd,
       projectId: source.projectId,
     });
-
+    const rawSlug = source.worktreeSlug ?? `workspace-${fingerprint.slice(0, 16)}`;
+    const worktreeSlug = normalizeWorktreeSlug(rawSlug);
+    await this.assertFrozenWorktreeTargetAvailable(worktreeSlug, sourceCwd);
     const result = await this.createPaseoWorktreeWorkflow(
       {
         cwd: sourceCwd,
         projectId: source.projectId,
-        worktreeSlug: source.worktreeSlug,
+        worktreeSlug,
         action: source.action,
         refName: source.refName,
         checkoutSource: source.checkoutSource,
         githubPrNumber: source.githubPrNumber,
         firstAgentContext: request.firstAgentContext,
+        creationRequestId: request.requestId,
+        creationFingerprint: fingerprint,
       },
       source.baseBranch
         ? { resolveDefaultBranch: async () => source.baseBranch as string }
         : undefined,
     );
-
     if (request.title?.trim()) {
       await this.workspaceRegistry.upsert({
         ...result.workspace,
@@ -4951,18 +5107,37 @@ export class Session {
       });
       result.workspace.title = request.title.trim();
     }
+    return {
+      workspace: await this.describeCreatedWorktreeWorkspace(result),
+      error: null,
+      reconciled: false,
+      archived: false,
+    };
+  }
 
-    const descriptor = await this.describeCreatedWorktreeWorkspace(result);
-    this.emit({
-      type: "workspace.create.response",
-      payload: {
-        requestId: request.requestId,
-        workspace: descriptor,
-        setupTerminalId: null,
-        error: null,
-      },
-    });
-    await this.emitCreatedWorkspaceUpdate(descriptor);
+  private async assertFrozenWorktreeTargetAvailable(
+    worktreeSlug: string,
+    sourceCwd: string,
+  ): Promise<void> {
+    const repoRoot = await this.workspaceGitService.resolveRepoRoot(sourceCwd);
+    const frozenPath = await computeWorktreePath(
+      repoRoot,
+      worktreeSlug,
+      this.paseoHome,
+      this.worktreesRoot,
+    );
+    try {
+      await lstat(frozenPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    // Persisted matching requests are resolved before reaching this point. Any
+    // remaining directory needs inspection, never an automatically suffixed copy.
+    throw new WorkspaceCreationReconciliationError(
+      "creation_target_ambiguous",
+      `The requested workspace path already exists: ${frozenPath}. Inspect the existing attempt before creating another workspace.`,
+    );
   }
 
   private async resolveWorktreeSourceCwd(input: {
@@ -4973,9 +5148,10 @@ export class Session {
       return expandTilde(input.cwd);
     }
     const project = await this.projectRegistry.get(input.projectId as string);
-    if (!project || project.archivedAt) {
-      throw new Error(`Project not found: ${input.projectId}`);
-    }
+    if (!project)
+      throw new WorkspaceProvisioningError("unknown_project", input.projectId as string);
+    if (project.archivedAt)
+      throw new WorkspaceProvisioningError("archived_project", project.projectId);
     return project.rootPath;
   }
 
@@ -5448,32 +5624,20 @@ export class Session {
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
+    let knownArchivedAt: string | null = null;
     try {
+      const mode = request.mode ?? "archive_and_cleanup";
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
 
-      if (existing.kind === "worktree") {
-        const hasDurableOwnedPlacement =
-          existing.isPaseoOwnedWorktree &&
-          existing.worktreeRoot !== null &&
-          existing.mainRepoRoot !== null;
-        if (!hasDurableOwnedPlacement) {
-          const ownership = await isPaseoOwnedWorktreeCwd(existing.worktreeRoot ?? existing.cwd, {
-            paseoHome: this.paseoHome,
-            worktreesRoot: this.worktreesRoot,
-          });
-          if (!ownership.allowed) {
-            throw new Error(
-              "Cannot archive this worktree because it is not a Paseo-managed worktree. " +
-                "Remove it with Git, or hide its workspace without deleting files.",
-            );
-          }
-        }
-      }
+      knownArchivedAt = existing.archivedAt ?? null;
 
-      await archiveByScope(
+      // archive_only archives records and workspace-owned terminals/agents. It
+      // never runs arbitrary worktree teardown or deletes the directory, and it
+      // must preserve active sibling workspace records.
+      const result = await archiveByScope(
         {
           paseoHome: this.paseoHome,
           paseoWorktreesBaseRoot: this.worktreesRoot,
@@ -5483,6 +5647,8 @@ export class Session {
           agentStorage: this.agentStorage,
           findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
           listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+          persistRecoveryHead: (path, head) =>
+            persistArchivedWorkspaceHeads(this.workspaceRegistry, path, head),
           archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
           emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
             this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
@@ -5496,11 +5662,30 @@ export class Session {
         {
           scope: { kind: "workspace", workspaceId: existing.workspaceId },
           requestId: request.requestId,
+          mode,
+          existingPlacement: existing.archivedAt
+            ? {
+                workspaceId: existing.workspaceId,
+                cwd: existing.cwd,
+                kind: existing.kind,
+                worktreeRoot: existing.worktreeRoot,
+                isPaseoOwnedWorktree: existing.isPaseoOwnedWorktree,
+                mainRepoRoot: existing.mainRepoRoot,
+              }
+            : undefined,
         },
       );
 
+      if (result.archivedWorkspaceIds.length === 0 && !existing.archivedAt) {
+        throw new Error("Failed to archive workspace: required teardown failed");
+      }
+
       const archivedWorkspace = await this.workspaceRegistry.get(request.workspaceId);
-      const archivedAt = archivedWorkspace?.archivedAt ?? new Date().toISOString();
+      const archivedAt = archivedWorkspace?.archivedAt ?? existing.archivedAt ?? null;
+      if (!archivedAt) {
+        throw new Error("Failed to archive workspace: required teardown failed");
+      }
+      knownArchivedAt = archivedAt;
       this.emit({
         type: "archive_workspace_response",
         payload: {
@@ -5508,9 +5693,18 @@ export class Session {
           workspaceId: request.workspaceId,
           archivedAt,
           error: null,
+          cleanup: result.cleanup ?? {
+            status: result.removedDirectory ? "removed" : "retained",
+          },
         },
       });
     } catch (error) {
+      try {
+        knownArchivedAt =
+          (await this.workspaceRegistry.get(request.workspaceId))?.archivedAt ?? knownArchivedAt;
+      } catch {
+        // Preserve an already observed durable archive even if a later read fails.
+      }
       const message = error instanceof Error ? error.message : "Failed to archive workspace";
       this.sessionLogger.error(
         { err: error, workspaceId: request.workspaceId },
@@ -5521,7 +5715,7 @@ export class Session {
         payload: {
           requestId: request.requestId,
           workspaceId: request.workspaceId,
-          archivedAt: null,
+          archivedAt: knownArchivedAt,
           error: message,
         },
       });

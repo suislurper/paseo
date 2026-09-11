@@ -925,6 +925,11 @@ class DaemonRpcError extends Error {
   }
 }
 
+/** The capability check rejected archival before any request was sent. */
+export class WorkspaceArchiveNotDispatchedError extends Error {
+  override readonly name = "WorkspaceArchiveNotDispatchedError";
+}
+
 class DaemonProtocolError extends Error {
   readonly requestId: string;
   readonly responseType?: string;
@@ -2183,12 +2188,34 @@ export class DaemonClient {
   async archiveWorkspace(
     workspaceId: string,
     requestId?: string,
+    options?: { mode?: "archive_and_cleanup" | "archive_only" },
   ): Promise<ArchiveWorkspacePayload> {
+    // COMPAT(workspaceArchiveModes): added in v0.1.110; remove after 2027-03-11.
+    // Older daemons ignore mode and may delete the checkout. Never send an
+    // archive-only request until the host has advertised that it honors it.
+    if (
+      options?.mode === "archive_only" &&
+      this.lastServerInfoMessage?.features?.workspaceArchiveModes !== true
+    ) {
+      throw new WorkspaceArchiveNotDispatchedError(
+        "Update the host to archive workspace records without deleting files.",
+      );
+    }
+    // COMPAT(workspaceSafeCleanup): added 2026-09-11; remove after 2027-03-11.
+    if (
+      options?.mode !== "archive_only" &&
+      this.lastServerInfoMessage?.features?.workspaceSafeCleanup !== true
+    ) {
+      throw new WorkspaceArchiveNotDispatchedError(
+        "Update the host to archive workspaces with verified checkout cleanup.",
+      );
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "archive_workspace_request",
         workspaceId,
+        ...(options?.mode ? { mode: options.mode } : {}),
       },
       responseType: "archive_workspace_response",
     });
@@ -3901,6 +3928,9 @@ export class DaemonClient {
     },
     requestId?: string,
   ): Promise<PaseoWorktreeArchivePayload> {
+    if (this.lastServerInfoMessage?.features?.workspaceSafeCleanup !== true) {
+      throw new Error("Update the host to archive worktrees with verified checkout cleanup.");
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
@@ -3958,6 +3988,17 @@ export class DaemonClient {
       },
       responseType: "workspace.create.response",
     });
+  }
+
+  supportsWorkspaceCreationRetry(): boolean {
+    // COMPAT(workspaceCreationRetry): added in v0.2.0-beta.1, drop the gate when floor >= v0.2.0-beta.1.
+    return this.lastServerInfoMessage?.features?.workspaceCreationRetry === true;
+  }
+
+  requireWorkspaceCreationRetrySupport(): void {
+    if (!this.supportsWorkspaceCreationRetry()) {
+      throw new Error("Update the host to retry workspace creation safely.");
+    }
   }
 
   async validateBranch(

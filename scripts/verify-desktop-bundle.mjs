@@ -34,10 +34,15 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const UI_MARKERS = [
   ["originDefaultRelation", "landed-vs-unpushed workspace git relation (1bf93bb7e)"],
   ["patch_equivalent", "patch-equivalent archive classification (1bf93bb7e)"],
-  ["archiveUnpushedCommitCount", "unpushed-commit count on sidebar rows"],
+  ["archiveRemotePreservation", "remote preservation on sidebar rows"],
+  ["workspaceCreationRetry", "capability-gated workspace creation retries"],
+  ["archivedFilesRetained", "truthful archive cleanup outcomes"],
 ];
 
 const SERVER_MARKERS = [
+  ["workspaceSafeCleanup", "verified checkout cleanup capability"],
+  ["workspaceCreationRetry", "durable workspace creation identity"],
+  ["archivedHead", "exact-commit checkout recovery"],
   ["originDefaultRelation", "origin-default relation computed server side (1bf93bb7e)"],
   ["claude-opus-5", "Opus 5 Claude model manifest entries (3778a52d9)"],
   ["PASEO_AGENT_ARTIFACT_DIR", "managed per-agent runtime storage (95c63c3c5)"],

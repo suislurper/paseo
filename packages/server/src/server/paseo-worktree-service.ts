@@ -31,6 +31,8 @@ import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 
 export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {
   projectId?: string;
+  creationRequestId?: string | null;
+  creationFingerprint?: string | null;
 }
 
 export interface CreatePaseoWorktreeResult {
@@ -90,6 +92,8 @@ export async function createPaseoWorktree(
       branch: createdWorktree.worktree.branchName || null,
       baseBranch: resolveIntentBaseBranch(createdWorktree.intent),
       title: resolveFirstAgentPromptTitle(input.firstAgentContext),
+      creationRequestId: input.creationRequestId ?? null,
+      creationFingerprint: input.creationFingerprint ?? null,
     });
 
     deps.github.invalidate({ cwd: createdWorktree.worktree.worktreePath });

@@ -1,6 +1,9 @@
+import { WorkspaceArchiveNotDispatchedError } from "@getpaseo/client/internal/daemon-client";
+import type { WorkspaceRecoveryState } from "@getpaseo/protocol/messages";
 import {
   clearWorkspaceArchivePending,
   markWorkspaceArchivePending,
+  markWorkspaceArchiveUncertain,
 } from "@/contexts/session-workspace-upserts";
 import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
 import { resolveWorkspaceMapKeyByIdentity } from "@/utils/workspace-identity";
@@ -11,8 +14,18 @@ export interface WorkspaceArchiveTarget {
   workspaceId: string;
 }
 
+export interface WorkspaceArchiveCleanup {
+  status: "removed" | "retained" | "failed";
+  reason?: string;
+}
+
 interface WorkspaceArchiveClient {
-  archiveWorkspace: (workspaceId: string) => Promise<{ error: string | null }>;
+  inspectWorkspaceRecovery?: (workspaceId: string) => Promise<WorkspaceRecoveryState>;
+  archiveWorkspace: (workspaceId: string) => Promise<{
+    error: string | null;
+    archivedAt?: string | null;
+    cleanup?: WorkspaceArchiveCleanup;
+  }>;
 }
 
 interface OptimisticWorkspaceArchiveSnapshot {
@@ -68,33 +81,66 @@ function restoreOptimisticallyHiddenWorkspace(input: {
   }
 }
 
+class WorkspaceArchiveRejectedError extends Error {}
+
 async function archiveWorkspaceOrThrow(input: {
   client: WorkspaceArchiveClient;
   workspaceId: string;
-}): Promise<void> {
+}): Promise<WorkspaceArchiveCleanup | undefined> {
   const payload = await input.client.archiveWorkspace(input.workspaceId);
-  if (payload.error) {
-    throw new Error(payload.error);
-  }
+  if (payload.error && !payload.archivedAt) throw new WorkspaceArchiveRejectedError(payload.error);
+  // Record archival is durable even when a later cleanup or notification fails.
+  return (
+    payload.cleanup ??
+    (payload.error && payload.archivedAt ? { status: "failed", reason: payload.error } : undefined)
+  );
 }
 
 export async function archiveWorkspaceOptimistically(input: {
   client: WorkspaceArchiveClient;
   workspace: WorkspaceArchiveTarget;
-}): Promise<void> {
+}): Promise<WorkspaceArchiveCleanup | undefined> {
   const snapshot = hideWorkspaceOptimistically(input.workspace);
 
   try {
-    await archiveWorkspaceOrThrow({
+    return await archiveWorkspaceOrThrow({
       client: input.client,
       workspaceId: input.workspace.workspaceId,
     });
   } catch (error) {
-    restoreOptimisticallyHiddenWorkspace({
-      serverId: input.workspace.serverId,
-      workspaceId: input.workspace.workspaceId,
-      snapshot,
-    });
+    if (
+      !(
+        error instanceof WorkspaceArchiveRejectedError ||
+        error instanceof WorkspaceArchiveNotDispatchedError
+      )
+    ) {
+      markWorkspaceArchiveUncertain(input.workspace);
+      const state = await input.client
+        .inspectWorkspaceRecovery?.(input.workspace.workspaceId)
+        .catch(() => null);
+      if (state?.workspaceId === input.workspace.workspaceId) {
+        if (
+          state.kind === "recoverable" ||
+          (state.kind === "unavailable" &&
+            [
+              "project_not_found",
+              "project_directory_missing",
+              "workspace_directory_missing",
+              "worktree_branch_missing",
+            ].includes(state.reason))
+        ) {
+          return { status: "failed", reason: i18n.t("sidebar.workspace.toasts.cleanupUnknown") };
+        }
+        if (state.kind === "unavailable" && state.reason === "workspace_not_archived") {
+          restoreOptimisticallyHiddenWorkspace({ ...input.workspace, snapshot });
+          throw error;
+        }
+      }
+      // No proof of rejection: keep hidden until a fresh fetch or removal delta
+      // resolves the record. An old snapshot is not rollback authority.
+      throw new Error(i18n.t("sidebar.workspace.toasts.archiveUnconfirmed"), { cause: error });
+    }
+    restoreOptimisticallyHiddenWorkspace({ ...input.workspace, snapshot });
     throw error;
   }
 }

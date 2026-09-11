@@ -1,214 +1,108 @@
 import { describe, expect, it } from "vitest";
-
 import {
-  buildWorktreeArchiveConfirmationMessage,
   buildWorktreeArchiveRiskReasons,
-  classifyOriginDefaultArchivePushRisk,
   formatOriginDefaultRelationLabel,
   toWorktreeArchiveRisk,
   type OriginDefaultRelation,
-} from "@/git/worktree-archive-warning";
+  type WorktreeArchiveWarningLabels,
+} from "./worktree-archive-warning";
 
-const included: OriginDefaultRelation = {
-  state: "included",
-  resolvedRef: "origin/main",
-  ahead: 0,
-  behind: 2,
-  uniquePatchCount: 0,
+const labels: WorktreeArchiveWarningLabels = {
+  title: (name) => `Archive ${name}`,
+  confirm: "Archive",
+  cancel: "Cancel",
+  uncommittedChanges: "Uncommitted changes",
+  uncommittedChangesWithDiff: (diff) => `Uncommitted changes: ${diff}`,
+  addedLine: (count) => `${count} added`,
+  deletedLine: (count) => `${count} deleted`,
+  unpreservedCommits: () => "Local commits not preserved remotely",
+  preservedNotMerged: "Preserved remotely; not merged",
+  preservedMergeUnknown: "Preserved remotely; merge status unknown",
+  statusUnknown: "Status unknown",
+  includedInOriginDefault: (ref) => `Merged into ${ref}`,
+  patchEquivalentToOriginDefault: () => "Changes equivalent to merged work",
 };
+const relation = (state: OriginDefaultRelation["state"]): OriginDefaultRelation => ({
+  state,
+  resolvedRef: "origin/master",
+  ahead: 12,
+  behind: 3,
+  uniquePatchCount: 4,
+});
+const preserved = { state: "preserved" as const, ref: "origin/archive/task", localCommitCount: 0 };
+const unpreserved = { state: "unpreserved" as const, ref: null, localCommitCount: 4 };
 
-const exact: OriginDefaultRelation = {
-  state: "exact",
-  resolvedRef: "origin/main",
-  ahead: 0,
-  behind: 0,
-  uniquePatchCount: 0,
-};
-
-const patchEquivalent: OriginDefaultRelation = {
-  state: "patch_equivalent_not_included",
-  resolvedRef: "origin/main",
-  ahead: 1,
-  behind: 1,
-  uniquePatchCount: 0,
-};
-
-const ahead: OriginDefaultRelation = {
-  state: "ahead",
-  resolvedRef: "origin/main",
-  ahead: 2,
-  behind: 0,
-  uniquePatchCount: 2,
-};
-
-const diverged: OriginDefaultRelation = {
-  state: "diverged_with_unique_commits",
-  resolvedRef: "origin/main",
-  ahead: 1,
-  behind: 1,
-  uniquePatchCount: 1,
-};
-
-const unverifiable: OriginDefaultRelation = {
-  state: "unverifiable",
-  resolvedRef: null,
-  ahead: null,
-  behind: null,
-  uniquePatchCount: null,
-};
-
-describe("workspace archive warning for worktree backing", () => {
-  it("does not require a confirmation for clean and pushed worktrees", () => {
+describe("archive preservation and merge labels", () => {
+  it("distinguishes merged, preserved, unpreserved, equivalent, and unknown states", () => {
+    expect(formatOriginDefaultRelationLabel(relation("included"), labels, preserved)).toBe(
+      "Merged into master",
+    );
+    expect(formatOriginDefaultRelationLabel(relation("ahead"), labels, preserved)).toBe(
+      "Preserved remotely; not merged",
+    );
+    expect(formatOriginDefaultRelationLabel(relation("ahead"), labels, unpreserved)).toBe(
+      "Local commits not preserved remotely",
+    );
     expect(
-      buildWorktreeArchiveConfirmationMessage({
-        workspaceName: "feature",
-        isDirty: false,
-        aheadOfOrigin: 0,
-        diffStat: null,
-      }),
+      formatOriginDefaultRelationLabel(
+        relation("patch_equivalent_not_included"),
+        labels,
+        unpreserved,
+      ),
+    ).toBe("Changes equivalent to merged work");
+    expect(formatOriginDefaultRelationLabel(relation("ahead"), labels)).toBe("Status unknown");
+  });
+  it("does not turn ahead-of-default or missing merge evidence into an unpushed claim", () => {
+    expect(
+      formatOriginDefaultRelationLabel(relation("diverged_with_unique_commits"), labels, preserved),
+    ).toBe("Preserved remotely; not merged");
+    expect(formatOriginDefaultRelationLabel(relation("unverifiable"), labels, preserved)).toBe(
+      "Preserved remotely; merge status unknown",
+    );
+    expect(formatOriginDefaultRelationLabel(null, labels, preserved)).toBe(
+      "Preserved remotely; merge status unknown",
+    );
+    expect(formatOriginDefaultRelationLabel(null, labels)).toBe("Status unknown");
+  });
+  it("suppresses only an exact ordinary default checkout", () => {
+    expect(
+      formatOriginDefaultRelationLabel(relation("exact"), labels, preserved, "master"),
     ).toBeNull();
+    expect(formatOriginDefaultRelationLabel(relation("exact"), labels, preserved, "feature")).toBe(
+      "Merged into master",
+    );
   });
-
-  it("explains uncommitted line changes", () => {
+  it("warns about exact unpreserved history even when changes are patch equivalent", () => {
     expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: true,
-        aheadOfOrigin: 0,
-        diffStat: { additions: 12, deletions: 1 },
-      }),
-    ).toEqual(["Uncommitted changes (12 added lines, 1 deleted line)"]);
+      buildWorktreeArchiveRiskReasons(
+        {
+          remotePreservation: unpreserved,
+          originDefaultRelation: relation("patch_equivalent_not_included"),
+        },
+        labels,
+      ),
+    ).toEqual(["Changes equivalent to merged work", "Local commits not preserved remotely"]);
   });
-
-  it("treats nonzero diff stats as dirty when dirty state is missing", () => {
+  it("keeps dirty-file warnings independent of preserved commits", () => {
     expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: undefined,
-        aheadOfOrigin: 0,
-        diffStat: { additions: 4, deletions: 0 },
-      }),
-    ).toEqual(["Uncommitted changes (4 added lines)"]);
+      buildWorktreeArchiveRiskReasons(
+        { isDirty: true, remotePreservation: preserved, diffStat: { additions: 2, deletions: 1 } },
+        labels,
+      ),
+    ).toEqual(["Uncommitted changes: 2 added, 1 deleted"]);
+    expect(buildWorktreeArchiveRiskReasons({}, labels)).toEqual(["Status unknown"]);
   });
-
-  it("explains unpushed commits", () => {
-    expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: false,
-        aheadOfOrigin: 2,
-        diffStat: null,
-      }),
-    ).toEqual(["2 unpushed commits"]);
-  });
-
-  it("includes every archive risk in the confirmation copy", () => {
-    expect(
-      buildWorktreeArchiveConfirmationMessage({
-        workspaceName: "risky-feature",
-        isDirty: true,
-        aheadOfOrigin: 1,
-        diffStat: { additions: 1, deletions: 3 },
-      }),
-    ).toBe("Uncommitted changes (1 added line, 3 deleted lines)\n1 unpushed commit");
-  });
-
-  it("maps archive workspace fields into the shared worktree risk shape", () => {
+  it("carries preservation through sidebar and project archive input", () => {
     expect(
       toWorktreeArchiveRisk({
-        archiveHasUncommittedChanges: true,
-        archiveUnpushedCommitCount: 3,
-        archiveOriginDefaultRelation: included,
-        diffStat: { additions: 2, deletions: 1 },
+        archiveRemotePreservation: preserved,
+        archiveOriginDefaultRelation: relation("ahead"),
+        archiveHasUncommittedChanges: false,
       }),
-    ).toEqual({
-      isDirty: true,
-      aheadOfOrigin: 3,
-      originDefaultRelation: included,
-      diffStat: { additions: 2, deletions: 1 },
+    ).toMatchObject({
+      remotePreservation: preserved,
+      originDefaultRelation: relation("ahead"),
+      isDirty: false,
     });
-  });
-
-  it("does not treat exact/included as unpushed risk even when aheadOfOrigin is positive", () => {
-    expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: false,
-        aheadOfOrigin: 3,
-        originDefaultRelation: included,
-        diffStat: null,
-      }),
-    ).toEqual([]);
-    expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: false,
-        aheadOfOrigin: 1,
-        originDefaultRelation: exact,
-        diffStat: null,
-      }),
-    ).toEqual([]);
-    expect(classifyOriginDefaultArchivePushRisk(included)).toBe("included");
-    expect(classifyOriginDefaultArchivePushRisk(exact)).toBe("included");
-  });
-
-  it("labels exact/included as Included in origin/<default>", () => {
-    expect(formatOriginDefaultRelationLabel(included)).toBe("Included in origin/main");
-    // Without currentBranch, exact still labels (display helper is opt-in suppress).
-    expect(formatOriginDefaultRelationLabel(exact)).toBe("Included in origin/main");
-    // Feature branch at exact tip still shows inclusion (not a default-branch tautology).
-    expect(formatOriginDefaultRelationLabel(exact, undefined, undefined, "feature")).toBe(
-      "Included in origin/main",
-    );
-  });
-
-  it("suppresses exact label for ordinary default-branch checkout (display only)", () => {
-    expect(formatOriginDefaultRelationLabel(exact, undefined, undefined, "main")).toBeNull();
-    // Classification / archive risk path remains included — only the status label is scoped.
-    expect(classifyOriginDefaultArchivePushRisk(exact)).toBe("included");
-    expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: false,
-        aheadOfOrigin: 1,
-        originDefaultRelation: exact,
-        diffStat: null,
-      }),
-    ).toEqual([]);
-  });
-
-  it("keeps patch-equivalent visibly distinct and still protected", () => {
-    expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: false,
-        aheadOfOrigin: 2,
-        originDefaultRelation: patchEquivalent,
-        diffStat: null,
-      }),
-    ).toEqual(["Changes landed in origin/main (branch not merged)"]);
-    expect(formatOriginDefaultRelationLabel(patchEquivalent)).toBe(
-      "Changes landed in origin/main (branch not merged)",
-    );
-    expect(classifyOriginDefaultArchivePushRisk(patchEquivalent)).toBe("patch_equivalent");
-  });
-
-  it("keeps ahead/diverged/unverifiable as unpushed risk when aheadOfOrigin is positive", () => {
-    for (const relation of [ahead, diverged, unverifiable]) {
-      expect(
-        buildWorktreeArchiveRiskReasons({
-          isDirty: false,
-          aheadOfOrigin: 2,
-          originDefaultRelation: relation,
-          diffStat: null,
-        }),
-      ).toEqual(["2 unpushed commits"]);
-    }
-  });
-
-  it("falls back to legacy unpushed labeling when originDefaultRelation is missing", () => {
-    expect(
-      buildWorktreeArchiveRiskReasons({
-        isDirty: false,
-        aheadOfOrigin: 4,
-        originDefaultRelation: null,
-        diffStat: null,
-      }),
-    ).toEqual(["4 unpushed commits"]);
-    expect(formatOriginDefaultRelationLabel(null, undefined, 4)).toBe("4 unpushed commits");
-    expect(classifyOriginDefaultArchivePushRisk(undefined)).toBe("unknown");
   });
 });

@@ -448,4 +448,27 @@ describe("runGitCommand", () => {
       expect.objectContaining({ exitCode: 0, stdout: "fourth", truncated: false }),
     ]);
   });
+  it("records queue wait separately from execution duration", async () => {
+    const { runGitCommand, startGitCommandMetrics, stopGitCommandMetrics } =
+      await loadRunGitCommand(1);
+
+    enqueueSpawnBehaviors({ delayMs: 50 }, { delayMs: 0, stdoutData: "second" });
+
+    startGitCommandMetrics();
+    const [first, second] = await Promise.all([
+      runGitCommand(["status"], { cwd: process.cwd() }),
+      runGitCommand(["status"], { cwd: process.cwd() }),
+    ]);
+    const metrics = stopGitCommandMetrics();
+
+    expect(first.truncated).toBe(false);
+    expect(second.stdout).toBe("second");
+    expect(metrics.total).toBe(2);
+    const [firstMetric, secondMetric] = metrics.commands;
+    expect(firstMetric?.queueWaitMs).toBeGreaterThanOrEqual(0);
+    expect(secondMetric?.queueWaitMs).toBeGreaterThanOrEqual(firstMetric?.queueWaitMs ?? 0);
+    expect(secondMetric?.totalDurationMs).toBeGreaterThanOrEqual(
+      (secondMetric?.queueWaitMs ?? 0) + (secondMetric?.durationMs ?? 0),
+    );
+  });
 });

@@ -1,7 +1,7 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { existsSync, mkdirSync, realpathSync, rmSync, statSync } from "fs";
-import { copyFile, rm, stat } from "fs/promises";
+import { copyFile, lstat, stat } from "fs/promises";
 import { join, basename, dirname, isAbsolute, resolve, sep } from "path";
 import net from "node:net";
 import { createHash } from "node:crypto";
@@ -30,6 +30,9 @@ import {
   writePaseoWorktreeRuntimeMetadata,
 } from "./worktree-metadata.js";
 import { runGitCommand } from "./run-git-command.js";
+import { removeVerifiedWorktree } from "./remove-verified-worktree.js";
+import { inspectDisposableCheckout } from "./worktree-cleanup-safety.js";
+import { withCheckoutWriteLock, WorktreeCleanupHold } from "./worktree-preservation.js";
 import { spawnProcess } from "./spawn.js";
 import { resolvePaseoHome } from "../server/paseo-home.js";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
@@ -168,6 +171,7 @@ export interface WorktreeCheckoutRef {
 export type WorktreeSource =
   | { kind: "branch-off"; baseBranch: string; branchName: string }
   | { kind: "checkout-branch"; branchName: string }
+  | { kind: "restore-commit"; commit: string; branchName: string }
   | {
       kind: "checkout-change-request";
       forge: string;
@@ -1075,12 +1079,8 @@ export interface DeletePaseoWorktreeOptions {
   worktreesRoot?: string;
   paseoHome?: string;
   worktreesBaseRoot?: string;
-  /**
-   * Defaults to true for explicit/rollback cleanup. Auto-archive passes false
-   * so Git remains the final dirty-worktree guard and no recursive fallback
-   * can erase work created after the preceding safety snapshot.
-   */
-  force?: boolean;
+  validateReferences: () => Promise<void>;
+  persistHead: (head: string) => Promise<void>;
 }
 
 export async function deletePaseoWorktree({
@@ -1091,7 +1091,8 @@ export async function deletePaseoWorktree({
   worktreesRoot,
   paseoHome,
   worktreesBaseRoot,
-  force = true,
+  validateReferences,
+  persistHead,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   if (!worktreePath && !worktreeSlug) {
     throw new Error("worktreePath or worktreeSlug is required");
@@ -1113,7 +1114,8 @@ export async function deletePaseoWorktree({
   const resolvedRequested = normalizePathForOwnership(requestedPath);
   const ownership = await isPaseoOwnedWorktreeCwd(requestedPath, {
     paseoHome,
-    worktreesRoot: worktreesBaseRoot,
+    // Persisted placement remains valid after the configured base root moves.
+    worktreesRoot: worktreesRoot ? dirname(resolve(worktreesRoot)) : worktreesBaseRoot,
   });
   const resolvedWorktree =
     ownership.allowed && ownership.worktreePath ? ownership.worktreePath : resolvedRequested;
@@ -1126,36 +1128,66 @@ export async function deletePaseoWorktree({
     throw new Error("Refusing to delete non-Paseo worktree");
   }
 
-  if (await pathExists(resolvedWorktree)) {
-    for (const teardownCwd of teardownCwds ?? [resolvedWorktree]) {
-      await runWorktreeTeardownCommands({
-        worktreePath: resolvedWorktree,
-        teardownCwd,
-      });
-    }
+  try {
+    await lstat(resolvedWorktree);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
-
-  await removeWorktreeWithGit({ cwd, resolvedWorktree, force });
-
-  if (force) {
-    await removeDirectoryWithRetries(resolvedWorktree);
-  } else if (await pathExists(resolvedWorktree)) {
-    throw new WorktreeTeardownError(
-      "Safe worktree removal left the directory present; refusing recursive deletion",
-      [],
+  if (!cwd)
+    throw new WorktreeCleanupHold("The source repository is unavailable; checkout retained.");
+  if (!ownership.allowed)
+    throw new WorktreeCleanupHold("Checkout ownership could not be verified.");
+  const expectedRoot = await getPaseoWorktreesRoot(
+    cwd,
+    paseoHome,
+    dirname(resolve(resolvedWorktreesRoot)),
+  );
+  if (
+    normalizePathForOwnership(expectedRoot) !== normalizePathForOwnership(resolvedWorktreesRoot)
+  ) {
+    throw new WorktreeCleanupHold(
+      "Checkout repository identity does not match its owned directory.",
     );
   }
-
-  await pruneWorktreesIfPossible(cwd);
+  await removeVerifiedWorktree({
+    cwd,
+    worktree: resolvedWorktree,
+    persistHead,
+    validateReferences,
+    teardown: async () => {
+      for (const teardownCwd of teardownCwds ?? [resolvedWorktree]) {
+        await runWorktreeTeardownCommands({
+          worktreePath: resolvedWorktree,
+          teardownCwd,
+          repoRootPath: cwd,
+        });
+      }
+    },
+  });
 }
 
 export async function rollbackCreatedPaseoWorktree(
-  options: DeletePaseoWorktreeOptions,
+  options: Omit<DeletePaseoWorktreeOptions, "validateReferences" | "persistHead">,
   cause: unknown,
 ): Promise<never> {
   let cleanupError: unknown;
   try {
-    await deletePaseoWorktree(options);
+    // Failed creation has no remotely preserved tip yet. Keep the branch and
+    // use Git's non-forced removal only after proving the new checkout disposable.
+    if (!options.cwd || !options.worktreePath)
+      throw new WorktreeCleanupHold("Rollback checkout identity is unavailable.");
+    const { stdout } = await runGitCommand(["rev-parse", "--absolute-git-dir"], {
+      cwd: options.worktreePath,
+    });
+    await withCheckoutWriteLock(stdout.trim(), async (assertHeld) => {
+      await inspectDisposableCheckout(options.worktreePath!);
+      await assertHeld();
+      await runGitCommand(["worktree", "remove", "--", options.worktreePath!], {
+        cwd: options.cwd!,
+        timeout: 120_000,
+      });
+    });
   } catch (error) {
     cleanupError = error;
   }
@@ -1170,98 +1202,6 @@ export async function rollbackCreatedPaseoWorktree(
   throw cause;
 }
 
-async function pathExists(path: string): Promise<boolean> {
-  try {
-    await stat(path);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
-}
-
-async function removeWorktreeWithGit(input: {
-  cwd: string | null;
-  resolvedWorktree: string;
-  force: boolean;
-}): Promise<void> {
-  if (!input.force && !input.cwd && (await pathExists(input.resolvedWorktree))) {
-    throw new WorktreeTeardownError(
-      "Safe worktree removal requires an available repository root",
-      [],
-    );
-  }
-  if (!input.cwd) {
-    return;
-  }
-
-  try {
-    await runGitCommand(
-      ["worktree", "remove", input.resolvedWorktree, ...(input.force ? ["--force"] : [])],
-      {
-        cwd: input.cwd,
-        timeout: 120_000,
-      },
-    );
-  } catch (error) {
-    if (!input.force) {
-      throw new WorktreeTeardownError(
-        `Safe worktree removal refused: ${error instanceof Error ? error.message : String(error)}`,
-        [],
-      );
-    }
-    // `git worktree remove` fails if the admin dir is already gone (e.g. a
-    // prior archive attempt removed it before the working tree could be fully
-    // cleaned up), or if the repo root moved. Forced cleanup remains
-    // idempotent via the recursive retry path.
-  }
-}
-
-async function pruneWorktreesIfPossible(cwd: string | null): Promise<void> {
-  if (!cwd) {
-    return;
-  }
-  try {
-    await runGitCommand(["worktree", "prune"], { cwd, timeout: 30_000 });
-  } catch {
-    // not critical; git will prune lazily
-  }
-}
-
-async function removeDirectoryWithRetries(path: string): Promise<void> {
-  if (!(await pathExists(path))) {
-    return;
-  }
-
-  const delaysMs = [0, 100, 300, 700, 1500];
-  let lastError: unknown = null;
-  for (const delay of delaysMs) {
-    if (delay > 0) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
-    }
-    try {
-      await rm(path, { recursive: true, force: true });
-      if (!(await pathExists(path))) {
-        return;
-      }
-      lastError = new Error(`Directory still present after rm: ${path}`);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  if (await pathExists(path)) {
-    throw lastError instanceof Error
-      ? lastError
-      : new Error(`Failed to remove worktree directory: ${path}`);
-  }
-}
-
-/**
- * Create a git worktree with proper naming conventions
- */
 export const createWorktree = async ({
   cwd,
   source,
@@ -1350,28 +1290,53 @@ interface WorktreeSourcePlan {
   };
 }
 
+async function resolveArchivedCommitPlan(
+  cwd: string,
+  source: Extract<WorktreeSource, { kind: "restore-commit" }>,
+): Promise<WorktreeSourcePlan> {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(source.commit)) {
+    throw new Error("Archived commit identity is invalid");
+  }
+  await runGitCommand(["cat-file", "-e", `${source.commit}^{commit}`], { cwd });
+  const branchName = await resolveUniqueLocalBranchName(cwd, source.branchName);
+  return {
+    branchName,
+    metadataBaseRefName: source.commit,
+    addArguments: ["-b", branchName, "--no-track", source.commit],
+  };
+}
+
+async function resolveBranchOffPlan(
+  cwd: string,
+  source: Extract<WorktreeSource, { kind: "branch-off" }>,
+  desiredSlug: string,
+): Promise<WorktreeSourcePlan> {
+  const branchName = source.branchName;
+  validateWorktreeBranchName(branchName);
+  const normalizedBaseBranch = normalizeRequiredBaseBranch(source.baseBranch);
+  const resolvedBaseBranch = await resolveBaseBranchForWorktree(cwd, normalizedBaseBranch);
+  const branchExists = await localBranchExists(cwd, branchName);
+  const base = branchExists ? branchName : resolvedBaseBranch;
+  const candidateBranch = branchExists ? desiredSlug : branchName;
+  const newBranchName = await resolveUniqueLocalBranchName(cwd, candidateBranch);
+
+  return {
+    branchName: newBranchName,
+    metadataBaseRefName: normalizedBaseBranch,
+    addArguments: ["-b", newBranchName, "--no-track", base],
+  };
+}
+
 async function resolveWorktreeSourcePlan({
   cwd,
   source,
   desiredSlug,
 }: ResolveWorktreeSourcePlanOptions): Promise<WorktreeSourcePlan> {
   switch (source.kind) {
-    case "branch-off": {
-      const branchName = source.branchName;
-      validateWorktreeBranchName(branchName);
-      const normalizedBaseBranch = normalizeRequiredBaseBranch(source.baseBranch);
-      const resolvedBaseBranch = await resolveBaseBranchForWorktree(cwd, normalizedBaseBranch);
-      const branchExists = await localBranchExists(cwd, branchName);
-      const base = branchExists ? branchName : resolvedBaseBranch;
-      const candidateBranch = branchExists ? desiredSlug : branchName;
-      const newBranchName = await resolveUniqueLocalBranchName(cwd, candidateBranch);
-
-      return {
-        branchName: newBranchName,
-        metadataBaseRefName: normalizedBaseBranch,
-        addArguments: ["-b", newBranchName, "--no-track", base],
-      };
-    }
+    case "branch-off":
+      return resolveBranchOffPlan(cwd, source, desiredSlug);
+    case "restore-commit":
+      return resolveArchivedCommitPlan(cwd, source);
     case "checkout-branch": {
       await validateExistingWorktreeBranchName(cwd, source.branchName);
       if (!(await localBranchExists(cwd, source.branchName))) {

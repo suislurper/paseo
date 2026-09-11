@@ -11,8 +11,17 @@ export interface WorkspaceArchiveTarget {
   workspaceId: string;
 }
 
+export interface WorkspaceArchiveCleanup {
+  status: "removed" | "retained" | "failed";
+  reason?: string;
+}
+
 interface WorkspaceArchiveClient {
-  archiveWorkspace: (workspaceId: string) => Promise<{ error: string | null }>;
+  archiveWorkspace: (workspaceId: string) => Promise<{
+    error: string | null;
+    archivedAt?: string | null;
+    cleanup?: WorkspaceArchiveCleanup;
+  }>;
 }
 
 interface OptimisticWorkspaceArchiveSnapshot {
@@ -71,21 +80,24 @@ function restoreOptimisticallyHiddenWorkspace(input: {
 async function archiveWorkspaceOrThrow(input: {
   client: WorkspaceArchiveClient;
   workspaceId: string;
-}): Promise<void> {
+}): Promise<WorkspaceArchiveCleanup | undefined> {
   const payload = await input.client.archiveWorkspace(input.workspaceId);
-  if (payload.error) {
-    throw new Error(payload.error);
-  }
+  if (payload.error && !payload.archivedAt) throw new Error(payload.error);
+  // Record archival is durable even when a later cleanup or notification fails.
+  return (
+    payload.cleanup ??
+    (payload.error && payload.archivedAt ? { status: "failed", reason: payload.error } : undefined)
+  );
 }
 
 export async function archiveWorkspaceOptimistically(input: {
   client: WorkspaceArchiveClient;
   workspace: WorkspaceArchiveTarget;
-}): Promise<void> {
+}): Promise<WorkspaceArchiveCleanup | undefined> {
   const snapshot = hideWorkspaceOptimistically(input.workspace);
 
   try {
-    await archiveWorkspaceOrThrow({
+    return await archiveWorkspaceOrThrow({
       client: input.client,
       workspaceId: input.workspace.workspaceId,
     });

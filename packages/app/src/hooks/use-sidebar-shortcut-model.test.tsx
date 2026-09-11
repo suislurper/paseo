@@ -32,7 +32,7 @@ function workspace(projectKey: string, workspaceId: string): SidebarWorkspaceEnt
     diffStat: null,
     prHint: null,
     archiveHasUncommittedChanges: null,
-    archiveUnpushedCommitCount: null,
+    archiveRemotePreservation: null,
     archiveOriginDefaultRelation: null,
     originDefaultRelationLabel: null,
     scripts: [],

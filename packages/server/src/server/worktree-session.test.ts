@@ -1,3 +1,5 @@
+import * as cleanupSafety from "../utils/worktree-cleanup-safety.js";
+const inspectDisposableCheckout = cleanupSafety.inspectDisposableCheckout;
 import { execFileSync } from "node:child_process";
 import {
   mkdirSync,
@@ -1813,6 +1815,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
   const cleanupPaths: string[] = [];
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const target of cleanupPaths.splice(0)) {
       rmSync(target, { recursive: true, force: true });
     }
@@ -1831,6 +1834,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       runSetup: false,
       paseoHome,
     });
+    prepareCleanupFixture(tempDir, repoDir, created.worktreePath);
     const sharedCwd = created.worktreePath;
     const workspaceA = "ws-worktree-scope-A";
     const workspaceB = "ws-worktree-scope-B";
@@ -1858,6 +1862,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
           }),
         },
         agentStorage: createAgentStorageStub(),
+        persistRecoveryHead: async () => {},
         findWorkspaceIdForCwd: vi.fn(async () => workspaceA),
         listActiveWorkspaces,
         archiveWorkspaceRecord: createArchiveWorkspaceRecordMutator(
@@ -1906,6 +1911,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       runSetup: false,
       paseoHome,
     });
+    prepareCleanupFixture(tempDir, repoDir, created.worktreePath);
     const workspaceId = "ws-default-scope";
     const activeWorkspaces = [
       { workspaceId, cwd: created.worktreePath, kind: "worktree" as const },
@@ -1929,6 +1935,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
           }),
         },
         agentStorage: createAgentStorageStub(),
+        persistRecoveryHead: async () => {},
         findWorkspaceIdForCwd: vi.fn(async (cwd: string) =>
           cwd === created.worktreePath ? workspaceId : null,
         ),
@@ -1979,6 +1986,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       runSetup: false,
       paseoHome,
     });
+    prepareCleanupFixture(tempDir, repoDir, created.worktreePath);
     const sharedCwd = created.worktreePath;
     const workspaceA = "ws-default-scope-sibling-A";
     const workspaceB = "ws-default-scope-sibling-B";
@@ -2005,6 +2013,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
           }),
         },
         agentStorage: createAgentStorageStub(),
+        persistRecoveryHead: async () => {},
         findWorkspaceIdForCwd: vi.fn(async (cwd: string) =>
           cwd === sharedCwd ? workspaceA : null,
         ),
@@ -2055,6 +2064,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       runSetup: false,
       paseoHome,
     });
+    prepareCleanupFixture(tempDir, repoDir, created.worktreePath);
     const sharedCwd = created.worktreePath;
     const workspaceA = "ws-delete-flag-a";
     const workspaceB = "ws-delete-flag-b";
@@ -2081,6 +2091,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         }),
       },
       agentStorage: createAgentStorageStub(),
+      persistRecoveryHead: async () => {},
       findWorkspaceIdForCwd: vi.fn(async (cwd: string) => (cwd === sharedCwd ? workspaceA : null)),
       listActiveWorkspaces,
       archiveWorkspaceRecord: createArchiveWorkspaceRecordMutator(
@@ -2133,3 +2144,19 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
     ).toHaveLength(2);
   });
 });
+
+function prepareCleanupFixture(tempDir: string, repoDir: string, worktree: string): void {
+  const remote = path.join(tempDir, "preservation.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+  execFileSync("git", ["remote", "add", "preservation", remote], { cwd: repoDir });
+  execFileSync("git", ["push", "preservation", "HEAD:refs/heads/saved"], {
+    cwd: worktree,
+    stdio: "pipe",
+  });
+  const procRoot = path.join(tempDir, "proc");
+  mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  writeFileSync(path.join(procRoot, "self", "mountinfo"), "1 0 0:1 / / rw - ext4 /dev/root rw\n");
+  vi.spyOn(cleanupSafety, "inspectDisposableCheckout").mockImplementation((cwd) =>
+    inspectDisposableCheckout(cwd, { procRoot }),
+  );
+}

@@ -14,6 +14,8 @@ export interface WorktreeArchiveResult {
   name: string;
   status: "archived";
   removedAgents: string[];
+  cleanup: string;
+  reason: string | null;
 }
 
 /** Schema for archive command output */
@@ -22,6 +24,8 @@ export const archiveSchema: OutputSchema<WorktreeArchiveResult> = {
   columns: [
     { header: "NAME", field: "name" },
     { header: "STATUS", field: "status" },
+    { header: "FILES", field: "cleanup" },
+    { header: "REASON", field: "reason" },
     {
       header: "REMOVED AGENTS",
       field: (item) => (item.removedAgents.length > 0 ? item.removedAgents.join(", ") : "-"),
@@ -125,6 +129,8 @@ export async function runArchiveCommandWithDeps(
         name: worktreeName,
         status: "archived",
         removedAgents: response.removedAgents ?? [],
+        cleanup: response.cleanup?.status ?? "unknown",
+        reason: response.cleanup?.reason ?? null,
       },
       schema: archiveSchema,
     };

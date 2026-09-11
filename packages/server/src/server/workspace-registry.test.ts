@@ -1,4 +1,5 @@
 import os from "node:os";
+import { persistArchivedWorkspaceHeads } from "./workspace-archive-service.js";
 import path from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 
@@ -63,6 +64,36 @@ describe("workspace registries", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("persists the exact archived commit across registry reload and rejects active references", async () => {
+    await workspaceRegistry.initialize();
+    const checkout = path.join(tmpDir, "checkout");
+    const record = createPersistedWorkspaceRecord({
+      workspaceId: "saved-workspace",
+      projectId: "project",
+      cwd: checkout,
+      worktreeRoot: checkout,
+      kind: "worktree",
+      displayName: "saved",
+      createdAt: "2026-09-11T00:00:00Z",
+      updatedAt: "2026-09-11T00:00:00Z",
+      archivedAt: "2026-09-11T00:00:00Z",
+    });
+    await workspaceRegistry.upsert(record);
+    const head = "a".repeat(40);
+    await persistArchivedWorkspaceHeads(workspaceRegistry, checkout, head);
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    await reloaded.initialize();
+    expect((await reloaded.get(record.workspaceId))?.archivedHead).toBe(head);
+    await reloaded.update(record.workspaceId, (current) => ({ ...current, archivedAt: null }));
+    await expect(persistArchivedWorkspaceHeads(reloaded, checkout, "b".repeat(40))).rejects.toThrow(
+      "active workspace",
+    );
+    expect((await reloaded.get(record.workspaceId))?.archivedHead).toBe(head);
   });
 
   test("creates, updates, archives, deletes, and lists project records", async () => {

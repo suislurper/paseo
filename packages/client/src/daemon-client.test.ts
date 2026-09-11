@@ -5572,6 +5572,26 @@ test("archive-only refuses an old host before sending a destructive request", as
   expect(mock.sent).toEqual([]);
 });
 
+test("cleanup operations refuse a host without safe-cleanup support before dispatch", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "cid_unsafe_cleanup",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { workspaceArchiveModes: true } });
+  await connected;
+  await expect(client.archiveWorkspace("ws-1")).rejects.toThrow("Update the host");
+  await expect(
+    client.archivePaseoWorktree({ worktreePath: "/worktree", scope: "worktree" }),
+  ).rejects.toThrow("Update the host");
+  expect(mock.sent).toEqual([]);
+});
+
 test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", async () => {
   useHeartbeatClock();
   try {

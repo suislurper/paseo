@@ -2734,6 +2734,8 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceRecovery: z.boolean().optional(),
         // COMPAT(workspaceArchiveModes): added in v0.1.110; remove gate after 2027-03-11.
         workspaceArchiveModes: z.boolean().optional(),
+        // COMPAT(workspaceSafeCleanup): added 2026-09-11; remove gate after 2027-03-11.
+        workspaceSafeCleanup: z.boolean().optional(),
         // COMPAT(providerUsageList): added in v0.1.98, drop the gate when daemon floor >= v0.1.98.
         providerUsageList: z.boolean().optional(),
         // COMPAT(providerUsageForceRefresh): added in v0.1.X, drop the gate when daemon floor >= v0.1.X.
@@ -2984,6 +2986,13 @@ export const OriginDefaultRelationStateSchema = z.enum([
   "unverifiable",
 ]);
 
+export const RemotePreservationSchema = z.object({
+  state: z.enum(["preserved", "unpreserved", "unknown"]),
+  ref: z.string().nullable(),
+  localCommitCount: z.number().int().nonnegative().nullable(),
+});
+export type RemotePreservation = z.infer<typeof RemotePreservationSchema>;
+
 export const OriginDefaultRelationSchema = z.object({
   state: OriginDefaultRelationStateSchema,
   resolvedRef: z.string().nullable(),
@@ -3007,8 +3016,9 @@ const WorkspaceGitRuntimePayloadSchema = z
       .optional(),
     aheadOfOrigin: z.number().nullable().optional(),
     behindOfOrigin: z.number().nullable().optional(),
-    // COMPAT(originDefaultRelation): missing on old daemons; preserve unpushed behavior.
+    // COMPAT(remotePreservation): absent on old daemons means unknown, never unpushed by inference.
     originDefaultRelation: OriginDefaultRelationSchema.optional(),
+    remotePreservation: RemotePreservationSchema.optional(),
   })
   .optional()
   .nullable();
@@ -3904,6 +3914,7 @@ const CheckoutStatusNotGitSchema = CheckoutStatusCommonSchema.extend({
   behindOfOrigin: z.null(),
   // COMPAT(originDefaultRelation): optional; absent on not-git is fine.
   originDefaultRelation: OriginDefaultRelationSchema.optional(),
+  remotePreservation: RemotePreservationSchema.optional(),
   hasRemote: z.boolean(),
   remoteUrl: z.null(),
 });
@@ -3921,6 +3932,7 @@ const CheckoutStatusGitNonPaseoSchema = CheckoutStatusCommonSchema.extend({
   behindOfOrigin: z.number().nullable(),
   // COMPAT(originDefaultRelation): optional for old clients.
   originDefaultRelation: OriginDefaultRelationSchema.optional(),
+  remotePreservation: RemotePreservationSchema.optional(),
   hasRemote: z.boolean(),
   remoteUrl: z.string().nullable(),
 });
@@ -3938,6 +3950,7 @@ const CheckoutStatusGitPaseoSchema = CheckoutStatusCommonSchema.extend({
   behindOfOrigin: z.number().nullable(),
   // COMPAT(originDefaultRelation): optional for old clients.
   originDefaultRelation: OriginDefaultRelationSchema.optional(),
+  remotePreservation: RemotePreservationSchema.optional(),
   hasRemote: z.boolean(),
   remoteUrl: z.string().nullable(),
 });
@@ -4605,6 +4618,7 @@ export const PaseoWorktreeArchiveResponseSchema = z.object({
   type: z.literal("paseo_worktree_archive_response"),
   payload: z.object({
     success: z.boolean(),
+    cleanup: ArchiveWorkspaceCleanupSchema.optional(),
     removedAgents: z.array(z.string()).optional(),
     error: CheckoutErrorSchema.nullable(),
     requestId: z.string(),

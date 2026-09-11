@@ -1,3 +1,4 @@
+import type { RemotePreservation } from "@getpaseo/protocol/messages";
 import {
   formatOriginDefaultRelationLabel,
   type OriginDefaultRelation,
@@ -48,7 +49,7 @@ export interface SidebarWorkspaceEntry extends SidebarStatusWorkspacePlacement {
   diffStat: { additions: number; deletions: number } | null;
   prHint: PrHint | null;
   archiveHasUncommittedChanges: boolean | null;
-  archiveUnpushedCommitCount: number | null;
+  archiveRemotePreservation: RemotePreservation | null;
   archiveOriginDefaultRelation: OriginDefaultRelation | null;
   /**
    * Concise origin-default relation label for sidebar/hover completion UX.
@@ -172,7 +173,7 @@ export function createSidebarWorkspaceEntry(input: {
 }): SidebarWorkspaceEntry {
   const projectKey = input.workspace.project?.projectKey ?? input.workspace.projectId;
   const effectiveStatus = deriveEffectiveWorkspaceStatus(input);
-  const archiveUnpushedCommitCount = input.workspace.gitRuntime?.aheadOfOrigin ?? null;
+  const archiveRemotePreservation = input.workspace.gitRuntime?.remotePreservation ?? null;
   const archiveOriginDefaultRelation = input.workspace.gitRuntime?.originDefaultRelation ?? null;
   return {
     workspaceKey: `${input.serverId}:${input.workspace.id}`,
@@ -197,12 +198,12 @@ export function createSidebarWorkspaceEntry(input: {
       input.workspace.forge,
     ),
     archiveHasUncommittedChanges: input.workspace.gitRuntime?.isDirty ?? null,
-    archiveUnpushedCommitCount,
+    archiveRemotePreservation,
     archiveOriginDefaultRelation,
     originDefaultRelationLabel: formatOriginDefaultRelationLabel(
       archiveOriginDefaultRelation,
       undefined,
-      archiveUnpushedCommitCount,
+      archiveRemotePreservation,
       normalizeCurrentBranch(input.workspace.gitRuntime?.currentBranch),
     ),
     scripts: input.workspace.scripts,

@@ -32,7 +32,7 @@ export function createWorktreeCommand(): Command {
   addJsonAndDaemonHostOptions(
     worktree
       .command("archive")
-      .description("Archive a worktree (removes worktree and associated branch)")
+      .description("Archive a worktree and report eligible file and branch cleanup")
       .argument("<name>", "Worktree name or branch name"),
   ).action(withOutput(runArchiveCommand));
 

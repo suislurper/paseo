@@ -238,7 +238,11 @@ import {
   handlePaseoWorktreeListRequest as handleWorktreeListRequest,
   handleWorkspaceSetupStatusRequest as handleWorkspaceSetupStatusRequestMessage,
 } from "./worktree-session.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
+import {
+  archiveByScope,
+  persistArchivedWorkspaceHeads,
+  type ActiveWorkspaceRef,
+} from "./workspace-archive-service.js";
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import {
@@ -906,6 +910,8 @@ export class Session {
       archiveAgentForClose: (agentId) => this.archiveAgentForClose(agentId),
       findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
       listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+      persistRecoveryHead: (path, head) =>
+        persistArchivedWorkspaceHeads(this.workspaceRegistry, path, head),
       archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
       emit: (message) => this.emit(message),
       emitAgentRemove: (agentId) => this.agentUpdates.removeAgent(agentId),
@@ -3604,6 +3610,8 @@ export class Session {
         agentStorage: this.agentStorage,
         findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
         listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+        persistRecoveryHead: (path, head) =>
+          persistArchivedWorkspaceHeads(this.workspaceRegistry, path, head),
         archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
         emit: (message) => this.emit(message),
         emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
@@ -4041,6 +4049,7 @@ export class Session {
       aheadBehind: snapshot.git.aheadBehind,
       aheadOfOrigin: snapshot.git.aheadOfOrigin,
       behindOfOrigin: snapshot.git.behindOfOrigin,
+      remotePreservation: snapshot.git.remotePreservation,
       ...(snapshot.git.originDefaultRelation
         ? { originDefaultRelation: snapshot.git.originDefaultRelation }
         : {}),
@@ -5602,12 +5611,15 @@ export class Session {
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
+    let knownArchivedAt: string | null = null;
     try {
       const mode = request.mode ?? "archive_and_cleanup";
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
+
+      knownArchivedAt = existing.archivedAt ?? null;
 
       // archive_only archives records and workspace-owned terminals/agents. It
       // never runs arbitrary worktree teardown or deletes the directory, and it
@@ -5622,6 +5634,8 @@ export class Session {
           agentStorage: this.agentStorage,
           findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
           listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+          persistRecoveryHead: (path, head) =>
+            persistArchivedWorkspaceHeads(this.workspaceRegistry, path, head),
           archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
           emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
             this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
@@ -5658,6 +5672,7 @@ export class Session {
       if (!archivedAt) {
         throw new Error("Failed to archive workspace: required teardown failed");
       }
+      knownArchivedAt = archivedAt;
       this.emit({
         type: "archive_workspace_response",
         payload: {
@@ -5671,6 +5686,12 @@ export class Session {
         },
       });
     } catch (error) {
+      try {
+        knownArchivedAt =
+          (await this.workspaceRegistry.get(request.workspaceId))?.archivedAt ?? knownArchivedAt;
+      } catch {
+        // Preserve an already observed durable archive even if a later read fails.
+      }
       const message = error instanceof Error ? error.message : "Failed to archive workspace";
       this.sessionLogger.error(
         { err: error, workspaceId: request.workspaceId },
@@ -5681,7 +5702,7 @@ export class Session {
         payload: {
           requestId: request.requestId,
           workspaceId: request.workspaceId,
-          archivedAt: null,
+          archivedAt: knownArchivedAt,
           error: message,
         },
       });

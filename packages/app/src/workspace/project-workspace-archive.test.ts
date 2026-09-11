@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { selectProjectWorkspacesToArchive } from "@/workspace/project-workspace-archive";
 
 describe("selectProjectWorkspacesToArchive", () => {
-  it("skips archiving a dirty and unpushed worktree when the risky archive confirmation is canceled", async () => {
+  it("skips archiving a dirty and unpreserved worktree when the risky archive confirmation is canceled", async () => {
     const confirmWorktreeArchive = vi.fn(async () => false);
 
     const targets = await selectProjectWorkspacesToArchive(
@@ -13,7 +13,8 @@ describe("selectProjectWorkspacesToArchive", () => {
           workspaceKind: "worktree",
           name: "feature/risky",
           archiveHasUncommittedChanges: true,
-          archiveUnpushedCommitCount: 2,
+          archiveOriginDefaultRelation: null,
+          archiveRemotePreservation: { state: "unpreserved", ref: null, localCommitCount: 2 },
           diffStat: { additions: 5, deletions: 1 },
         },
         {
@@ -22,7 +23,8 @@ describe("selectProjectWorkspacesToArchive", () => {
           workspaceKind: "local_checkout",
           name: "main",
           archiveHasUncommittedChanges: null,
-          archiveUnpushedCommitCount: null,
+          archiveOriginDefaultRelation: null,
+          archiveRemotePreservation: null,
           diffStat: null,
         },
       ],
@@ -33,7 +35,8 @@ describe("selectProjectWorkspacesToArchive", () => {
     expect(confirmWorktreeArchive).toHaveBeenCalledWith({
       workspaceName: "feature/risky",
       isDirty: true,
-      aheadOfOrigin: 2,
+      remotePreservation: { state: "unpreserved", ref: null, localCommitCount: 2 },
+      originDefaultRelation: null,
       diffStat: { additions: 5, deletions: 1 },
     });
     expect(targets).toEqual([
@@ -44,7 +47,7 @@ describe("selectProjectWorkspacesToArchive", () => {
     ]);
   });
 
-  it("includes a dirty and unpushed worktree when the risky archive confirmation is accepted", async () => {
+  it("includes a dirty and unpreserved worktree when the risky archive confirmation is accepted", async () => {
     const confirmWorktreeArchive = vi.fn(async () => true);
 
     const targets = await selectProjectWorkspacesToArchive(
@@ -55,7 +58,8 @@ describe("selectProjectWorkspacesToArchive", () => {
           workspaceKind: "worktree",
           name: "feature/risky",
           archiveHasUncommittedChanges: true,
-          archiveUnpushedCommitCount: 2,
+          archiveOriginDefaultRelation: null,
+          archiveRemotePreservation: { state: "unpreserved", ref: null, localCommitCount: 2 },
           diffStat: { additions: 5, deletions: 1 },
         },
         {
@@ -64,7 +68,8 @@ describe("selectProjectWorkspacesToArchive", () => {
           workspaceKind: "local_checkout",
           name: "main",
           archiveHasUncommittedChanges: null,
-          archiveUnpushedCommitCount: null,
+          archiveOriginDefaultRelation: null,
+          archiveRemotePreservation: null,
           diffStat: null,
         },
       ],
@@ -75,7 +80,8 @@ describe("selectProjectWorkspacesToArchive", () => {
     expect(confirmWorktreeArchive).toHaveBeenCalledWith({
       workspaceName: "feature/risky",
       isDirty: true,
-      aheadOfOrigin: 2,
+      remotePreservation: { state: "unpreserved", ref: null, localCommitCount: 2 },
+      originDefaultRelation: null,
       diffStat: { additions: 5, deletions: 1 },
     });
     expect(targets).toEqual([

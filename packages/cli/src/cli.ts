@@ -9,6 +9,7 @@ import { createScheduleCommand } from "./commands/schedule/index.js";
 import { createSpeechCommand } from "./commands/speech/index.js";
 import { createTerminalCommand } from "./commands/terminal/index.js";
 import { createWorktreeCommand } from "./commands/worktree/index.js";
+import { createWorkspaceCommand } from "./commands/workspace/index.js";
 import { createHubCommand } from "./commands/hub/index.js";
 import { createHooksCommand } from "./commands/hooks.js";
 import { startCommand as daemonStartCommand } from "./commands/daemon/start.js";
@@ -186,6 +187,7 @@ export function createCli(): Command {
 
   // Worktree commands
   program.addCommand(createWorktreeCommand());
+  program.addCommand(createWorkspaceCommand());
 
   return program;
 }

@@ -307,13 +307,18 @@ function WorkspaceHoverCardContent({
             />
           ) : null}
           {workspace.originDefaultRelationLabel ? (
-            <Text
-              style={styles.relationLabel}
-              numberOfLines={2}
-              testID="hover-card-origin-default-relation"
-            >
-              {workspace.originDefaultRelationLabel}
-            </Text>
+            <>
+              <Text
+                style={styles.relationLabel}
+                numberOfLines={2}
+                testID="hover-card-origin-default-relation"
+              >
+                {workspace.originDefaultRelationLabel}
+              </Text>
+              <Text style={styles.relationLabel} testID="hover-card-preservation-evidence">
+                {t("workspace.git.actions.archiveWarning.fetchedRefsNote")}
+              </Text>
+            </>
           ) : null}
           {prHint || workspace.diffStat ? (
             <View style={styles.cardMetaRow}>

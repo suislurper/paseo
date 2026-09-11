@@ -1,3 +1,5 @@
+import * as cleanupSafety from "../utils/worktree-cleanup-safety.js";
+const inspectDisposableCheckout = cleanupSafety.inspectDisposableCheckout;
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -5517,6 +5519,43 @@ test("archive_workspace_request hides non-destructive workspace records", async 
   expect(response?.payload.error).toBeNull();
 });
 
+test("archive_workspace_request preserves archivedAt when the first response fails", async () => {
+  const session = createSessionForWorkspaceTests();
+  const record = createPersistedWorkspaceRecord({
+    workspaceId: "ws-response-failure",
+    projectId: "project",
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  session.workspaceRegistry.get = async () => record;
+  session.workspaceRegistry.list = async () => [record];
+  session.workspaceRegistry.archive = async (_id, archivedAt) => {
+    record.archivedAt = archivedAt;
+  };
+  const emitted: SessionOutboundMessage[] = [];
+  let failed = false;
+  session.emit = (message) => {
+    if (message.type === "archive_workspace_response" && !failed) {
+      failed = true;
+      throw new Error("response failed");
+    }
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  await session.handleMessage({
+    type: "archive_workspace_request",
+    workspaceId: record.workspaceId,
+    requestId: "response-failure",
+  });
+  expect(record.archivedAt).toBeTruthy();
+  expect(findByType(emitted, "archive_workspace_response")?.payload).toMatchObject({
+    archivedAt: record.archivedAt,
+    error: "response failed",
+  });
+});
+
 test("archive_workspace_request archives an external worktree record without deleting files", async () => {
   const tempDir = mkdtempSync(path.join(tmpdir(), "session-external-worktree-archive-"));
   const workspace = createPersistedWorkspaceRecord({
@@ -5628,6 +5667,7 @@ test("archive_workspace_request retries residual cleanup for an already-archived
     runSetup: false,
     paseoHome,
   });
+  prepareArchiveRemovalFixture(tempDir, repoDir, worktree.worktreePath);
   const workspace = createPersistedWorkspaceRecord({
     workspaceId: "ws-archived-retry",
     projectId: "proj-archived-retry",
@@ -5651,6 +5691,10 @@ test("archive_workspace_request retries residual cleanup for an already-archived
   };
   session.workspaceRegistry.get = async () => workspace;
   session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.update = async (_id, updater) => {
+    Object.assign(workspace, updater(workspace));
+    return workspace;
+  };
   session.workspaceRegistry.archive = async () => {
     throw new Error("must not unarchive or duplicate an archived record");
   };
@@ -5668,6 +5712,7 @@ test("archive_workspace_request retries residual cleanup for an already-archived
     expect(response?.payload.error).toBeNull();
     expect(response?.payload.archivedAt).toBe("2026-03-02T12:00:00.000Z");
   } finally {
+    vi.restoreAllMocks();
     rmSync(tempDir, { recursive: true, force: true });
   }
 });
@@ -5750,6 +5795,7 @@ test.each([
       paseoHome,
     });
 
+    prepareArchiveRemovalFixture(tempDir, repoDir, worktree.worktreePath);
     const workspaceId = "ws-worktree-kind-archive";
     const projectId = "proj-worktree-kind-archive";
     const workspace = createPersistedWorkspaceRecord({
@@ -5808,6 +5854,10 @@ test.each([
     };
     session.workspaceRegistry.get = async () => workspace;
     session.workspaceRegistry.list = async () => [workspace];
+    session.workspaceRegistry.update = async (_id, updater) => {
+      Object.assign(workspace, updater(workspace));
+      return workspace;
+    };
     session.workspaceRegistry.archive = async (_id: string, archivedAt: string) => {
       workspace.archivedAt = archivedAt;
     };
@@ -5827,6 +5877,7 @@ test.each([
         | undefined;
       expect(response?.payload.error).toBeNull();
     } finally {
+      vi.restoreAllMocks();
       rmSync(tempDir, { recursive: true, force: true });
     }
   },
@@ -8884,3 +8935,19 @@ test("workspace.create shares a flight across sessions and recovers its identity
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function prepareArchiveRemovalFixture(tempDir: string, repoDir: string, worktree: string): void {
+  const remote = path.join(tempDir, "preservation.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
+  execFileSync("git", ["remote", "add", "preservation", remote], { cwd: repoDir });
+  execFileSync("git", ["push", "preservation", "HEAD:refs/heads/saved"], {
+    cwd: worktree,
+    stdio: "pipe",
+  });
+  const procRoot = path.join(tempDir, "proc");
+  mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  writeFileSync(path.join(procRoot, "self", "mountinfo"), "1 0 0:1 / / rw - ext4 /dev/root rw\n");
+  vi.spyOn(cleanupSafety, "inspectDisposableCheckout").mockImplementation((cwd) =>
+    inspectDisposableCheckout(cwd, { procRoot }),
+  );
+}

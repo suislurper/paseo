@@ -1,3 +1,5 @@
+import type { RemotePreservation } from "@getpaseo/protocol/messages";
+import { getRemotePreservation } from "./worktree-preservation.js";
 import { resolve, dirname, basename } from "path";
 import { existsSync, realpathSync } from "fs";
 import { open as openFile, readFile, stat as statFile } from "fs/promises";
@@ -752,6 +754,7 @@ export interface CheckoutStatusGitNonPaseo {
   aheadOfOrigin: number | null;
   behindOfOrigin: number | null;
   originDefaultRelation?: OriginDefaultRelation;
+  remotePreservation?: RemotePreservation;
   hasRemote: boolean;
   remoteUrl: string | null;
   isPaseoOwnedWorktree: false;
@@ -768,6 +771,7 @@ export interface CheckoutStatusGitPaseo {
   aheadOfOrigin: number | null;
   behindOfOrigin: number | null;
   originDefaultRelation?: OriginDefaultRelation;
+  remotePreservation?: RemotePreservation;
   hasRemote: boolean;
   remoteUrl: string | null;
   isPaseoOwnedWorktree: true;
@@ -2280,18 +2284,20 @@ export async function getCheckoutStatus(
   const baseRef = facts.resolvedBaseRef;
   const mainRepoRoot = facts.mainRepoRoot;
   const factsContext = { ...context, facts };
-  const [aheadBehind, aheadOfOrigin, behindOfOrigin, originDefaultRelation] = await Promise.all([
-    baseRef && currentBranch
-      ? getAheadBehind(cwd, baseRef, currentBranch, factsContext)
-      : Promise.resolve(null),
-    hasRemote && currentBranch
-      ? getAheadOfOrigin(cwd, currentBranch, factsContext)
-      : Promise.resolve(null),
-    hasRemote && currentBranch
-      ? getBehindOfOrigin(cwd, currentBranch, factsContext)
-      : Promise.resolve(null),
-    getOriginDefaultRelation(cwd, factsContext),
-  ]);
+  const [aheadBehind, aheadOfOrigin, behindOfOrigin, originDefaultRelation, remotePreservation] =
+    await Promise.all([
+      baseRef && currentBranch
+        ? getAheadBehind(cwd, baseRef, currentBranch, factsContext)
+        : Promise.resolve(null),
+      hasRemote && currentBranch
+        ? getAheadOfOrigin(cwd, currentBranch, factsContext)
+        : Promise.resolve(null),
+      hasRemote && currentBranch
+        ? getBehindOfOrigin(cwd, currentBranch, factsContext)
+        : Promise.resolve(null),
+      getOriginDefaultRelation(cwd, factsContext),
+      getRemotePreservation(cwd),
+    ]);
 
   if (paseoWorktree.isPaseoOwnedWorktree && baseRef) {
     return {
@@ -2305,6 +2311,7 @@ export async function getCheckoutStatus(
       aheadOfOrigin,
       behindOfOrigin,
       originDefaultRelation,
+      remotePreservation,
       hasRemote,
       remoteUrl,
       isPaseoOwnedWorktree: true,
@@ -2323,6 +2330,7 @@ export async function getCheckoutStatus(
     aheadOfOrigin,
     behindOfOrigin,
     originDefaultRelation,
+    remotePreservation,
     hasRemote,
     remoteUrl,
     isPaseoOwnedWorktree: false,

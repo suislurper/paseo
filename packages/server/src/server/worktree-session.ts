@@ -491,6 +491,7 @@ export async function handlePaseoWorktreeArchiveRequest(
       payload: {
         success: true,
         removedAgents: result.removedAgents,
+        cleanup: result.cleanup,
         error: null,
         requestId,
       },

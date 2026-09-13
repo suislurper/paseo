@@ -1,6 +1,7 @@
-import type { SpawnSyncReturns } from "node:child_process";
+import { ChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,10 +10,11 @@ import { inheritLoginShellEnv } from "./login-shell-env";
 
 const zsh = "/bin/zsh";
 const describeIfZsh = existsSync(zsh) ? describe : describe.skip;
+const describeIfPosix = process.platform === "win32" ? describe.skip : describe;
 const basePath = "/usr/bin:/bin:/usr/sbin:/sbin";
 const fakeHome = path.join(os.tmpdir(), "paseo-login-shell-env-fake-home");
 type LoginShellEnvInput = NonNullable<Parameters<typeof inheritLoginShellEnv>[0]>;
-type LoginShellSpawnSync = NonNullable<LoginShellEnvInput["spawnSync"]>;
+type LoginShellSpawn = NonNullable<LoginShellEnvInput["spawn"]>;
 
 interface TestClock {
   advance: (ms: number) => void;
@@ -25,18 +27,9 @@ interface RecordedLog {
 }
 
 interface RecordedSpawn {
-  argv0: string | undefined;
   shell: string;
   args: string[];
-  timeoutMs: number | undefined;
-}
-
-interface SpawnResultFields {
-  stdout?: string;
-  stderr?: string;
-  status?: number | null;
-  signal?: NodeJS.Signals | null;
-  error?: Error;
+  argv0: string | undefined;
 }
 
 class RecordingLoginShellLogger {
@@ -50,6 +43,19 @@ class RecordingLoginShellLogger {
   warn(message: string, fields: Record<string, unknown>): void {
     this.warnings.push({ message, fields });
   }
+}
+
+class FakeChild extends ChildProcess {
+  override stdout = new PassThrough();
+  override stderr = new PassThrough();
+  readonly killed: string[] = [];
+
+  override kill(signal?: NodeJS.Signals | number): boolean {
+    this.killed.push(String(signal));
+    return true;
+  }
+
+  override unref(): void {}
 }
 
 function createEnv(home: string): NodeJS.ProcessEnv {
@@ -72,24 +78,39 @@ function createTestClock(): TestClock {
   };
 }
 
-function spawnResult(fields: SpawnResultFields): SpawnSyncReturns<string> {
-  const stdout = fields.stdout ?? "";
-  const stderr = fields.stderr ?? "";
-  return {
-    pid: 0,
-    output: [null, stdout, stderr],
-    stdout,
-    stderr,
-    status: fields.status === undefined ? 0 : fields.status,
-    signal: fields.signal ?? null,
-    error: fields.error,
-  } satisfies SpawnSyncReturns<string>;
+type SpawnBehavior = (child: FakeChild, call: RecordedSpawn) => void;
+
+function createFakeSpawn(behaviors: SpawnBehavior[]): {
+  calls: RecordedSpawn[];
+  children: FakeChild[];
+  spawn: LoginShellSpawn;
+} {
+  const calls: RecordedSpawn[] = [];
+  const children: FakeChild[] = [];
+  const spawn: LoginShellSpawn = (_shell, args, options) => {
+    const child = new FakeChild();
+    const recordedArgs = Array.isArray(args) ? args.map(String) : [];
+    const call: RecordedSpawn = {
+      shell: String(_shell),
+      args: recordedArgs,
+      argv0: options?.argv0,
+    };
+    calls.push(call);
+    children.push(child);
+    const behavior = behaviors[Math.min(calls.length - 1, behaviors.length - 1)];
+    queueMicrotask(() => behavior?.(child, call));
+    return child;
+  };
+  return { calls, children, spawn };
 }
 
-function successResult(shellCommand: string, env: NodeJS.ProcessEnv): SpawnSyncReturns<string> {
-  const marker = markerFromShellCommand(shellCommand);
-  const stdout = `${marker}${JSON.stringify(env)}${marker}`;
-  return spawnResult({ stdout });
+function succeedWith(env: NodeJS.ProcessEnv, clock: TestClock, advanceMs: number): SpawnBehavior {
+  return (child, call) => {
+    clock.advance(advanceMs);
+    const marker = markerFromShellCommand(String(call.args.at(-1)));
+    child.stdout?.emit("data", `${marker}${JSON.stringify({ ...env, PATH: env.PATH })}${marker}`);
+    child.emit("close", 0, null);
+  };
 }
 
 function shellArgsFromRecordedCall(call: RecordedSpawn | undefined): string[] {
@@ -112,30 +133,37 @@ async function createShellHome(): Promise<string> {
 }
 
 describe("login shell env retry behavior", () => {
-  it("applies the interactive env without retrying", () => {
+  it("preserves UTF-8 environment values split across output chunks", async () => {
+    const env = createEnv(fakeHome);
+    const logger = new RecordingLoginShellLogger();
+    const { spawn } = createFakeSpawn([
+      (child, call) => {
+        const marker = markerFromShellCommand(String(call.args.at(-1)));
+        const bytes = Buffer.from(`${marker}${JSON.stringify({ PATH: "/café/bin" })}${marker}`);
+        const split = bytes.indexOf(0xc3) + 1;
+        child.stdout.write(bytes.subarray(0, split));
+        child.stdout.write(bytes.subarray(split));
+        child.emit("close", 0, null);
+      },
+    ]);
+    await inheritLoginShellEnv({ env, logger, spawn });
+    expect(env.PATH).toBe("/café/bin");
+  });
+
+  it("applies the interactive env without retrying", async () => {
     const env = createEnv(fakeHome);
     const logger = new RecordingLoginShellLogger();
     const clock = createTestClock();
-    const calls: RecordedSpawn[] = [];
     const interactivePath = "/interactive/bin:/usr/bin:/bin";
-    const spawnSync: LoginShellSpawnSync = (shell, args, options) => {
-      const recordedArgs = Array.isArray(args) ? args.map(String) : [];
-      calls.push({
-        argv0: options?.argv0,
-        shell: String(shell),
-        args: recordedArgs,
-        timeoutMs: options?.timeout,
-      });
-      clock.advance(5);
-      return successResult(String(recordedArgs.at(-1)), { ...env, PATH: interactivePath });
-    };
+    const { calls, spawn } = createFakeSpawn([
+      succeedWith({ ...env, PATH: interactivePath }, clock, 5),
+    ]);
 
-    inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawnSync });
+    await inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawn });
 
     expect(env.PATH).toBe(interactivePath);
     expect(calls).toHaveLength(1);
     expect(shellArgsFromRecordedCall(calls[0])).toEqual(["-i", "-l", "-c"]);
-    expect(calls[0]?.timeoutMs).toBe(15_000);
     expect(logger.infos.map((entry) => entry.message)).toEqual([
       "[login-shell-env] start",
       "[login-shell-env] attempt applied",
@@ -158,49 +186,32 @@ describe("login shell env retry behavior", () => {
     expect(logger.warnings).toEqual([]);
   });
 
-  it("retries non-interactively after an interactive timeout", () => {
+  it("retries non-interactively after an interactive timeout", async () => {
     const env = createEnv(fakeHome);
     const logger = new RecordingLoginShellLogger();
     const clock = createTestClock();
-    const calls: RecordedSpawn[] = [];
     const nonInteractivePath = "/login/bin:/usr/bin:/bin";
-    const timeoutError = Object.assign(new Error("spawnSync ETIMEDOUT"), {
+    const timeoutError = Object.assign(new Error("spawn ETIMEDOUT"), {
       code: "ETIMEDOUT",
     });
     let timedOutStdout = "";
-    const spawnSync: LoginShellSpawnSync = (shell, args, options) => {
-      const recordedArgs = Array.isArray(args) ? args.map(String) : [];
-      calls.push({
-        argv0: options?.argv0,
-        shell: String(shell),
-        args: recordedArgs,
-        timeoutMs: options?.timeout,
-      });
-
-      if (calls.length === 1) {
-        const marker = markerFromShellCommand(String(recordedArgs.at(-1)));
+    const { calls, spawn } = createFakeSpawn([
+      (child, call) => {
+        const marker = markerFromShellCommand(String(call.args.at(-1)));
         timedOutStdout = `${marker}${JSON.stringify({ ...env, PATH: "/timed-out/bin" })}${marker}`;
         clock.advance(15_000);
-        return spawnResult({
-          stdout: timedOutStdout,
-          status: null,
-          signal: "SIGTERM",
-          error: timeoutError,
-        });
-      }
+        child.stdout?.emit("data", timedOutStdout);
+        child.emit("error", timeoutError);
+      },
+      succeedWith({ ...env, PATH: nonInteractivePath }, clock, 3),
+    ]);
 
-      clock.advance(3);
-      return successResult(String(recordedArgs.at(-1)), { ...env, PATH: nonInteractivePath });
-    };
-
-    inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawnSync });
+    await inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawn });
 
     expect(env.PATH).toBe(nonInteractivePath);
     expect(calls).toHaveLength(2);
     expect(shellArgsFromRecordedCall(calls[0])).toEqual(["-i", "-l", "-c"]);
     expect(shellArgsFromRecordedCall(calls[1])).toEqual(["-l", "-c"]);
-    expect(calls[0]?.timeoutMs).toBe(15_000);
-    expect(calls[1]?.timeoutMs).toBe(15_000);
     expect(logger.warnings).toHaveLength(1);
     expect(logger.warnings[0]?.message).toBe("[login-shell-env] attempt failed; retrying");
     expect(logger.warnings[0]?.fields).toMatchObject({
@@ -208,7 +219,7 @@ describe("login shell env retry behavior", () => {
       attemptKind: "interactive",
       shellArgs: ["-i", "-l", "-c"],
       status: null,
-      signal: "SIGTERM",
+      signal: null,
       stdoutLength: timedOutStdout.length,
       markerFound: true,
       errorCode: "ETIMEDOUT",
@@ -233,39 +244,27 @@ describe("login shell env retry behavior", () => {
     expectNoRawStdout(logger.warnings[0]?.fields ?? {});
   });
 
-  it("retries non-interactively when the interactive marker is missing", () => {
+  it("retries non-interactively when the interactive marker is missing", async () => {
     const env = createEnv(fakeHome);
     const logger = new RecordingLoginShellLogger();
     const clock = createTestClock();
-    const calls: RecordedSpawn[] = [];
     const nonInteractivePath = "/profile/bin:/usr/bin:/bin";
     const missingMarkerStdout = "switched shells before command\n";
-    const spawnSync: LoginShellSpawnSync = (shell, args, options) => {
-      const recordedArgs = Array.isArray(args) ? args.map(String) : [];
-      calls.push({
-        argv0: options?.argv0,
-        shell: String(shell),
-        args: recordedArgs,
-        timeoutMs: options?.timeout,
-      });
-
-      if (calls.length === 1) {
+    const { calls, spawn } = createFakeSpawn([
+      (child) => {
         clock.advance(25);
-        return spawnResult({ stdout: missingMarkerStdout });
-      }
+        child.stdout?.emit("data", missingMarkerStdout);
+        child.emit("close", 0, null);
+      },
+      succeedWith({ ...env, PATH: nonInteractivePath }, clock, 2),
+    ]);
 
-      clock.advance(2);
-      return successResult(String(recordedArgs.at(-1)), { ...env, PATH: nonInteractivePath });
-    };
-
-    inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawnSync });
+    await inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawn });
 
     expect(env.PATH).toBe(nonInteractivePath);
     expect(calls).toHaveLength(2);
     expect(shellArgsFromRecordedCall(calls[0])).toEqual(["-i", "-l", "-c"]);
     expect(shellArgsFromRecordedCall(calls[1])).toEqual(["-l", "-c"]);
-    expect(calls[0]?.timeoutMs).toBe(15_000);
-    expect(calls[1]?.timeoutMs).toBe(29_975);
     expect(logger.warnings).toHaveLength(1);
     expect(logger.warnings[0]?.message).toBe("[login-shell-env] attempt failed; retrying");
     expect(logger.warnings[0]?.fields).toMatchObject({
@@ -288,42 +287,29 @@ describe("login shell env retry behavior", () => {
     expectNoRawStdout(logger.warnings[0]?.fields ?? {});
   });
 
-  it("keeps the inherited env after both attempts fail", () => {
+  it("keeps the inherited env after both attempts fail", async () => {
     const env = createEnv(fakeHome);
     const logger = new RecordingLoginShellLogger();
     const clock = createTestClock();
-    const calls: RecordedSpawn[] = [];
-    const spawnError = Object.assign(new Error("spawnSync ENOENT"), {
+    const spawnError = Object.assign(new Error("spawn ENOENT"), {
       code: "ENOENT",
     });
-    const spawnSync: LoginShellSpawnSync = (shell, args, options) => {
-      const recordedArgs = Array.isArray(args) ? args.map(String) : [];
-      calls.push({
-        argv0: options?.argv0,
-        shell: String(shell),
-        args: recordedArgs,
-        timeoutMs: options?.timeout,
-      });
-
-      if (calls.length === 1) {
+    const { calls, spawn } = createFakeSpawn([
+      (child) => {
         clock.advance(10);
-        return spawnResult({ stdout: "no marker\n" });
-      }
+        child.stdout?.emit("data", "no marker\n");
+        child.emit("close", 0, null);
+      },
+      (child) => {
+        clock.advance(5);
+        child.emit("error", spawnError);
+      },
+    ]);
 
-      clock.advance(5);
-      return spawnResult({
-        status: null,
-        signal: null,
-        error: spawnError,
-      });
-    };
-
-    inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawnSync });
+    await inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawn });
 
     expect(env.PATH).toBe(basePath);
     expect(calls).toHaveLength(2);
-    expect(calls[0]?.timeoutMs).toBe(15_000);
-    expect(calls[1]?.timeoutMs).toBe(29_990);
     expect(logger.infos.map((entry) => entry.message)).toEqual(["[login-shell-env] start"]);
     expect(logger.warnings.map((entry) => entry.message)).toEqual([
       "[login-shell-env] attempt failed; retrying",
@@ -359,32 +345,22 @@ describe("login shell env retry behavior", () => {
     expectNoRawStdout(logger.warnings[2]?.fields ?? {});
   });
 
-  it("uses the configured shell env timeout", () => {
+  it("uses the configured shell env timeout", async () => {
     const env = {
       ...createEnv(fakeHome),
       PASEO_SHELL_ENV_TIMEOUT_MS: "1234",
     };
     const logger = new RecordingLoginShellLogger();
     const clock = createTestClock();
-    const calls: RecordedSpawn[] = [];
     const configuredPath = "/configured/bin:/usr/bin:/bin";
-    const spawnSync: LoginShellSpawnSync = (shell, args, options) => {
-      const recordedArgs = Array.isArray(args) ? args.map(String) : [];
-      calls.push({
-        argv0: options?.argv0,
-        shell: String(shell),
-        args: recordedArgs,
-        timeoutMs: options?.timeout,
-      });
-      clock.advance(4);
-      return successResult(String(recordedArgs.at(-1)), { ...env, PATH: configuredPath });
-    };
+    const { calls, spawn } = createFakeSpawn([
+      succeedWith({ ...env, PATH: configuredPath }, clock, 4),
+    ]);
 
-    inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawnSync });
+    await inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawn });
 
     expect(env.PATH).toBe(configuredPath);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.timeoutMs).toBe(617);
     expect(logger.infos[0]?.fields).toMatchObject({
       timeoutMs: 1234,
     });
@@ -397,34 +373,24 @@ describe("login shell env retry behavior", () => {
     });
   });
 
-  it("uses argv0 for the non-interactive tcsh login retry", () => {
+  it("uses argv0 for the non-interactive tcsh login retry", async () => {
     const env = {
       ...createEnv(fakeHome),
       SHELL: "/bin/tcsh",
     };
     const logger = new RecordingLoginShellLogger();
     const clock = createTestClock();
-    const calls: RecordedSpawn[] = [];
     const nonInteractivePath = "/tcsh/login/bin:/usr/bin:/bin";
-    const spawnSync: LoginShellSpawnSync = (shell, args, options) => {
-      const recordedArgs = Array.isArray(args) ? args.map(String) : [];
-      calls.push({
-        argv0: options?.argv0,
-        shell: String(shell),
-        args: recordedArgs,
-        timeoutMs: options?.timeout,
-      });
-
-      if (calls.length === 1) {
+    const { calls, spawn } = createFakeSpawn([
+      (child) => {
         clock.advance(8);
-        return spawnResult({ stdout: "no marker\n" });
-      }
+        child.stdout?.emit("data", "no marker\n");
+        child.emit("close", 0, null);
+      },
+      succeedWith({ ...env, PATH: nonInteractivePath }, clock, 2),
+    ]);
 
-      clock.advance(2);
-      return successResult(String(recordedArgs.at(-1)), { ...env, PATH: nonInteractivePath });
-    };
-
-    inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawnSync });
+    await inheritLoginShellEnv({ env, logger, now: clock.now, platform: "darwin", spawn });
 
     expect(env.PATH).toBe(nonInteractivePath);
     expect(calls).toHaveLength(2);
@@ -432,7 +398,6 @@ describe("login shell env retry behavior", () => {
     expect(calls[0]?.argv0).toBeUndefined();
     expect(shellArgsFromRecordedCall(calls[1])).toEqual(["-c"]);
     expect(calls[1]?.argv0).toBe("-tcsh");
-    expect(calls[1]?.timeoutMs).toBe(29_992);
     expect(logger.warnings[0]?.fields).toMatchObject({
       attemptKind: "interactive",
       shellArgs: ["-ic"],
@@ -466,7 +431,7 @@ describeIfZsh("login shell env", () => {
     const env = createEnv(home);
     const logger = new RecordingLoginShellLogger();
 
-    inheritLoginShellEnv({ env, logger });
+    await inheritLoginShellEnv({ env, logger });
 
     expect(env.PATH?.split(path.delimiter)[0]).toBe(binDir);
     expect(logger.infos.map((entry) => entry.message)).toEqual([
@@ -496,7 +461,7 @@ describeIfZsh("login shell env", () => {
     const env = createEnv(home);
     const logger = new RecordingLoginShellLogger();
 
-    inheritLoginShellEnv({ env, logger });
+    await inheritLoginShellEnv({ env, logger });
 
     expect(env.PASEO_TEST_ZSHRC_LOADED).toBe("1");
     expect(logger.infos.map((entry) => entry.message)).toEqual([
@@ -514,7 +479,7 @@ describeIfZsh("login shell env", () => {
     const env = createEnv(home);
     const logger = new RecordingLoginShellLogger();
 
-    inheritLoginShellEnv({ env, logger });
+    await inheritLoginShellEnv({ env, logger });
 
     expect(env.PATH).toBe(basePath);
     expect(logger.infos.map((entry) => entry.message)).toEqual(["[login-shell-env] start"]);
@@ -563,26 +528,19 @@ describeIfZsh("login shell env", () => {
     const logger = new RecordingLoginShellLogger();
     const timedOutPath = path.join(home, "timed-out");
     let stdout = "";
-    const timeoutError = Object.assign(new Error("spawnSync ETIMEDOUT"), {
+    const timeoutError = Object.assign(new Error("spawn ETIMEDOUT"), {
       code: "ETIMEDOUT",
     });
-    const spawnSync: LoginShellSpawnSync = (_shell, args) => {
-      const shellCommand = String(Array.isArray(args) ? args.at(-1) : "");
+    const failWithTimedOutMarker: SpawnBehavior = (child, call) => {
+      const shellCommand = String(call.args.at(-1) ?? "");
       const marker = markerFromShellCommand(shellCommand);
       stdout = `${marker}${JSON.stringify({ ...env, PATH: timedOutPath })}${marker}`;
-
-      return {
-        pid: 0,
-        output: [stdout, stdout, ""],
-        stdout,
-        stderr: "",
-        status: null,
-        signal: "SIGTERM",
-        error: timeoutError,
-      } satisfies SpawnSyncReturns<string>;
+      child.stdout?.emit("data", stdout);
+      child.emit("error", timeoutError);
     };
+    const { spawn } = createFakeSpawn([failWithTimedOutMarker, failWithTimedOutMarker]);
 
-    inheritLoginShellEnv({ env, logger, spawnSync });
+    await inheritLoginShellEnv({ env, logger, spawn });
 
     expect(env.PATH).toBe(basePath);
     expect(logger.infos.map((entry) => entry.message)).toEqual(["[login-shell-env] start"]);
@@ -597,7 +555,7 @@ describeIfZsh("login shell env", () => {
       shell: zsh,
       shellArgs: ["-i", "-l", "-c"],
       status: null,
-      signal: "SIGTERM",
+      signal: null,
       stdoutLength: stdout.length,
       markerFound: true,
       errorCode: "ETIMEDOUT",
@@ -608,7 +566,7 @@ describeIfZsh("login shell env", () => {
       shell: zsh,
       shellArgs: ["-l", "-c"],
       status: null,
-      signal: "SIGTERM",
+      signal: null,
       stdoutLength: stdout.length,
       markerFound: true,
       errorCode: "ETIMEDOUT",
@@ -619,7 +577,7 @@ describeIfZsh("login shell env", () => {
       shell: zsh,
       shellArgs: ["-l", "-c"],
       status: null,
-      signal: "SIGTERM",
+      signal: null,
       stdoutLength: stdout.length,
       markerFound: true,
       errorCode: "ETIMEDOUT",
@@ -630,3 +588,72 @@ describeIfZsh("login shell env", () => {
     expectNoRawStdout(logger.warnings[2]?.fields ?? {});
   });
 });
+
+describeIfPosix("login shell env hang regression", () => {
+  it("keeps the event loop responsive and kills TERM-ignoring descendants within the deadline", async () => {
+    const home = await createShellHome();
+    const pidFile = path.join(home, "owned.pids");
+    const wrapper = path.join(home, "paseo-hang-shell");
+    await writeFile(
+      wrapper,
+      [
+        "#!/bin/sh",
+        "trap '' TERM",
+        `echo $$ >> "${pidFile}"`,
+        "sleep 45 &",
+        `echo $! >> "${pidFile}"`,
+        "wait",
+        "",
+      ].join("\n"),
+    );
+    await chmod(wrapper, 0o700);
+    const env = { PATH: basePath, HOME: home, SHELL: wrapper, PASEO_SHELL_ENV_TIMEOUT_MS: "600" };
+    const logger = new RecordingLoginShellLogger();
+    let beats = 0;
+    const heartbeat = setInterval(() => {
+      beats += 1;
+    }, 20);
+    const startedAt = Date.now();
+    try {
+      await inheritLoginShellEnv({ env, logger });
+      const elapsed = Date.now() - startedAt;
+      const pids = (await readFile(pidFile, "utf8")).trim().split(/\s+/).map(Number);
+      expect(new Set(pids).size).toBe(4);
+      for (const pid of pids) {
+        await expect.poll(() => pidRunning(pid), { timeout: 2000 }).toBe(false);
+      }
+      expect(elapsed).toBeLessThan(1800);
+      expect(beats).toBeGreaterThan(5);
+      expect(env.PATH).toBe(basePath);
+      expect(logger.warnings.filter((entry) => entry.fields.reason === "timeout")).toHaveLength(3);
+    } finally {
+      clearInterval(heartbeat);
+      if (existsSync(pidFile)) {
+        const pids = (await readFile(pidFile, "utf8")).trim().split(/\s+/).map(Number);
+        for (const pid of pids) {
+          if (await pidRunning(pid)) process.kill(pid, "SIGKILL");
+        }
+      }
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+async function pidRunning(pid: number): Promise<boolean> {
+  try {
+    if (process.platform === "linux") {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z";
+    }
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      ["ENOENT", "ESRCH"].includes(String(error.code))
+    )
+      return false;
+    throw error;
+  }
+}

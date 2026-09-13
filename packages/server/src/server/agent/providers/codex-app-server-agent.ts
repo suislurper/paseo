@@ -6697,8 +6697,15 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       resolveCodexHomeFor(this.runtimeSettings, launchContext?.env),
     );
-    await session.connect();
-    return session;
+    try {
+      await session.connect();
+      return session;
+    } catch (error) {
+      // A failed initialization may already own a process and rollout writer.
+      // Do not let the caller recover the original account until cleanup finishes.
+      await session.close();
+      throw error;
+    }
   }
 
   async resumeSession(
@@ -6742,8 +6749,15 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       targetHome,
     );
-    await session.connect();
-    return session;
+    try {
+      await session.connect();
+      return session;
+    } catch (error) {
+      // A failed initialization may already own a process and rollout writer.
+      // Do not let the caller recover the original account until cleanup finishes.
+      await session.close();
+      throw error;
+    }
   }
 
   async listImportableSessions(

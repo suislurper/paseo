@@ -100,6 +100,47 @@ async function resumeIntoTarget(
 }
 
 describe("Codex profile home switching", () => {
+  test.each(["create", "resume"])(
+    "cleans up failed %s connection before caller recovery",
+    async (operation) => {
+      const { sourceHome, targetHome } = await createHomes();
+      await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
+      const appServer = createFakeCodexAppServer({
+        initialize: () => Promise.reject(new Error("destination initialization failed")),
+      });
+      const order: string[] = [];
+      appServer.child.kill = () => {
+        order.push("shutdown requested");
+        setTimeout(() => {
+          order.push("target exited");
+          appServer.child.emit("exit", 0, null);
+        }, 10);
+        return true;
+      };
+      const client = createProfileClient(targetHome);
+      castInternals<ClientInternals>(client).spawnAppServer = async () => appServer.child;
+      const connecting =
+        operation === "resume"
+          ? resumeIntoTarget(client, sourceHome)
+          : client.createSession({
+              provider: "codex",
+              cwd: "/workspace/project",
+              modeId: "auto",
+              model: "gpt-5.4",
+            });
+      await expect(
+        connecting.catch((error) => {
+          order.push("caller recovery");
+          throw error;
+        }),
+      ).rejects.toThrow("destination initialization failed");
+      expect(order).toEqual(["shutdown requested", "target exited", "caller recovery"]);
+      expect(appServer.child.stdin.writableEnded).toBe(true);
+      appServer.child.stdout.end();
+      appServer.child.stderr.end();
+    },
+  );
+
   test("copies a resumed session and its referenced child rollouts into the target home", async () => {
     const { sourceHome, targetHome } = await createHomes();
     await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());

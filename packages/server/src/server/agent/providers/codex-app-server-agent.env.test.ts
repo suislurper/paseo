@@ -1,8 +1,8 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import fs, { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals } from "../../test-utils/class-mocks.js";
@@ -36,6 +36,7 @@ interface ClientInternals {
 const createdRoots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     createdRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -99,6 +100,47 @@ async function resumeIntoTarget(
 }
 
 describe("Codex profile home switching", () => {
+  test.each(["create", "resume"])(
+    "cleans up failed %s connection before caller recovery",
+    async (operation) => {
+      const { sourceHome, targetHome } = await createHomes();
+      await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
+      const appServer = createFakeCodexAppServer({
+        initialize: () => Promise.reject(new Error("destination initialization failed")),
+      });
+      const order: string[] = [];
+      appServer.child.kill = () => {
+        order.push("shutdown requested");
+        setTimeout(() => {
+          order.push("target exited");
+          appServer.child.emit("exit", 0, null);
+        }, 10);
+        return true;
+      };
+      const client = createProfileClient(targetHome);
+      castInternals<ClientInternals>(client).spawnAppServer = async () => appServer.child;
+      const connecting =
+        operation === "resume"
+          ? resumeIntoTarget(client, sourceHome)
+          : client.createSession({
+              provider: "codex",
+              cwd: "/workspace/project",
+              modeId: "auto",
+              model: "gpt-5.4",
+            });
+      await expect(
+        connecting.catch((error) => {
+          order.push("caller recovery");
+          throw error;
+        }),
+      ).rejects.toThrow("destination initialization failed");
+      expect(order).toEqual(["shutdown requested", "target exited", "caller recovery"]);
+      expect(appServer.child.stdin.writableEnded).toBe(true);
+      appServer.child.stdout.end();
+      appServer.child.stderr.end();
+    },
+  );
+
   test("copies a resumed session and its referenced child rollouts into the target home", async () => {
     const { sourceHome, targetHome } = await createHomes();
     await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
@@ -152,18 +194,234 @@ describe("Codex profile home switching", () => {
     );
   });
 
-  test("refuses to overwrite a diverged rollout in the target home", async () => {
+  test("preserves a conflicting account copy and resumes the selected source conversation", async () => {
     const { sourceHome, targetHome } = await createHomes();
-    const sourceContent = rootRolloutContent();
-    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, sourceContent);
-    // Same length, different bytes: neither file is a prefix of the other.
-    await writeRollout(targetHome, ROOT_ROLLOUT_REL, `X${sourceContent.slice(1)}`);
-
-    const client = createProfileClient(targetHome);
-    await expect(resumeIntoTarget(client, sourceHome)).rejects.toThrow(
-      "has diverged between profile homes",
-    );
+    const common = rootRolloutContent();
+    const source =
+      common +
+      '{"type":"response_item","payload":{"type":"message","content":"continued conversation"}}\n';
+    const previous = common + '{"type":"event_msg","payload":{"type":"item_completed"}}\n';
+    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, source);
+    await writeRollout(targetHome, ROOT_ROLLOUT_REL, previous);
+    const session = await resumeIntoTarget(createProfileClient(targetHome), sourceHome);
+    try {
+      expect(await readFile(join(targetHome, ROOT_ROLLOUT_REL), "utf8")).toBe(source);
+      expect(await readFile(join(sourceHome, ROOT_ROLLOUT_REL), "utf8")).toBe(source);
+      const backupDir = join(targetHome, "paseo-profile-transfer-backups", ROOT_THREAD_ID);
+      const backups = await readdir(backupDir);
+      expect(backups).toHaveLength(1);
+      expect(await readFile(join(backupDir, backups[0]!), "utf8")).toBe(previous);
+    } finally {
+      await session.close();
+    }
   });
+
+  test("retains the target when publication fails and removes the staged file", async () => {
+    const { sourceHome, targetHome } = await createHomes();
+    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
+    const previous = '{"different":"conversation"}\n';
+    await writeRollout(targetHome, ROOT_ROLLOUT_REL, previous);
+    vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("publication failed"));
+    await expect(resumeIntoTarget(createProfileClient(targetHome), sourceHome)).rejects.toThrow(
+      "publication failed",
+    );
+    expect(await readFile(join(targetHome, ROOT_ROLLOUT_REL), "utf8")).toBe(previous);
+    expect(
+      (await readdir(dirname(join(targetHome, ROOT_ROLLOUT_REL)))).some((name) =>
+        name.startsWith(".paseo-transfer-"),
+      ),
+    ).toBe(false);
+  });
+
+  test("refuses a changing source without publishing a partial snapshot", async () => {
+    const { sourceHome, targetHome } = await createHomes();
+    const sourcePath = join(sourceHome, ROOT_ROLLOUT_REL);
+    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
+    const previous = '{"existing":true}\n';
+    await writeRollout(targetHome, ROOT_ROLLOUT_REL, previous);
+    const copy = fs.copyFile;
+    vi.spyOn(fs, "copyFile").mockImplementation(async (...args) => {
+      await copy(...args);
+      await appendFile(sourcePath, '{"late":true}\n');
+    });
+    await expect(resumeIntoTarget(createProfileClient(targetHome), sourceHome)).rejects.toThrow(
+      "changed during transfer",
+    );
+    expect(await readFile(join(targetHome, ROOT_ROLLOUT_REL), "utf8")).toBe(previous);
+  });
+
+  test("retains a destination changed by another writer while staging", async () => {
+    const { sourceHome, targetHome } = await createHomes();
+    const targetPath = join(targetHome, ROOT_ROLLOUT_REL);
+    const previous = '{"existing":true}\n';
+    const late = '{"late":true}\n';
+    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
+    await writeRollout(targetHome, ROOT_ROLLOUT_REL, previous);
+    const copy = fs.copyFile;
+    vi.spyOn(fs, "copyFile").mockImplementation(async (...args) => {
+      await copy(...args);
+      await appendFile(targetPath, late);
+    });
+    await expect(resumeIntoTarget(createProfileClient(targetHome), sourceHome)).rejects.toThrow(
+      "changed in the target profile",
+    );
+    expect(await readFile(targetPath, "utf8")).toBe(previous + late);
+  });
+
+  test("rejects a rollout disappearing after indexing without an unhandled stream error", async () => {
+    const { sourceHome, targetHome } = await createHomes();
+    const sourcePath = join(sourceHome, ROOT_ROLLOUT_REL);
+    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, rootRolloutContent());
+    const list = fs.readdir;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      const entries = await list(...args);
+      if (String(args[0]) === dirname(sourcePath)) await rm(sourcePath);
+      return entries;
+    });
+    await expect(
+      resumeIntoTarget(createProfileClient(targetHome), sourceHome),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("does not copy UUIDs quoted in messages or unrelated tool output", async () => {
+    const { sourceHome, targetHome } = await createHomes();
+    const content =
+      [
+        { type: "session_meta", payload: { id: ROOT_THREAD_ID } },
+        {
+          type: "response_item",
+          payload: { type: "message", content: `Example agentThreadId: ${CHILD_THREAD_ID}` },
+        },
+        {
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: "unrelated",
+            output: JSON.stringify({ agent_id: CHILD_THREAD_ID }),
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n";
+    await writeRollout(sourceHome, ROOT_ROLLOUT_REL, content);
+    await writeRollout(sourceHome, CHILD_ROLLOUT_REL, '{"unrelated":true}\n');
+    const session = await resumeIntoTarget(createProfileClient(targetHome), sourceHome);
+    try {
+      await expect(readFile(join(targetHome, CHILD_ROLLOUT_REL))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each([
+    { type: "sub_agent_activity", agent_thread_id: CHILD_THREAD_ID, kind: "started" },
+    {
+      type: "item_completed",
+      item: { type: "SubAgentActivity", agent_thread_id: CHILD_THREAD_ID, kind: "completed" },
+    },
+  ])("copies V2 child history from native activity %j", async (activity) => {
+    const { sourceHome, targetHome } = await createHomes();
+    const records = [
+      {
+        type: "response_item",
+        payload: { type: "function_call", name: "spawn_agent", call_id: "v2" },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "v2",
+          output: JSON.stringify({ task_name: "child" }),
+        },
+      },
+      { type: "event_msg", payload: activity },
+    ];
+    await writeRollout(
+      sourceHome,
+      ROOT_ROLLOUT_REL,
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await writeRollout(sourceHome, CHILD_ROLLOUT_REL, '{"child":true}\n');
+    const session = await resumeIntoTarget(createProfileClient(targetHome), sourceHome);
+    try {
+      expect(await readFile(join(targetHome, CHILD_ROLLOUT_REL), "utf8")).toBe('{"child":true}\n');
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("copies native spawn outputs and recursive child histories without cycles", async () => {
+    const { sourceHome, targetHome } = await createHomes();
+    const grandchildId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const grandchildRel = CHILD_ROLLOUT_REL.replace(CHILD_THREAD_ID, grandchildId);
+    const records = [
+      { type: "session_meta", payload: { id: ROOT_THREAD_ID } },
+      {
+        type: "response_item",
+        payload: { type: "function_call", name: "spawn_agent", call_id: "spawn-one" },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "spawn-one",
+          output: JSON.stringify({ agent_id: CHILD_THREAD_ID }),
+        },
+      },
+    ];
+    await writeRollout(
+      sourceHome,
+      ROOT_ROLLOUT_REL,
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const child =
+      JSON.stringify({
+        type: "event_msg",
+        payload: { type: "collab_agent_spawn_end", new_thread_id: grandchildId },
+      }) + "\n";
+    const grandchild =
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "agent", agentThreadId: ROOT_THREAD_ID },
+      }) + "\n";
+    await writeRollout(sourceHome, CHILD_ROLLOUT_REL, child);
+    await writeRollout(sourceHome, grandchildRel, grandchild);
+    const session = await resumeIntoTarget(createProfileClient(targetHome), sourceHome);
+    try {
+      expect(await readFile(join(targetHome, CHILD_ROLLOUT_REL), "utf8")).toBe(child);
+      expect(await readFile(join(targetHome, grandchildRel), "utf8")).toBe(grandchild);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each([0, 1_000_000, 2_200_000])(
+    "detects a large conflicting copy at byte %i even when another range matches",
+    async (offset) => {
+      const { sourceHome, targetHome } = await createHomes();
+      const source =
+        rootRolloutContent() +
+        JSON.stringify({
+          type: "response_item",
+          payload: { type: "message", content: "a".repeat(2_500_000) },
+        }) +
+        "\n";
+      const target = source.slice(0, offset) + "X" + source.slice(offset + 1);
+      await writeRollout(sourceHome, ROOT_ROLLOUT_REL, source);
+      await writeRollout(targetHome, ROOT_ROLLOUT_REL, target);
+      const session = await resumeIntoTarget(createProfileClient(targetHome), sourceHome);
+      try {
+        expect(await readFile(join(targetHome, ROOT_ROLLOUT_REL), "utf8")).toBe(source);
+        const backupDir = join(targetHome, "paseo-profile-transfer-backups", ROOT_THREAD_ID);
+        const [backup] = await readdir(backupDir);
+        expect(await readFile(join(backupDir, backup!), "utf8")).toBe(target);
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   test("replaces a stale prefix rollout when switching back to an earlier home", async () => {
     const { sourceHome, targetHome } = await createHomes();

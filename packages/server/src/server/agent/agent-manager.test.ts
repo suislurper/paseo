@@ -1546,6 +1546,77 @@ test("setAgentProvider reloads an active Codex agent through a compatible provid
   );
 });
 
+test.each(["success", "target failure", "close failure"])(
+  "setAgentProvider drains the old writer before copying and recovers on %s",
+  async (scenario) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-switch-drain-"));
+    const order: string[] = [];
+    let history = "initial";
+    let copied = "";
+    class ClosingSession extends TestAgentSession {
+      override async close() {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        if (scenario === "close failure") throw new Error("writer still alive");
+        history += " late completion";
+        order.push("closed");
+      }
+    }
+    class ProfileClient implements AgentClient {
+      readonly capabilities = TEST_CAPABILITIES;
+      constructor(readonly provider: string) {}
+      async isAvailable() {
+        return true;
+      }
+      async fetchCatalog() {
+        return { models: [], modes: [] };
+      }
+      async createSession(config: AgentSessionConfig) {
+        return new ClosingSession(config);
+      }
+      async resumeSession(_handle: AgentPersistenceHandle, config?: Partial<AgentSessionConfig>) {
+        order.push(this.provider);
+        if (this.provider === "codex-work") {
+          copied = history;
+          if (scenario === "target failure") throw new Error("destination unavailable");
+        }
+        return new TestAgentSession({ provider: this.provider, cwd: workdir, ...config });
+      }
+    }
+    const manager = new AgentManager({
+      clients: { codex: new ProfileClient("codex"), "codex-work": new ProfileClient("codex-work") },
+      providerDefinitions: {
+        codex: { enabled: true },
+        "codex-work": { enabled: true, derivedFromProviderId: "codex" },
+      },
+      logger,
+    });
+    const created = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const switching = manager.setAgentProvider(created.id, "codex-work", "gpt-5.4");
+    if (scenario === "success") {
+      await switching;
+      expect(order).toEqual(["closed", "codex-work"]);
+      expect(copied).toBe("initial late completion");
+      expect(manager.getAgent(created.id)?.provider).toBe("codex-work");
+    } else if (scenario === "target failure") {
+      await expect(switching).rejects.toThrow("destination unavailable");
+      expect(order).toEqual(["closed", "codex-work", "codex"]);
+      expect(manager.getAgent(created.id)).toMatchObject({
+        provider: "codex",
+        config: { model: "gpt-5.4" },
+        lifecycle: "idle",
+      });
+    } else {
+      await expect(switching).rejects.toThrow("writer still alive");
+      expect(order).toEqual([]);
+      expect(copied).toBe("");
+    }
+  },
+);
+
 test("setAgentProvider rejects pending permissions without canceling or resuming", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-switch-permission-"));
   let targetAvailabilityChecks = 0;

@@ -38,7 +38,7 @@ import type { Logger } from "pino";
 
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createReadStream, Dirent } from "node:fs";
+import { constants as fsConstants, createReadStream, Dirent, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -560,8 +560,7 @@ function resolveCodexHomeDir(): string {
 const PASEO_CODEX_HOME_METADATA_KEY = "paseoCodexHome";
 const CODEX_ROLLOUT_THREAD_ID_PATTERN =
   /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
-const CODEX_ANY_THREAD_ID_PATTERN =
-  /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const CODEX_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Effective CODEX_HOME for a spawned app-server: launch-context env overrides
 // profile runtime settings, which override the daemon process env. This must
@@ -615,20 +614,108 @@ async function indexCodexRollouts(codexHome: string): Promise<Map<string, string
   return index;
 }
 
-// Rollouts reference sub-agent child threads by id; resume replays those child
-// histories, so they must travel with the root rollout across profile homes.
-async function collectCodexReferencedThreadIds(rolloutPath: string): Promise<Set<string>> {
-  const ids = new Set<string>();
-  const reader = readline.createInterface({
-    input: createReadStream(rolloutPath, { encoding: "utf8" }),
-    crlfDelay: Infinity,
-  });
-  for await (const line of reader) {
-    for (const match of line.matchAll(CODEX_ANY_THREAD_ID_PATTERN)) {
-      ids.add(match[0].toLowerCase());
+function readCodexSpawnOutputId(output: unknown): unknown {
+  if (typeof output !== "string") return undefined;
+  try {
+    return toObjectRecord(JSON.parse(output))?.agent_id;
+  } catch {
+    return undefined;
+  } // Failed spawn output can be plain text.
+}
+
+function readCodexRolloutResponseIds(
+  payload: Record<string, unknown>,
+  spawnCalls: Set<string>,
+): unknown[] {
+  switch (payload.type) {
+    case "agent":
+    case "subAgentActivity":
+    case "collabAgentToolCall":
+      return [
+        payload.agentThreadId,
+        ...(Array.isArray(payload.receiverThreadIds) ? payload.receiverThreadIds : []),
+      ];
+    case "function_call":
+    case "custom_tool_call": {
+      const name = typeof payload.name === "string" ? payload.name : "";
+      if (
+        (name === "spawn_agent" || name.endsWith(".spawn_agent")) &&
+        typeof payload.call_id === "string"
+      )
+        spawnCalls.add(payload.call_id);
+      return [];
     }
+    case "function_call_output":
+    case "custom_tool_call_output":
+      if (typeof payload.call_id === "string" && spawnCalls.delete(payload.call_id))
+        return [readCodexSpawnOutputId(payload.output)];
+      return [];
+    default:
+      return [];
+  }
+}
+
+function readCodexRolloutEventIds(payload: Record<string, unknown>): unknown[] {
+  const ids: unknown[] = readCodexHistoricalSubAgentThreadIds(payload.item);
+  for (const item of [payload, toObjectRecord(payload.item)]) {
+    if (!item || typeof item.type !== "string") continue;
+    const type = item.type.replaceAll("_", "").toLowerCase();
+    if (type === "subagentactivity") ids.push(item.agent_thread_id, item.agentThreadId);
+    if (type === "collabagenttoolcall" && Array.isArray(item.receiver_thread_ids))
+      ids.push(...item.receiver_thread_ids);
+  }
+  if (typeof payload.type === "string" && payload.type.startsWith("collab_")) {
+    ids.push(payload.new_thread_id, payload.receiver_thread_id);
+    if (Array.isArray(payload.receiver_thread_ids)) ids.push(...payload.receiver_thread_ids);
   }
   return ids;
+}
+
+// Only structural references belong to this conversation. UUIDs in messages,
+// code, and tool output often name unrelated sessions (or aren't sessions at all).
+async function collectCodexReferencedThreadIds(rolloutPath: string): Promise<Set<string>> {
+  const ids = new Set<string>();
+  const spawnCalls = new Set<string>();
+  const markers = [
+    '"agentThreadId"',
+    '"agent_thread_id"',
+    '"receiverThreadIds"',
+    '"new_thread_id"',
+    '"receiver_thread_id"',
+    '"receiver_thread_ids"',
+    "spawn_agent",
+  ];
+  const input = createReadStream(rolloutPath, { encoding: "utf8", highWaterMark: 1024 * 1024 });
+  const reader = readline.createInterface({ input, crlfDelay: Infinity });
+  let readError: Error | undefined;
+  input.on("error", (error) => {
+    readError = error;
+    reader.close();
+  });
+  const add = (value: unknown): void => {
+    if (typeof value === "string" && CODEX_THREAD_ID_PATTERN.test(value))
+      ids.add(value.toLowerCase());
+  };
+  try {
+    for await (const line of reader) {
+      const possibleSpawnOutput =
+        spawnCalls.size > 0 &&
+        (line.includes('"function_call_output"') || line.includes('"custom_tool_call_output"'));
+      if (!possibleSpawnOutput && !markers.some((marker) => line.includes(marker))) continue;
+      const record = toObjectRecord(JSON.parse(line));
+      const payload = toObjectRecord(record?.payload);
+      if (!payload) continue;
+      if (record?.type === "response_item") {
+        readCodexRolloutResponseIds(payload, spawnCalls).forEach(add);
+      }
+      if (record?.type === "event_msg") readCodexRolloutEventIds(payload).forEach(add);
+    }
+    if (readError) throw readError;
+    return ids;
+  } finally {
+    reader.close();
+    input.destroy();
+  }
 }
 
 async function codexFileIsPrefixOf(prefixPath: string, fullPath: string): Promise<boolean> {
@@ -644,20 +731,25 @@ async function codexFileIsPrefixOf(prefixPath: string, fullPath: string): Promis
     const chunkSize = 1024 * 1024;
     const prefixBuffer = Buffer.allocUnsafe(chunkSize);
     const fullBuffer = Buffer.allocUnsafe(chunkSize);
-    let offset = 0;
-    while (offset < prefixStat.size) {
-      const length = Math.min(chunkSize, prefixStat.size - offset);
+    const equalRange = async (offset: number, length: number): Promise<boolean> => {
       const [prefixRead, fullRead] = await Promise.all([
         prefixHandle.read(prefixBuffer, 0, length, offset),
         fullHandle.read(fullBuffer, 0, length, offset),
       ]);
-      if (
-        prefixRead.bytesRead !== length ||
-        fullRead.bytesRead !== length ||
-        !prefixBuffer.subarray(0, length).equals(fullBuffer.subarray(0, length))
-      ) {
-        return false;
-      }
+      return (
+        prefixRead.bytesRead === length &&
+        fullRead.bytesRead === length &&
+        prefixBuffer.subarray(0, length).equals(fullBuffer.subarray(0, length))
+      );
+    };
+    // A previous account commonly has a few late completion records at its end.
+    // Check that tail first instead of reading hundreds of MB to discover them.
+    const tailOffset = Math.max(0, prefixStat.size - chunkSize);
+    if (!(await equalRange(tailOffset, prefixStat.size - tailOffset))) return false;
+    let offset = 0;
+    while (offset < tailOffset) {
+      const length = Math.min(chunkSize, tailOffset - offset);
+      if (!(await equalRange(offset, length))) return false;
       offset += length;
     }
     return true;
@@ -666,48 +758,101 @@ async function codexFileIsPrefixOf(prefixPath: string, fullPath: string): Promis
   }
 }
 
-// Rollout files are append-only, which makes cross-profile publication safe:
-// identical target -> no-op, target a prefix of source -> source is newer,
-// overwrite; source a prefix of target -> target is already complete, keep it;
-// anything else means the thread diverged between homes and we refuse.
+function codexRolloutUnchanged(before: Stats, after: Stats): boolean {
+  return (
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.size === after.size &&
+    before.mtimeMs === after.mtimeMs
+  );
+}
+
+async function statCodexRollout(filePath: string): Promise<Stats | null> {
+  try {
+    return await fs.stat(filePath);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+// Profile switches continue the selected source conversation. A different target
+// branch is preserved outside Codex's session trees before atomic publication.
+// Late writes through an old target file descriptor remain in that backup inode.
 async function publishCodexRollout(input: {
   sourcePath: string;
   targetPath: string;
+  targetHome: string;
   threadId: string;
+  logger: Logger;
 }): Promise<void> {
   const sourceStat = await fs.stat(input.sourcePath);
-  let targetStat;
+  const targetStat = await statCodexRollout(input.targetPath);
+  if (
+    targetStat &&
+    sourceStat.size <= targetStat.size &&
+    (await codexFileIsPrefixOf(input.sourcePath, input.targetPath))
+  ) {
+    const [sourceNow, targetNow] = await Promise.all([
+      fs.stat(input.sourcePath),
+      fs.stat(input.targetPath),
+    ]);
+    if (
+      !codexRolloutUnchanged(sourceStat, sourceNow) ||
+      !codexRolloutUnchanged(targetStat, targetNow)
+    ) {
+      throw new Error(
+        `Codex session rollout '${input.threadId}' changed during comparison; retry when idle`,
+      );
+    }
+    return;
+  }
+  const targetIsPrefix =
+    targetStat &&
+    targetStat.size < sourceStat.size &&
+    (await codexFileIsPrefixOf(input.targetPath, input.sourcePath));
+  await fs.mkdir(path.dirname(input.targetPath), { recursive: true });
+  const stagedPath = path.join(path.dirname(input.targetPath), `.paseo-transfer-${randomUUID()}`);
   try {
-    targetStat = await fs.stat(input.targetPath);
-  } catch {
-    targetStat = null;
-  }
-  if (!targetStat) {
-    await fs.mkdir(path.dirname(input.targetPath), { recursive: true });
-    await fs.copyFile(input.sourcePath, input.targetPath);
-    return;
-  }
-  const diverged = () =>
-    new Error(
-      `Codex session rollout '${input.threadId}' has diverged between profile homes; refusing to overwrite '${input.targetPath}'`,
-    );
-  if (targetStat.size === sourceStat.size) {
-    if (await codexFileIsPrefixOf(input.sourcePath, input.targetPath)) {
-      return;
+    await fs.copyFile(input.sourcePath, stagedPath, fsConstants.COPYFILE_EXCL);
+    await fs.chmod(stagedPath, 0o600);
+    if (!codexRolloutUnchanged(sourceStat, await fs.stat(input.sourcePath))) {
+      throw new Error(
+        `Codex session rollout '${input.threadId}' changed during transfer; retry when idle`,
+      );
     }
-    throw diverged();
-  }
-  if (sourceStat.size > targetStat.size) {
-    if (await codexFileIsPrefixOf(input.targetPath, input.sourcePath)) {
-      await fs.copyFile(input.sourcePath, input.targetPath);
-      return;
+    const currentTarget = await statCodexRollout(input.targetPath);
+    const targetChanged = targetStat
+      ? !currentTarget || !codexRolloutUnchanged(targetStat, currentTarget)
+      : currentTarget !== null;
+    if (targetChanged)
+      throw new Error(
+        `Codex session rollout '${input.threadId}' changed in the target profile during transfer; retry when idle`,
+      );
+    if (targetStat && !targetIsPrefix) {
+      const backupDir = path.join(
+        input.targetHome,
+        "paseo-profile-transfer-backups",
+        input.threadId,
+      );
+      await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
+      const backupPath = path.join(backupDir, `${randomUUID()}.jsonl`);
+      await fs.link(input.targetPath, backupPath);
+      input.logger.info(
+        { threadId: input.threadId, backupPath },
+        "Preserved conflicting Codex rollout before profile switch",
+      );
     }
-    throw diverged();
+    if (targetStat) {
+      await fs.rename(stagedPath, input.targetPath);
+    } else {
+      // Exclusive publication also protects against another writer creating the
+      // destination while the source snapshot was being prepared.
+      await fs.link(stagedPath, input.targetPath);
+    }
+  } finally {
+    await fs.rm(stagedPath, { force: true });
   }
-  if (await codexFileIsPrefixOf(input.sourcePath, input.targetPath)) {
-    return;
-  }
-  throw diverged();
 }
 
 // Serialize transfers per target home so concurrent switches cannot interleave
@@ -740,21 +885,23 @@ async function transferCodexSessionBetweenHomes(input: {
         `Codex session rollout '${input.threadId}' was not found in '${input.sourceHome}'`,
       );
     }
-    const referencedIds = await collectCodexReferencedThreadIds(
-      path.join(input.sourceHome, rootRelative),
-    );
     const rollouts = new Map<string, string>([[rootThreadId, rootRelative]]);
-    for (const threadId of referencedIds) {
-      const relative = index.get(threadId);
-      if (relative && !rollouts.has(threadId)) {
-        rollouts.set(threadId, relative);
+    for (const relative of rollouts.values()) {
+      const referencedIds = await collectCodexReferencedThreadIds(
+        path.join(input.sourceHome, relative),
+      );
+      for (const threadId of referencedIds) {
+        const childRelative = index.get(threadId);
+        if (childRelative && !rollouts.has(threadId)) rollouts.set(threadId, childRelative);
       }
     }
     for (const [threadId, relative] of rollouts) {
       await publishCodexRollout({
         sourcePath: path.join(input.sourceHome, relative),
         targetPath: path.join(input.targetHome, relative),
+        targetHome: input.targetHome,
         threadId,
+        logger: input.logger,
       });
     }
     input.logger.debug(
@@ -6550,8 +6697,15 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       resolveCodexHomeFor(this.runtimeSettings, launchContext?.env),
     );
-    await session.connect();
-    return session;
+    try {
+      await session.connect();
+      return session;
+    } catch (error) {
+      // A failed initialization may already own a process and rollout writer.
+      // Do not let the caller recover the original account until cleanup finishes.
+      await session.close();
+      throw error;
+    }
   }
 
   async resumeSession(
@@ -6595,8 +6749,15 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       targetHome,
     );
-    await session.connect();
-    return session;
+    try {
+      await session.connect();
+      return session;
+    } catch (error) {
+      // A failed initialization may already own a process and rollout writer.
+      // Do not let the caller recover the original account until cleanup finishes.
+      await session.close();
+      throw error;
+    }
   }
 
   async listImportableSessions(

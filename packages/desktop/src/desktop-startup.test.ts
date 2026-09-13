@@ -10,7 +10,9 @@ describe("desktop startup", () => {
         calls.push("cli");
         return true;
       }),
-      inheritLoginShellEnv: vi.fn(() => calls.push("env")),
+      inheritLoginShellEnv: vi.fn(async () => {
+        calls.push("env");
+      }),
       bootstrapGui: vi.fn(async () => {
         calls.push("gui");
       }),
@@ -27,7 +29,9 @@ describe("desktop startup", () => {
         calls.push("cli");
         return false;
       }),
-      inheritLoginShellEnv: vi.fn(() => calls.push("env")),
+      inheritLoginShellEnv: vi.fn(async () => {
+        calls.push("env");
+      }),
       bootstrapGui: vi.fn(async () => {
         calls.push("gui");
       }),
@@ -44,7 +48,9 @@ describe("desktop startup", () => {
         calls.push("cli");
         return false;
       }),
-      inheritLoginShellEnv: vi.fn(() => calls.push("env")),
+      inheritLoginShellEnv: vi.fn(async () => {
+        calls.push("env");
+      }),
       bootstrapGui: vi.fn(async () => {
         calls.push("gui");
       }),
@@ -57,17 +63,51 @@ describe("desktop startup", () => {
   it("does not route open-project launches through CLI passthrough", async () => {
     const runCliPassthroughIfRequested = vi.fn(async () => true);
     const calls: string[] = [];
+    const inheritLoginShellEnv = vi.fn(async () => {
+      calls.push("env");
+    });
 
     await runDesktopStartup({
       hasPendingOpenProjectPath: true,
       runCliPassthroughIfRequested,
-      inheritLoginShellEnv: vi.fn(() => calls.push("env")),
+      inheritLoginShellEnv,
       bootstrapGui: vi.fn(async () => {
         calls.push("gui");
       }),
     });
 
     expect(runCliPassthroughIfRequested).not.toHaveBeenCalled();
+    expect(inheritLoginShellEnv).toHaveBeenCalledTimes(1);
     expect(calls).toEqual(["env", "gui"]);
+  });
+
+  it("waits for login-shell env resolution before bootstrap", async () => {
+    const calls: string[] = [];
+    let releaseEnv!: () => void;
+    const envGate = new Promise<void>((resolve) => {
+      releaseEnv = resolve;
+    });
+    const startup = runDesktopStartup({
+      hasPendingOpenProjectPath: false,
+      runCliPassthroughIfRequested: vi.fn(async () => {
+        calls.push("cli");
+        return false;
+      }),
+      inheritLoginShellEnv: vi.fn(async () => {
+        await envGate;
+        calls.push("env");
+      }),
+      bootstrapGui: vi.fn(async () => {
+        calls.push("gui");
+      }),
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(["cli"]);
+    releaseEnv();
+    await startup;
+
+    expect(calls).toEqual(["cli", "env", "gui"]);
   });
 });

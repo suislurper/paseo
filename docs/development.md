@@ -530,3 +530,16 @@ Always run typecheck after changes:
 ```bash
 npm run typecheck
 ```
+
+### Desktop login-shell environment
+
+GUI startup awaits asynchronous login-shell environment resolution before creating
+its window. `PASEO_SHELL_ENV_TIMEOUT_MS` bounds the interactive attempt and its
+non-interactive retry together (30 seconds by default). A timed-out attempt kills
+its own shell process group on POSIX and releases its output pipes; Electron stays
+responsive while waiting. If resolution fails, startup keeps the inherited
+environment. CLI passthrough skips this step.
+
+A synchronous shell wait previously exceeded a 15-second attempt timeout by several
+minutes when the shell did not terminate. The focused desktop startup tests cover
+event-loop responsiveness, deadline cleanup and environment decoding.

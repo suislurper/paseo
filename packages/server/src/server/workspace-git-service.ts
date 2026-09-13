@@ -48,7 +48,7 @@ import { checkoutLiteFromGitSnapshot } from "./workspace-registry-model.js";
 
 const WORKSPACE_GIT_WATCH_DEBOUNCE_MS = 1_000;
 const BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000;
-export const WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS = 60_000;
+export const WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS = 180_000;
 const FORGE_PR_STATUS_POLL_INTERVAL_MS = 60_000;
 const WORKING_TREE_WATCH_FALLBACK_REFRESH_MS = 5_000;
 // Auxiliary reads may reuse cached values within this window; snapshots do not expire on read.

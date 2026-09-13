@@ -8,7 +8,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
 
-const gitConcurrency = parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "8", 10) || 8;
+const gitConcurrency = parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "2", 10) || 2;
 const gitLimit = pLimit(gitConcurrency);
 
 export interface GitCommandOptions {
@@ -157,12 +157,18 @@ export function runGitCommand(
 
       // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
       // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
-      const child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
-        cwd: options.cwd,
-        envOverlay,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      // `core.preloadIndex=false` keeps status scans single-threaded so periodic
+      // scans do not dominate blocked I/O on encrypted storage.
+      const child = spawnProcess(
+        "git",
+        ["-c", "core.quotepath=false", "-c", "core.preloadIndex=false", ...args],
+        {
+          cwd: options.cwd,
+          envOverlay,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
 
       let settled = false;
       let metricFinished = false;

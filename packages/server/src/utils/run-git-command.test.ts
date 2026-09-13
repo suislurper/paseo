@@ -188,6 +188,41 @@ describe("runGitCommand", () => {
     vi.unstubAllEnvs();
   });
 
+  it("defaults concurrent git commands to two when no override is set", async () => {
+    vi.resetModules();
+    vi.stubEnv("PASEO_GIT_CONCURRENCY", "");
+    delete process.env.PASEO_GIT_CONCURRENCY;
+    const { runGitCommand } = await import("./run-git-command.js");
+
+    enqueueSpawnBehaviors(...Array.from({ length: 4 }, () => ({ delayMs: 25 })));
+
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        runGitCommand(["rev-parse", "--show-toplevel"], {
+          cwd: process.cwd(),
+        }),
+      ),
+    );
+
+    expect(fakeSpawnController.peakActiveCount).toBe(2);
+    expect(fakeSpawnController.activeCount).toBe(0);
+  });
+
+  it("passes conservative per-command git config without changing the requested args", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    const { spawn } = await import("node:child_process");
+
+    enqueueSpawnBehaviors({ delayMs: 0, stdoutData: "ok" });
+
+    await runGitCommand(["status", "--short"], { cwd: process.cwd() });
+
+    expect(vi.mocked(spawn)).toHaveBeenCalledWith(
+      "git",
+      ["-c", "core.quotepath=false", "-c", "core.preloadIndex=false", "status", "--short"],
+      expect.objectContaining({ cwd: process.cwd() }),
+    );
+  });
+
   it("throttles concurrent git commands to the configured limit", async () => {
     const { runGitCommand } = await loadRunGitCommand(2);
 

@@ -67,6 +67,8 @@ identity. They must not await a full Git snapshot: dirty-file scans and history 
 exceed the workspace RPC deadline in large repositories. Full Git status and worktree setup
 continue through the existing background update paths after creation.
 
+Checkout Git status runs with two concurrent Git commands by default (PASEO_GIT_CONCURRENCY remains an override), disables parallel index preloading per command, coalesces duplicate refreshes per checkout, keeps watcher-driven refreshes, uses a three-minute Git safety poll, and removes timers after final unsubscribe.
+
 **Key modules:**
 
 | Module                          | Responsibility                                                               |

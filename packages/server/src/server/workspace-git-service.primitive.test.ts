@@ -862,9 +862,11 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     let nowMs = 0;
     const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
     const getPullRequestStatus = vi.fn(async () => createPullRequestStatusResult());
+    const repoFetch = createDeferred<void>();
     const service = createService({
       getCheckoutStatus,
       getPullRequestStatus,
+      runGitFetch: vi.fn(() => repoFetch.promise),
       now: () => new Date(nowMs),
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
@@ -872,6 +874,12 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     nowMs = 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
+    await flushPromises();
+
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+
+    nowMs = 180_000;
+    await vi.advanceTimersByTimeAsync(120_000);
     await flushPromises();
 
     expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
@@ -884,6 +892,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     );
 
     subscription.unsubscribe();
+    repoFetch.resolve();
+    await flushPromises();
     service.dispose();
   });
 
@@ -907,8 +917,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(watch).not.toHaveBeenCalled();
     const factsCallsBeforeSelfHeal = getCheckoutSnapshotFacts.mock.calls.length;
 
-    nowMs = 60_000;
-    await vi.advanceTimersByTimeAsync(60_000);
+    nowMs = 180_000;
+    await vi.advanceTimersByTimeAsync(180_000);
     await flushPromises();
 
     expect(getCheckoutSnapshotFacts.mock.calls.length).toBeGreaterThan(factsCallsBeforeSelfHeal);
@@ -1312,8 +1322,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     const second = service.registerWorkspace({ cwd: join(REPO_CWD, ".") }, vi.fn());
     await flushPromises();
 
-    nowMs = 60_000;
-    await vi.advanceTimersByTimeAsync(60_000);
+    nowMs = 180_000;
+    await vi.advanceTimersByTimeAsync(180_000);
     await flushPromises();
 
     expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
@@ -1333,8 +1343,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
 
     subscription.unsubscribe();
-    nowMs = 60_000;
-    await vi.advanceTimersByTimeAsync(60_000);
+    nowMs = 180_000;
+    await vi.advanceTimersByTimeAsync(180_000);
     await flushPromises();
 
     expect(getCheckoutStatus).toHaveBeenCalledTimes(0);
@@ -1352,8 +1362,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
 
     service.dispose();
-    nowMs = 60_000;
-    await vi.advanceTimersByTimeAsync(60_000);
+    nowMs = 180_000;
+    await vi.advanceTimersByTimeAsync(180_000);
     await flushPromises();
 
     expect(getCheckoutStatus).toHaveBeenCalledTimes(0);
@@ -1373,8 +1383,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     await flushPromises();
 
-    nowMs = 60_000;
-    await vi.advanceTimersByTimeAsync(60_000);
+    nowMs = 180_000;
+    await vi.advanceTimersByTimeAsync(180_000);
     await flushPromises();
     const directRead = service.getSnapshot(REPO_CWD);
     await flushPromises();

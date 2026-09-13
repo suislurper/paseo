@@ -222,6 +222,7 @@ interface AgentManagerRescueTimeouts {
 interface ReloadAgentSessionOptions {
   rehydrateFromDisk?: boolean;
   targetProvider?: AgentProvider;
+  closeBeforeResume?: boolean;
 }
 
 interface ProviderEnabledFlag {
@@ -1241,6 +1242,16 @@ export class AgentManager {
     const launchContext = await this.buildLaunchContext(agentId, client);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
 
+    if (options?.closeBeforeResume) {
+      return this.switchQuiescedSession(
+        existing,
+        client,
+        storedConfig,
+        providerLaunchConfig,
+        launchContext,
+      );
+    }
+
     const session = handle
       ? await client.resumeSession({ ...handle, provider }, providerLaunchConfig, launchContext)
       : await client.createSession(providerLaunchConfig, launchContext);
@@ -1288,6 +1299,63 @@ export class AgentManager {
       if (!handedToRegistration) {
         await this.closeUnregisteredSession(session);
       }
+    }
+  }
+
+  private async switchQuiescedSession(
+    existing: LiveManagedAgent,
+    client: AgentClient,
+    storedConfig: AgentSessionConfig,
+    providerLaunchConfig: AgentSessionConfig,
+    launchContext: AgentLaunchContext,
+  ): Promise<ManagedAgent> {
+    const agentId = existing.id;
+    const handle = existing.persistence;
+    const provider = storedConfig.provider;
+    // A Codex writer can append completion records even when its turn is idle.
+    // Keep the transition reserved until it exits, then snapshot its rollout.
+    await existing.session.close();
+    const closed = this.prepareAgentForClosure(existing, "provider account switch");
+    const registrationOptions = {
+      labels: existing.labels,
+      workspaceId: existing.workspaceId,
+      owner: existing.owner,
+      createdAt: existing.createdAt,
+      updatedAt: existing.updatedAt,
+      lastUserMessageAt: existing.lastUserMessageAt,
+      historyPrimed: existing.historyPrimed,
+      lastUsage: existing.lastUsage,
+      lastError: existing.lastError,
+      attention: existing.attention,
+    };
+    try {
+      await this.persistSnapshot(closed);
+      const replacement = handle
+        ? await client.resumeSession({ ...handle, provider }, providerLaunchConfig, launchContext)
+        : await client.createSession(providerLaunchConfig, launchContext);
+      return await this.registerSession(replacement, storedConfig, agentId, registrationOptions);
+    } catch (error) {
+      // Resume from the untouched original home if the destination cannot start.
+      if (!this.agents.has(agentId)) {
+        try {
+          const originalClient = this.requireClient(existing.provider);
+          const originalContext = await this.buildLaunchContext(agentId, originalClient);
+          const originalConfig = this.resolveProviderLaunchConfig(existing.config, originalContext);
+          const restored = handle
+            ? await originalClient.resumeSession(handle, originalConfig, originalContext)
+            : await originalClient.createSession(originalConfig, originalContext);
+          await this.registerSession(restored, existing.config, agentId, registrationOptions);
+        } catch (recoveryError) {
+          this.logger.error(
+            { err: error, agentId },
+            "Account switch failed before recovery failed",
+          );
+          throw new Error("Account switch and original account recovery failed", {
+            cause: recoveryError,
+          });
+        }
+      }
+      throw error;
     }
   }
 
@@ -1607,7 +1675,7 @@ export class AgentManager {
         this.reloadAgentSessionInternal(
           agentId,
           { model: modelId ?? undefined },
-          { targetProvider: providerId },
+          { targetProvider: providerId, closeBeforeResume: currentBase === "codex" },
         ),
       );
     } finally {

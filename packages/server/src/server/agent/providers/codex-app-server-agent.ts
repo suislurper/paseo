@@ -657,6 +657,13 @@ function readCodexRolloutResponseIds(
 
 function readCodexRolloutEventIds(payload: Record<string, unknown>): unknown[] {
   const ids: unknown[] = readCodexHistoricalSubAgentThreadIds(payload.item);
+  for (const item of [payload, toObjectRecord(payload.item)]) {
+    if (!item || typeof item.type !== "string") continue;
+    const type = item.type.replaceAll("_", "").toLowerCase();
+    if (type === "subagentactivity") ids.push(item.agent_thread_id, item.agentThreadId);
+    if (type === "collabagenttoolcall" && Array.isArray(item.receiver_thread_ids))
+      ids.push(...item.receiver_thread_ids);
+  }
   if (typeof payload.type === "string" && payload.type.startsWith("collab_")) {
     ids.push(payload.new_thread_id, payload.receiver_thread_id);
     if (Array.isArray(payload.receiver_thread_ids)) ids.push(...payload.receiver_thread_ids);
@@ -671,6 +678,7 @@ async function collectCodexReferencedThreadIds(rolloutPath: string): Promise<Set
   const spawnCalls = new Set<string>();
   const markers = [
     '"agentThreadId"',
+    '"agent_thread_id"',
     '"receiverThreadIds"',
     '"new_thread_id"',
     '"receiver_thread_id"',

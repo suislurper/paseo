@@ -161,6 +161,7 @@ export class CodexAppServerClient {
   private notificationHandler: NotificationHandler | null = null;
   private nextId = 1;
   private disposed = false;
+  private exitObserved = false;
   private stderrBuffer = "";
 
   constructor(
@@ -193,6 +194,7 @@ export class CodexAppServerClient {
     });
 
     child.on("exit", (code, signal) => {
+      this.exitObserved = true;
       const message =
         code === 0 && !signal
           ? "Codex app-server exited"
@@ -249,7 +251,11 @@ export class CodexAppServerClient {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed) {
+      if (!this.exitObserved && this.child.exitCode === null && this.child.signalCode === null)
+        throw new Error("Codex app-server shutdown has not completed");
+      return;
+    }
     this.disposed = true;
     this.rl.close();
     try {
@@ -272,6 +278,7 @@ export class CodexAppServerClient {
         { timeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS },
         "Codex app-server did not report exit after SIGKILL",
       );
+      throw new Error("Codex app-server shutdown has not completed");
     }
   }
 

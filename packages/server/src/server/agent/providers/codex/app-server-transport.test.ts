@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import {
@@ -8,6 +8,26 @@ import {
 import { CodexAppServerClient } from "./app-server-transport.js";
 
 describe("Codex app-server transport", () => {
+  test("dispose refuses to report completion until the writer has exited", async () => {
+    vi.useFakeTimers();
+    const child = createCodexAppServerChildProcess();
+    child.kill = () => true;
+    const client = new CodexAppServerClient(child, createTestLogger());
+    try {
+      const closing = expect(client.dispose()).rejects.toThrow("shutdown has not completed");
+      await vi.advanceTimersByTimeAsync(3001);
+      await closing;
+      await expect(client.dispose()).rejects.toThrow("shutdown has not completed");
+      child.emit("exit", 0, null);
+      await expect(client.dispose()).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      child.stdout.end();
+      child.stderr.end();
+      child.stdin.end();
+    }
+  });
+
   test("ignores non-JSON stdout lines without dropping pending requests", async () => {
     const child = createCodexAppServerChildProcess();
     const client = new CodexAppServerClient(child, createTestLogger());

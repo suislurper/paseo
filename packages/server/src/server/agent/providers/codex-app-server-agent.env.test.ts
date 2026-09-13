@@ -274,6 +274,43 @@ describe("Codex profile home switching", () => {
     }
   });
 
+  test.each([
+    { type: "sub_agent_activity", agent_thread_id: CHILD_THREAD_ID, kind: "started" },
+    {
+      type: "item_completed",
+      item: { type: "SubAgentActivity", agent_thread_id: CHILD_THREAD_ID, kind: "completed" },
+    },
+  ])("copies V2 child history from native activity %j", async (activity) => {
+    const { sourceHome, targetHome } = await createHomes();
+    const records = [
+      {
+        type: "response_item",
+        payload: { type: "function_call", name: "spawn_agent", call_id: "v2" },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "v2",
+          output: JSON.stringify({ task_name: "child" }),
+        },
+      },
+      { type: "event_msg", payload: activity },
+    ];
+    await writeRollout(
+      sourceHome,
+      ROOT_ROLLOUT_REL,
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await writeRollout(sourceHome, CHILD_ROLLOUT_REL, '{"child":true}\n');
+    const session = await resumeIntoTarget(createProfileClient(targetHome), sourceHome);
+    try {
+      expect(await readFile(join(targetHome, CHILD_ROLLOUT_REL), "utf8")).toBe('{"child":true}\n');
+    } finally {
+      await session.close();
+    }
+  });
+
   test("copies native spawn outputs and recursive child histories without cycles", async () => {
     const { sourceHome, targetHome } = await createHomes();
     const grandchildId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";

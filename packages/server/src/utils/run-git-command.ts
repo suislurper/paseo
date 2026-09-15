@@ -16,7 +16,7 @@ function readGitConcurrency(): number {
 // Worktree creation gets one reserved slot, independent of the existing
 // background limit. Total subprocess concurrency is bounded by
 // PASEO_GIT_CONCURRENCY + 1; ordinary callers retain their existing capacity.
-const foregroundGitLaneStorage = new AsyncLocalStorage<boolean>();
+const foregroundGitLaneStorage = new AsyncLocalStorage<{ active: boolean }>();
 const gitConcurrencyLimit = readGitConcurrency();
 const backgroundGitLimit = pLimit(gitConcurrencyLimit);
 const foregroundGitLimit = pLimit(1);
@@ -29,10 +29,27 @@ const foregroundGitLimit = pLimit(1);
  * behind a deadline that a later mutation could bypass.
  */
 export function runWithForegroundGitLane<T>(callback: () => T): T {
-  if (foregroundGitLaneStorage.getStore() !== undefined) {
+  if (foregroundGitLaneStorage.getStore()?.active) {
     return callback();
   }
-  return foregroundGitLaneStorage.run(true, callback);
+  const scope = { active: true };
+  const release = () => {
+    scope.active = false;
+  };
+  try {
+    const result = foregroundGitLaneStorage.run(scope, callback);
+    if (result != null && typeof (result as { then?: unknown }).then === "function") {
+      // Keep the original promise identity for coalesced metadata reads. Detached
+      // descendants retain this token, but lose priority when their owner ends.
+      void Promise.resolve(result).then(release, release);
+    } else {
+      release();
+    }
+    return result;
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 export interface GitCommandOptions {
@@ -150,8 +167,9 @@ export function runGitCommand(
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
   const enqueuedAt = Date.now();
-  const limit =
-    foregroundGitLaneStorage.getStore() !== undefined ? foregroundGitLimit : backgroundGitLimit;
+  const limit = foregroundGitLaneStorage.getStore()?.active
+    ? foregroundGitLimit
+    : backgroundGitLimit;
   return limit(() => {
     const queueWaitMs = Date.now() - enqueuedAt;
     return new Promise<GitCommandResult>((resolve, reject) => {

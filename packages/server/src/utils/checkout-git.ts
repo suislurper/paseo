@@ -19,7 +19,7 @@ import type {
 } from "../services/forge-service.js";
 import { ForgeAuthenticationError, ForgeCliMissingError } from "../services/forge-cli-command.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
-import { runGitCommand } from "./run-git-command.js";
+import { runGitCommand, runWithForegroundGitLane } from "./run-git-command.js";
 import { isPaseoOwnedWorktreeCwd, resolvePaseoWorktreesBaseRoot } from "./worktree.js";
 import { type PaseoWorktreeMetadata, readPaseoWorktreeMetadata } from "./worktree-metadata.js";
 const READ_ONLY_GIT_ENV = {
@@ -2019,20 +2019,24 @@ function checkoutIdentityInflightKey(cwd: string, context?: CheckoutContext): st
 const checkoutIdentityInflight = new Map<string, Promise<CheckoutIdentity>>();
 
 // Workspace placement must not wait for dirty scans, history comparisons or remote queries.
+// The entire lookup runs in the foreground Git lane, including the shared in-flight map,
+// so identity callers never queue behind background status work or reuse a queued promise.
 export function getCheckoutIdentity(
   cwd: string,
   context?: CheckoutContext,
 ): Promise<CheckoutIdentity> {
-  const key = checkoutIdentityInflightKey(cwd, context);
-  const inflight = checkoutIdentityInflight.get(key);
-  if (inflight) return inflight;
-  const read = readCheckoutIdentity(cwd, context).finally(() => {
-    if (checkoutIdentityInflight.get(key) === read) {
-      checkoutIdentityInflight.delete(key);
-    }
+  return runWithForegroundGitLane(() => {
+    const key = checkoutIdentityInflightKey(cwd, context);
+    const inflight = checkoutIdentityInflight.get(key);
+    if (inflight) return inflight;
+    const read = readCheckoutIdentity(cwd, context).finally(() => {
+      if (checkoutIdentityInflight.get(key) === read) {
+        checkoutIdentityInflight.delete(key);
+      }
+    });
+    checkoutIdentityInflight.set(key, read);
+    return read;
   });
-  checkoutIdentityInflight.set(key, read);
-  return read;
 }
 
 async function readCheckoutIdentity(

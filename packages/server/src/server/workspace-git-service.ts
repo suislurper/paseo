@@ -40,7 +40,7 @@ import {
   type ForgeResolver,
 } from "../services/forge-resolver.js";
 import { parseGitRevParsePath } from "../utils/git-rev-parse-path.js";
-import { runGitCommand } from "../utils/run-git-command.js";
+import { runGitCommand, runWithForegroundGitLane } from "../utils/run-git-command.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
 import { deriveProjectSlug } from "./workspace-git-metadata.js";
@@ -620,15 +620,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwdOrRepoRoot: string,
     options?: WorkspaceGitReadOptions,
   ): Promise<WorkspaceGitWorktreeInfo[]> {
-    const repoRoot = await this.resolveRepoRoot(cwdOrRepoRoot, options);
-    const key = JSON.stringify(["worktrees", repoRoot]);
-    return this.readAuxiliaryCache(this.worktreeListCache, key, options, () =>
-      this.deps.listPaseoWorktrees({
-        cwd: repoRoot,
-        paseoHome: this.paseoHome,
-        worktreesRoot: this.worktreesRoot,
-      }),
-    );
+    return runWithForegroundGitLane(async () => {
+      const repoRoot = await this.resolveRepoRoot(cwdOrRepoRoot, options);
+      const key = JSON.stringify(["worktrees", repoRoot]);
+      return this.readAuxiliaryCache(this.worktreeListCache, key, options, () =>
+        this.deps.listPaseoWorktrees({
+          cwd: repoRoot,
+          paseoHome: this.paseoHome,
+          worktreesRoot: this.worktreesRoot,
+        }),
+      );
+    });
   }
 
   async resolveRepoRoot(cwd: string, _options?: WorkspaceGitReadOptions): Promise<string> {
@@ -644,14 +646,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwdOrRepoRoot: string,
     options?: WorkspaceGitReadOptions,
   ): Promise<string> {
-    const cwd = resolve(cwdOrRepoRoot);
-    const key = JSON.stringify(["default-branch", cwd]);
-    return this.readAuxiliaryCache(this.defaultBranchCache, key, options, async () => {
-      const defaultBranch = await this.deps.resolveRepositoryDefaultBranch(cwd);
-      if (!defaultBranch) {
-        throw new Error("Unable to resolve repository default branch");
-      }
-      return defaultBranch;
+    return runWithForegroundGitLane(async () => {
+      const cwd = resolve(cwdOrRepoRoot);
+      const key = JSON.stringify(["default-branch", cwd]);
+      return this.readAuxiliaryCache(this.defaultBranchCache, key, options, async () => {
+        const defaultBranch = await this.deps.resolveRepositoryDefaultBranch(cwd);
+        if (!defaultBranch) {
+          throw new Error("Unable to resolve repository default branch");
+        }
+        return defaultBranch;
+      });
     });
   }
 

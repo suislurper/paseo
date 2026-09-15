@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 
+import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import { runGitCommand } from "../utils/run-git-command.js";
 import type { ForgeService } from "../services/forge-service.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
 import type {
@@ -999,6 +1001,7 @@ interface TestDeps extends CreatePaseoWorktreeDeps {
 }
 
 function createDeps(options?: {
+  workspaceGitService?: WorkspaceGitService;
   events?: string[];
   projects?: Map<string, PersistedProjectRecord>;
   workspaces?: Map<string, PersistedWorkspaceRecord>;
@@ -1059,7 +1062,7 @@ function createDeps(options?: {
       workspaces.delete(workspaceId);
     },
   };
-  const workspaceGitService = createWorkspaceGitServiceStub();
+  const workspaceGitService = options?.workspaceGitService ?? createWorkspaceGitServiceStub();
   const workspaceProvisioning = createWorkspaceProvisioningService({
     projectRegistry,
     workspaceRegistry,
@@ -1304,3 +1307,85 @@ function createGitHubPrRemoteRepo(): { tempDir: string; repoDir: string } {
   execFileSync("git", ["fetch", "origin"], { cwd: repoDir, stdio: "pipe" });
   return { tempDir, repoDir };
 }
+
+test.skipIf(isPlatform("win32"))(
+  "creates and registers a worktree while real background Git commands occupy every normal slot",
+  async () => {
+    const { repoDir, tempDir } = createGitRepo();
+    cleanupPaths.push(tempDir);
+    const paseoHome = path.join(tempDir, ".paseo");
+    const service = new WorkspaceGitServiceImpl({ logger: createTestLogger(), paseoHome });
+    const deps = createDeps({ workspaceGitService: service });
+    const releasePath = path.join(tempDir, "release-background");
+    const slots = Number.parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "2", 10) || 2;
+    const readyPaths = Array.from({ length: slots }, (_, index) =>
+      path.join(tempDir, `ready-${index}`),
+    );
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const waitScript =
+      "const fs=require('node:fs');fs.writeFileSync(process.argv[1],'ready');const timer=setInterval(()=>{if(fs.existsSync(process.argv[2]))clearInterval(timer)},10)";
+    let backgroundFinished = 0;
+    const background = Promise.all(
+      readyPaths.map((readyPath) => {
+        const alias = `!${quote(process.execPath)} -e ${quote(waitScript)} ${quote(readyPath)} ${quote(releasePath)}`;
+        return runGitCommand(["-c", `alias.wait-for-test=${alias}`, "wait-for-test"], {
+          cwd: repoDir,
+        }).then((result) => {
+          backgroundFinished += 1;
+          return result;
+        });
+      }),
+    );
+    // Attach a handler immediately; cleanup below still awaits and reports failures.
+    void background.catch(() => {});
+    let creation: Promise<Awaited<ReturnType<typeof createPaseoWorktree>>> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await vi.waitFor(
+        () => {
+          expect(readyPaths.every((readyPath) => existsSync(readyPath))).toBe(true);
+        },
+        { timeout: 3_000, interval: 10 },
+      );
+      expect(backgroundFinished).toBe(0);
+      creation = (async () => {
+        // These placement checks also run before the creation context in RPC callers.
+        expect((await service.getCheckout(repoDir)).isGit).toBe(true);
+        await service.listWorktrees(repoDir);
+        expect(await service.resolveDefaultBranch(repoDir)).toBe("main");
+        return createPaseoWorktree(
+          {
+            cwd: repoDir,
+            worktreeSlug: "foreground-proof",
+            refName: "main",
+            action: "branch-off",
+            runSetup: false,
+            paseoHome,
+          },
+          deps,
+        );
+      })();
+      const created = await Promise.race([
+        creation,
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(
+            () => reject(new Error("creation waited for background Git")),
+            5_000,
+          );
+        }),
+      ]);
+      expect(created.created).toBe(true);
+      expect(created.worktree.worktreePath.startsWith(paseoHome + path.sep)).toBe(true);
+      expect(deps.workspaces.has(created.workspace.workspaceId)).toBe(true);
+      expect(backgroundFinished).toBe(0);
+    } finally {
+      clearTimeout(deadline);
+      writeFileSync(releasePath, "release");
+      // A failed timeout must not leave late creation or Git children past fixture cleanup.
+      await background;
+      await creation?.catch(() => {});
+      service.dispose();
+    }
+  },
+  15_000,
+);

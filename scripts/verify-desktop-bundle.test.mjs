@@ -17,6 +17,7 @@ const UI_BUNDLE = [
 ].join("\n");
 
 const SERVER_ASAR = [
+  "runWithForegroundGitLane",
   "workspaceSafeCleanup",
   "workspaceCreationRetry",
   "archivedHead",

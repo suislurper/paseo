@@ -1,3 +1,4 @@
+import { runWithForegroundGitLane } from "../utils/run-git-command.js";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -65,61 +66,63 @@ export async function createPaseoWorktree(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
-  const workspaceCwdPlan = await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService);
-  const createdWorktree = await createWorktreeCore(input, deps);
-  try {
-    maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
-    const workspaceCwd = mapWorkspaceRelativeCwdToWorktree({
-      relativeWorkspaceCwd: workspaceCwdPlan.relativeWorkspaceCwd,
-      targetWorktreePath: createdWorktree.worktree.worktreePath,
-    });
-    if (!(await isDirectory(workspaceCwd))) {
-      throw new Error(`Selected project directory is missing from the worktree: ${workspaceCwd}`);
-    }
-
-    if (createdWorktree.created) {
-      await seedPaseoConfigFile({
-        sourceCwd: workspaceCwdPlan.inputCwd,
-        targetCwd: workspaceCwd,
+  return runWithForegroundGitLane(async () => {
+    const workspaceCwdPlan = await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService);
+    const createdWorktree = await createWorktreeCore(input, deps);
+    try {
+      maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
+      const workspaceCwd = mapWorkspaceRelativeCwdToWorktree({
+        relativeWorkspaceCwd: workspaceCwdPlan.relativeWorkspaceCwd,
+        targetWorktreePath: createdWorktree.worktree.worktreePath,
       });
-    }
-    const workspace = await deps.workspaceProvisioning.createWorkspaceForWorktree({
-      sourceCwd: workspaceCwdPlan.inputCwd,
-      projectId: input.projectId,
-      repoRoot: createdWorktree.repoRoot,
-      cwd: workspaceCwd,
-      worktreeRoot: createdWorktree.worktree.worktreePath,
-      branch: createdWorktree.worktree.branchName || null,
-      baseBranch: resolveIntentBaseBranch(createdWorktree.intent),
-      title: resolveFirstAgentPromptTitle(input.firstAgentContext),
-      creationRequestId: input.creationRequestId ?? null,
-      creationFingerprint: input.creationFingerprint ?? null,
-    });
+      if (!(await isDirectory(workspaceCwd))) {
+        throw new Error(`Selected project directory is missing from the worktree: ${workspaceCwd}`);
+      }
 
-    deps.github.invalidate({ cwd: createdWorktree.worktree.worktreePath });
+      if (createdWorktree.created) {
+        await seedPaseoConfigFile({
+          sourceCwd: workspaceCwdPlan.inputCwd,
+          targetCwd: workspaceCwd,
+        });
+      }
+      const workspace = await deps.workspaceProvisioning.createWorkspaceForWorktree({
+        sourceCwd: workspaceCwdPlan.inputCwd,
+        projectId: input.projectId,
+        repoRoot: createdWorktree.repoRoot,
+        cwd: workspaceCwd,
+        worktreeRoot: createdWorktree.worktree.worktreePath,
+        branch: createdWorktree.worktree.branchName || null,
+        baseBranch: resolveIntentBaseBranch(createdWorktree.intent),
+        title: resolveFirstAgentPromptTitle(input.firstAgentContext),
+        creationRequestId: input.creationRequestId ?? null,
+        creationFingerprint: input.creationFingerprint ?? null,
+      });
 
-    return {
-      worktree: createdWorktree.worktree,
-      intent: createdWorktree.intent,
-      workspace,
-      repoRoot: createdWorktree.repoRoot,
-      created: createdWorktree.created,
-    };
-  } catch (error) {
-    if (!createdWorktree.created) {
-      throw error;
+      deps.github.invalidate({ cwd: createdWorktree.worktree.worktreePath });
+
+      return {
+        worktree: createdWorktree.worktree,
+        intent: createdWorktree.intent,
+        workspace,
+        repoRoot: createdWorktree.repoRoot,
+        created: createdWorktree.created,
+      };
+    } catch (error) {
+      if (!createdWorktree.created) {
+        throw error;
+      }
+      return rollbackCreatedPaseoWorktree(
+        {
+          cwd: createdWorktree.repoRoot,
+          worktreePath: createdWorktree.worktree.worktreePath,
+          ...(input.runSetup === false ? { teardownCwds: [] } : {}),
+          paseoHome: input.paseoHome,
+          worktreesBaseRoot: input.worktreesRoot,
+        },
+        error,
+      );
     }
-    return rollbackCreatedPaseoWorktree(
-      {
-        cwd: createdWorktree.repoRoot,
-        worktreePath: createdWorktree.worktree.worktreePath,
-        ...(input.runSetup === false ? { teardownCwds: [] } : {}),
-        paseoHome: input.paseoHome,
-        worktreesBaseRoot: input.worktreesRoot,
-      },
-      error,
-    );
-  }
+  });
 }
 
 async function isDirectory(targetPath: string): Promise<boolean> {

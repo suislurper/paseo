@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import pLimit from "p-limit";
 import type { Logger } from "pino";
@@ -8,8 +9,31 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
 
-const gitConcurrency = parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "2", 10) || 2;
-const gitLimit = pLimit(gitConcurrency);
+function readGitConcurrency(): number {
+  return parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "2", 10) || 2;
+}
+
+// Worktree creation gets one reserved slot, independent of the existing
+// background limit. Total subprocess concurrency is bounded by
+// PASEO_GIT_CONCURRENCY + 1; ordinary callers retain their existing capacity.
+const foregroundGitLaneStorage = new AsyncLocalStorage<boolean>();
+const gitConcurrencyLimit = readGitConcurrency();
+const backgroundGitLimit = pLimit(gitConcurrencyLimit);
+const foregroundGitLimit = pLimit(1);
+
+/**
+ * Runs `callback` in the foreground Git scheduling lane. Git commands issued
+ * inside the callback use the reserved foreground slot instead of competing
+ * with background status scans. Nesting is idempotent. The lane carries no
+ * timer or timeout: queued creation work keeps its place rather than rejecting
+ * behind a deadline that a later mutation could bypass.
+ */
+export function runWithForegroundGitLane<T>(callback: () => T): T {
+  if (foregroundGitLaneStorage.getStore() !== undefined) {
+    return callback();
+  }
+  return foregroundGitLaneStorage.run(true, callback);
+}
 
 export interface GitCommandOptions {
   cwd: string;
@@ -126,7 +150,9 @@ export function runGitCommand(
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
   const enqueuedAt = Date.now();
-  return gitLimit(() => {
+  const limit =
+    foregroundGitLaneStorage.getStore() !== undefined ? foregroundGitLimit : backgroundGitLimit;
+  return limit(() => {
     const queueWaitMs = Date.now() - enqueuedAt;
     return new Promise<GitCommandResult>((resolve, reject) => {
       const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;

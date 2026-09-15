@@ -17,6 +17,10 @@ if (!head) {
 
 const requiredHistory = [
   [
+    "ac4f736f5e0c45e6c2181c39700e7acc16464e52",
+    "worktree creation isolated from background Git scans",
+  ],
+  [
     "3b280b68ab79212931babbc2cf3bfe2ca2fdf591",
     "verified remote preservation and owned workspace cleanup",
   ],

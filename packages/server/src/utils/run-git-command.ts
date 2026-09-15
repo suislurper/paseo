@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import pLimit from "p-limit";
 import type { Logger } from "pino";
@@ -8,8 +9,48 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
 
-const gitConcurrency = parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "2", 10) || 2;
-const gitLimit = pLimit(gitConcurrency);
+function readGitConcurrency(): number {
+  return parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "2", 10) || 2;
+}
+
+// Worktree creation gets one reserved slot, independent of the existing
+// background limit. Total subprocess concurrency is bounded by
+// PASEO_GIT_CONCURRENCY + 1; ordinary callers retain their existing capacity.
+const foregroundGitLaneStorage = new AsyncLocalStorage<{ active: boolean }>();
+const gitConcurrencyLimit = readGitConcurrency();
+const backgroundGitLimit = pLimit(gitConcurrencyLimit);
+const foregroundGitLimit = pLimit(1);
+
+/**
+ * Runs `callback` in the foreground Git scheduling lane. Git commands issued
+ * inside the callback use the reserved foreground slot instead of competing
+ * with background status scans. Nesting is idempotent. The lane carries no
+ * timer or timeout: queued creation work keeps its place rather than rejecting
+ * behind a deadline that a later mutation could bypass.
+ */
+export function runWithForegroundGitLane<T>(callback: () => T): T {
+  if (foregroundGitLaneStorage.getStore()?.active) {
+    return callback();
+  }
+  const scope = { active: true };
+  const release = () => {
+    scope.active = false;
+  };
+  try {
+    const result = foregroundGitLaneStorage.run(scope, callback);
+    if (result != null && typeof (result as { then?: unknown }).then === "function") {
+      // Keep the original promise identity for coalesced metadata reads. Detached
+      // descendants retain this token, but lose priority when their owner ends.
+      void Promise.resolve(result).then(release, release);
+    } else {
+      release();
+    }
+    return result;
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
 
 export interface GitCommandOptions {
   cwd: string;
@@ -126,7 +167,10 @@ export function runGitCommand(
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
   const enqueuedAt = Date.now();
-  return gitLimit(() => {
+  const limit = foregroundGitLaneStorage.getStore()?.active
+    ? foregroundGitLimit
+    : backgroundGitLimit;
+  return limit(() => {
     const queueWaitMs = Date.now() - enqueuedAt;
     return new Promise<GitCommandResult>((resolve, reject) => {
       const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;

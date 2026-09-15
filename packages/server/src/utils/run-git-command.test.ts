@@ -506,4 +506,140 @@ describe("runGitCommand", () => {
       (secondMetric?.queueWaitMs ?? 0) + (secondMetric?.durationMs ?? 0),
     );
   });
+
+  it("runs nested asynchronous foreground work while background capacity is occupied", async () => {
+    const { runGitCommand, runWithForegroundGitLane } = await loadRunGitCommand(2);
+    vi.useFakeTimers();
+    try {
+      enqueueSpawnBehaviors(
+        { delayMs: 1_000 },
+        { delayMs: 1_000 },
+        { delayMs: 5, stdoutData: "foreground" },
+        { stdoutData: "outside" },
+      );
+      const background = Promise.all(
+        [1, 2].map(() => runGitCommand(["status"], { cwd: process.cwd() })),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fakeSpawnController.activeCount).toBe(2);
+      const readIdentity = () => runGitCommand(["rev-parse"], { cwd: process.cwd() });
+      const foreground = runWithForegroundGitLane(async () => {
+        await Promise.resolve();
+        return runWithForegroundGitLane(readIdentity);
+      });
+      let outsideFinished = false;
+      const outside = runGitCommand(["status"], { cwd: process.cwd() }).then((result) => {
+        outsideFinished = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(foreground).resolves.toMatchObject({ stdout: "foreground" });
+      expect(outsideFinished).toBe(false);
+      expect(fakeSpawnController.activeCount).toBe(2);
+      expect(fakeSpawnController.peakActiveCount).toBe(3);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await background;
+      await expect(outside).resolves.toMatchObject({ stdout: "outside" });
+    } finally {
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds concurrent foreground commands to one", async () => {
+    const { runGitCommand, runWithForegroundGitLane } = await loadRunGitCommand(2);
+    vi.useFakeTimers();
+    try {
+      enqueueSpawnBehaviors({ delayMs: 20 }, { delayMs: 20 });
+      const readStatus = () => runGitCommand(["status"], { cwd: process.cwd() });
+      const readForeground = () => runWithForegroundGitLane(readStatus);
+      const commands = Promise.all([1, 2].map(readForeground));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fakeSpawnController.activeCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(40);
+      await commands;
+      expect(fakeSpawnController.peakActiveCount).toBe(1);
+    } finally {
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases foreground capacity after a command fails", async () => {
+    const { runGitCommand, runWithForegroundGitLane } = await loadRunGitCommand(2);
+    vi.useFakeTimers();
+    try {
+      enqueueSpawnBehaviors(
+        { emitError: new Error("foreground failed") },
+        { stdoutData: "recovered" },
+      );
+      const failure = expect(
+        runWithForegroundGitLane(() => runGitCommand(["status"], { cwd: process.cwd() })),
+      ).rejects.toThrow("foreground failed");
+      await vi.advanceTimersByTimeAsync(0);
+      await failure;
+      const next = runWithForegroundGitLane(() =>
+        runGitCommand(["status"], { cwd: process.cwd() }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(next).resolves.toMatchObject({ stdout: "recovered" });
+      expect(fakeSpawnController.activeCount).toBe(0);
+    } finally {
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["resolve", "reject"])(
+    "expires inherited priority when the owner promise settles: %s",
+    async (outcome) => {
+      const { runGitCommand, runWithForegroundGitLane } = await loadRunGitCommand(2);
+      vi.useFakeTimers();
+      try {
+        enqueueSpawnBehaviors(
+          { delayMs: 1_000 },
+          { delayMs: 1_000 },
+          { stdoutData: "probe" },
+          { stdoutData: "detached" },
+        );
+        const background = Promise.all(
+          [1, 2].map(() => runGitCommand(["status"], { cwd: process.cwd() })),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        let trigger!: () => void;
+        let detached!: Promise<unknown>;
+        let detachedFinished = false;
+        const readDetached = () => runGitCommand(["status"], { cwd: process.cwd() });
+        const markDetached = (result: Awaited<ReturnType<typeof runGitCommand>>) => {
+          detachedFinished = true;
+          return result;
+        };
+        const owner = runWithForegroundGitLane(() => {
+          const gate = new Promise<void>((resolve) => {
+            trigger = resolve;
+          });
+          detached = gate.then(readDetached).then(markDetached);
+          return outcome === "resolve"
+            ? Promise.resolve()
+            : Promise.reject(new Error("owner failed"));
+        });
+        if (outcome === "resolve") await owner;
+        else await expect(owner).rejects.toThrow("owner failed");
+        trigger();
+        await vi.advanceTimersByTimeAsync(10);
+        expect(detachedFinished).toBe(false);
+        const probe = runWithForegroundGitLane(() =>
+          runGitCommand(["rev-parse"], { cwd: process.cwd() }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(probe).resolves.toMatchObject({ stdout: "probe" });
+        await vi.advanceTimersByTimeAsync(1_000);
+        await background;
+        await expect(detached).resolves.toMatchObject({ stdout: "detached" });
+      } finally {
+        await vi.runAllTimersAsync();
+        vi.useRealTimers();
+      }
+    },
+  );
 });

@@ -543,3 +543,16 @@ environment. CLI passthrough skips this step.
 A synchronous shell wait previously exceeded a 15-second attempt timeout by several
 minutes when the shell did not terminate. The focused desktop startup tests cover
 event-loop responsiveness, deadline cleanup and environment decoding.
+
+### Worktree creation under Git status load
+
+Git commands normally share the `PASEO_GIT_CONCURRENCY` limit (two by default).
+Worktree creation and its identity, worktree-list, and default-branch lookups use
+one additional reserved slot, so long background status scans cannot occupy all
+creation capacity. The total command concurrency is bounded by the configured
+background limit plus one. Full status and diff refreshes keep their normal lane.
+
+The foreground context lasts only until its owning operation settles. Detached
+jobs that run later return to the normal queue. Queued mutations are not cancelled
+by a scheduling timeout: increasing a client's timeout does not remove queue
+starvation, and a client timeout alone does not prove that creation failed.

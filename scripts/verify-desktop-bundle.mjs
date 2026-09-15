@@ -40,6 +40,7 @@ const UI_MARKERS = [
 ];
 
 const SERVER_MARKERS = [
+  ["runWithForegroundGitLane", "reserved worktree creation capacity"],
   ["workspaceSafeCleanup", "verified checkout cleanup capability"],
   ["workspaceCreationRetry", "durable workspace creation identity"],
   ["archivedHead", "exact-commit checkout recovery"],

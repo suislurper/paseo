@@ -261,9 +261,13 @@ export class ProviderCatalogSession {
     if (entry && !entry.enabled) {
       return entry;
     }
-    if (!entry || entry.status === "loading") {
+    if (!entry || entry.status === "loading" || entry.status === "error") {
       // Awaits the in-flight warmup (deduped per-cwd) so old clients still get
-      // a resolved answer rather than a loading placeholder.
+      // a resolved answer rather than a loading placeholder. A failed snapshot
+      // is retried through the same path — the manager applies its cooldown, so
+      // a read inside the cooldown returns the existing entry immediately while
+      // a later one recovers the provider instead of reporting a stale probe
+      // error forever.
       await manager.warmUpSnapshotForCwd({ cwd, providers: [provider] });
       entry = findEntry();
     }

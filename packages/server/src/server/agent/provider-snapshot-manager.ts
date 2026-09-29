@@ -38,6 +38,14 @@ import type { MutableDaemonConfig } from "../daemon-config-store.js";
 const DEFAULT_REFRESH_TIMEOUT_MS = 60_000;
 const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 120_000;
 const REFRESH_TIMEOUT_ENV_VAR = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
+/**
+ * How long a provider whose snapshot probe failed is left alone before a
+ * snapshot read retries it. Long enough that a provider failing for a real
+ * reason is not probed on every read, short enough that a transient failure
+ * (a probe that lost a race with a busy machine, say) heals by itself instead
+ * of pinning the provider to `error` for the life of the daemon.
+ */
+const FAILED_PROBE_RETRY_COOLDOWN_MS = 30_000;
 export const GLOBAL_PROVIDER_SNAPSHOT_KEY = "paseo:global";
 
 // Provider refresh probes can be slow on cold starts (e.g. Copilot's first
@@ -173,6 +181,8 @@ interface ProviderSnapshotTarget {
 export class ProviderSnapshotManager {
   private readonly snapshots = new Map<string, Map<AgentProvider, ProviderSnapshotEntry>>();
   private readonly providerLoads = new Map<string, Map<AgentProvider, ProviderLoad>>();
+  /** Last probe start per `cwd\0provider`, so a failed snapshot has a retry clock. */
+  private readonly probeAttemptsAt = new Map<string, number>();
   private readonly events = new EventEmitter();
   private destroyed = false;
   private readonly refreshTimeoutMs: number;
@@ -444,6 +454,7 @@ export class ProviderSnapshotManager {
     this.events.removeAllListeners();
     this.snapshots.clear();
     this.providerLoads.clear();
+    this.probeAttemptsAt.clear();
   }
 
   private buildRegistry(): Record<AgentProvider, ProviderDefinition> {
@@ -664,7 +675,31 @@ export class ProviderSnapshotManager {
       this.resetSnapshotToLoading(cwd, missingProviders);
     }
 
-    return providersToInspect.filter((provider) => snapshot.get(provider)?.status === "loading");
+    // Warm entries that are still loading, and entries whose probe failed once
+    // the retry cooldown has passed. The failed branch is what keeps a single
+    // probe timeout from sticking: an `error` entry is otherwise never warmed
+    // again by any client request, so the app keeps showing that provider's raw
+    // probe error and none of its models until someone restarts the daemon.
+    // The retry leaves the entry as it is — the recorded failure stays readable
+    // until the new probe answers. `unavailable` is deliberately excluded: it
+    // records a probe that ran and answered "not usable", and retrying those on
+    // every read would spawn a process per read for providers this deployment
+    // does not have installed.
+    const providersToWarm: AgentProvider[] = [];
+    for (const provider of providersToInspect) {
+      const entry = snapshot.get(provider);
+      if (entry === undefined) {
+        continue;
+      }
+      const attemptedAt = this.probeAttemptsAt.get(`${cwd}\u0000${provider}`) ?? 0;
+      const retryableFailure =
+        entry.status === "error" && Date.now() - attemptedAt >= FAILED_PROBE_RETRY_COOLDOWN_MS;
+      if (entry.status === "loading" || retryableFailure) {
+        providersToWarm.push(provider);
+      }
+    }
+
+    return providersToWarm;
   }
 
   private clearCachedProviders(providers?: AgentProvider[]): void {
@@ -725,7 +760,15 @@ export class ProviderSnapshotManager {
       return existingLoad.promise;
     }
     const existingEntry = this.snapshots.get(options.snapshotCwd)?.get(options.provider);
-    if (existingEntry && existingEntry.status !== "loading" && !options.force) {
+    if (
+      existingEntry &&
+      existingEntry.status !== "loading" &&
+      existingEntry.status !== "error" &&
+      !options.force
+    ) {
+      // A failed entry is allowed through: the warm-up list already decided this
+      // is a cooldown-governed retry (see resolveProvidersToWarm), so leaving the
+      // entry `error` must not turn that retry into a no-op.
       return Promise.resolve();
     }
 
@@ -766,6 +809,14 @@ export class ProviderSnapshotManager {
   }): Promise<void> {
     const { snapshotCwd, catalogScope, provider, definition, load, force } = options;
     const snapshot = this.getOrCreateSnapshot(snapshotCwd);
+    const previousEntry = snapshot.get(provider);
+    this.probeAttemptsAt.set(`${snapshotCwd}\u0000${provider}`, Date.now());
+    if (previousEntry?.status === "error") {
+      this.logger.info(
+        { provider, cwd: snapshotCwd },
+        "Retrying provider snapshot after a failed probe",
+      );
+    }
     const base = {
       provider,
       source: this.getProviderSource(provider),

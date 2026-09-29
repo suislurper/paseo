@@ -484,6 +484,48 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("a failed provider probe is retried on the next read once the cooldown passes", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ACP catalog probe timed out after 60000ms"))
+      .mockResolvedValue({
+        models: [{ provider: "codex", id: "gpt-5.4-mini", label: "GPT 5.4 Mini" }],
+        modes: [] as AgentMode[],
+      });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", { isAvailable: async () => true, fetchCatalog }),
+      },
+    });
+    const cwd = "/tmp/project";
+    const codexEntry = () => manager.getSnapshot(cwd).find((entry) => entry.provider === "codex");
+    const clock = vi.spyOn(Date, "now");
+    try {
+      const failedAt = Date.now();
+      await manager.listProviders({ cwd, providers: ["codex"], wait: true });
+      expect(codexEntry()?.status).toBe("error");
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+
+      // A read inside the cooldown must not spawn another probe.
+      clock.mockReturnValue(failedAt + 1_000);
+      await manager.listProviders({ cwd, providers: ["codex"], wait: true });
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+      expect(codexEntry()?.status).toBe("error");
+
+      // After it, the next read recovers the provider instead of reporting the
+      // stale probe error for the life of the daemon.
+      clock.mockReturnValue(failedAt + 31_000);
+      await manager.listProviders({ cwd, providers: ["codex"], wait: true });
+      expect(fetchCatalog).toHaveBeenCalledTimes(2);
+      expect(codexEntry()?.status).toBe("ready");
+      expect(codexEntry()?.models?.map((model) => model.id)).toEqual(["gpt-5.4-mini"]);
+    } finally {
+      clock.mockRestore();
+      manager.destroy();
+    }
+  });
+
   test("getProviderDiagnostic returns the diagnostic from the injected client and appends snapshot models/status", async () => {
     const getDiagnostic = vi.fn(async () => ({ diagnostic: "codex is ready" }));
     const client = createExtraClient("codex", { getDiagnostic });

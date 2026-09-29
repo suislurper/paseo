@@ -165,6 +165,40 @@ describe("ProviderCatalogSession", () => {
     });
   });
 
+  it("re-warms a provider whose snapshot failed and answers with the recovered models", async () => {
+    const failed: ProviderSnapshotEntry = {
+      provider: "codex",
+      status: "error",
+      enabled: true,
+      error: "ACP catalog probe timed out after 60000ms",
+    };
+    const recovered: ProviderSnapshotEntry = {
+      provider: "codex",
+      status: "ready",
+      enabled: true,
+      models: [{ provider: "codex", id: "gpt-5.4-mini", label: "GPT 5.4 Mini" }],
+      modes: [],
+    };
+    let current = failed;
+    const warmUpSnapshotForCwd = vi.fn(async () => {
+      current = recovered;
+    });
+    const { subsystem, emitted } = makeSubsystem({
+      snapshot: { getSnapshot: () => [current], warmUpSnapshotForCwd },
+    });
+
+    await subsystem.handleListProviderModelsRequest({
+      type: "list_provider_models_request",
+      provider: "codex",
+      requestId: "m-error",
+    });
+
+    expect(warmUpSnapshotForCwd).toHaveBeenCalledWith({ cwd: undefined, providers: ["codex"] });
+    const res = findByType(emitted, "list_provider_models_response");
+    expect(res?.payload.error).toBeNull();
+    expect(res?.payload.models?.map((model) => model.id)).toEqual(["gpt-5.4-mini"]);
+  });
+
   it("surfaces a usage-list failure as an rpc_error envelope", async () => {
     const { subsystem, emitted } = makeSubsystem({
       usage: {

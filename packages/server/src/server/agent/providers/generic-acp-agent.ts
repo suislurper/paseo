@@ -20,6 +20,12 @@ import {
 export const GenericACPProviderParamsSchema = z
   .object({
     supportsMcpServers: z.boolean().optional(),
+    /**
+     * Answer tool approvals automatically. For ACP surfaces that always defer
+     * approval to the client (Grok Build), no CLI-side permission flag can
+     * silence the prompt, so the choice has to be made here.
+     */
+    autoApprovePermissions: z.boolean().optional(),
     clientCapabilities: z
       .object({
         fs: z
@@ -67,6 +73,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       },
       defaultCommand: options.command,
       capabilities: buildGenericACPCapabilities(providerParams),
+      autoApprovePermissions: providerParams.autoApprovePermissions,
       waitForInitialCommands: options.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: options.initialCommandsWaitTimeoutMs,
       clientCapabilities: providerParams.clientCapabilities,

@@ -390,6 +390,8 @@ interface ACPAgentClientOptions {
     thinkingOptionId: string,
   ) => Promise<void>;
   capabilities?: AgentCapabilityFlags;
+  /** Answer tool approvals automatically instead of prompting the user. */
+  autoApprovePermissions?: boolean;
   extensionCommandsParser?: ACPExtensionCommandsParser;
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
@@ -420,6 +422,8 @@ interface ACPAgentSessionOptions {
     thinkingOptionId: string,
   ) => Promise<void>;
   capabilities: AgentCapabilityFlags;
+  /** Answer tool approvals automatically instead of prompting the user. */
+  autoApprovePermissions?: boolean;
   extensionCommandsParser?: ACPExtensionCommandsParser;
   handle?: AgentPersistenceHandle;
   agentId?: string;
@@ -733,12 +737,14 @@ export class ACPAgentClient implements AgentClient {
   private readonly waitForInitialCommands: boolean;
   private readonly initialCommandsWaitTimeoutMs: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
+  private readonly autoApprovePermissions: boolean;
   protected readonly terminateProcess: ProcessTerminator;
 
   constructor(options: ACPAgentClientOptions) {
     this.provider = options.provider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.capabilities = options.capabilities ?? DEFAULT_ACP_CAPABILITIES;
+    this.autoApprovePermissions = options.autoApprovePermissions === true;
     this.logger = options.logger.child({
       module: "agent",
       provider: options.provider,
@@ -787,6 +793,7 @@ export class ACPAgentClient implements AgentClient {
         beforeModeWriter: this.beforeModeWriter,
         thinkingOptionWriter: this.thinkingOptionWriter,
         capabilities: this.capabilities,
+        autoApprovePermissions: this.autoApprovePermissions,
         agentId: launchContext?.agentId,
         launchEnv: launchContext?.env,
         extensionCommandsParser: this.extensionCommandsParser,
@@ -837,6 +844,7 @@ export class ACPAgentClient implements AgentClient {
       beforeModeWriter: this.beforeModeWriter,
       thinkingOptionWriter: this.thinkingOptionWriter,
       capabilities: this.capabilities,
+      autoApprovePermissions: this.autoApprovePermissions,
       handle,
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
@@ -1336,12 +1344,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
+  private readonly autoApprovePermissions: boolean;
   private readonly terminateProcess: ProcessTerminator;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
     this.provider = options.provider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.capabilities = options.capabilities;
+    this.autoApprovePermissions = options.autoApprovePermissions === true;
     this.logger = options.logger.child({ module: "agent", provider: options.provider });
     this.runtimeSettings = options.runtimeSettings;
     this.defaultCommand = options.defaultCommand;
@@ -1962,17 +1972,35 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
 
     this.pendingPermissions.delete(requestId);
-    const selectedOption = selectPermissionOption(pending.options, response);
-    pending.resolve(
-      selectedOption
-        ? {
-            outcome: {
-              outcome: "selected",
-              optionId: selectedOption.optionId,
-            },
-          }
-        : { outcome: { outcome: "cancelled" } },
-    );
+
+    const pendingRawRequest = pending.request.metadata?.rawRequest as
+      | RequestPermissionRequest
+      | undefined;
+    if (pendingRawRequest !== undefined && readDshQuestionForm(pendingRawRequest) !== null) {
+      // A question form answers as a whole, which ACP's single-option outcome
+      // cannot carry, so the answers ride back in `_meta` for the DSH bridge.
+      const answers = readDshQuestionAnswers(response);
+      pending.resolve(
+        (answers === undefined
+          ? { outcome: { outcome: "cancelled" }, _meta: { dshAnswers: null } }
+          : {
+              outcome: { outcome: "selected", optionId: "dsh-question-answer" },
+              _meta: { dshAnswers: answers },
+            }) as RequestPermissionResponse,
+      );
+    } else {
+      const selectedOption = selectPermissionOption(pending.options, response);
+      pending.resolve(
+        selectedOption
+          ? {
+              outcome: {
+                outcome: "selected",
+                optionId: selectedOption.optionId,
+              },
+            }
+          : { outcome: { outcome: "cancelled" } },
+      );
+    }
 
     this.pushEvent({
       type: "permission_resolved",
@@ -2066,6 +2094,15 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    // Providers that opt in answer the approval here rather than prompting.
+    // Some ACP surfaces (Grok Build) always defer tool approval to the client,
+    // so no CLI-side permission flag can silence them.
+    if (this.autoApprovePermissions) {
+      const option = selectAutoApproveOption(params.options);
+      if (option !== null) {
+        return { outcome: { outcome: "selected", optionId: option.optionId } };
+      }
+    }
     // Match Zed acp.rs:3189-3220: generic ACP permission requests stay pure pass-through.
     const requestId = randomUUID();
     let toolSnapshot =
@@ -3301,12 +3338,56 @@ function extractTerminalContent(
   };
 }
 
+/**
+ * DSH marks a permission request that actually carries an interactive question
+ * form (see the `dsh-acp-questions` DSH profile plugin). The marker travels in
+ * `_meta` so every other ACP provider keeps the generic permission path.
+ */
+function readDshQuestionForm(params: RequestPermissionRequest): unknown[] | null {
+  type Marker = { dshQuestion?: { questions?: unknown } } | null | undefined;
+  const requestMeta = params._meta as Marker;
+  const toolMeta = params.toolCall._meta as Marker;
+  const questions = (requestMeta?.dshQuestion ?? toolMeta?.dshQuestion)?.questions;
+  return Array.isArray(questions) && questions.length > 0 ? questions : null;
+}
+
+/** Answers submitted by the question form, keyed by question header. */
+function readDshQuestionAnswers(
+  response: AgentPermissionResponse,
+): Record<string, unknown> | undefined {
+  if (response.behavior !== "allow") {
+    return undefined;
+  }
+  const updated = response.updatedInput as Record<string, unknown> | undefined;
+  const answers = updated?.answers;
+  if (answers === null || typeof answers !== "object" || Array.isArray(answers)) {
+    return undefined;
+  }
+  return answers as Record<string, unknown>;
+}
+
 function mapPermissionRequest(
   provider: string,
   requestId: string,
   params: RequestPermissionRequest,
   snapshot: ACPToolSnapshot,
 ): AgentPermissionRequest {
+  const dshQuestions = readDshQuestionForm(params);
+  if (dshQuestions !== null) {
+    return {
+      id: requestId,
+      provider,
+      name: "question",
+      kind: "question",
+      title: params.toolCall.title ?? snapshot.title,
+      input: { questions: dshQuestions },
+      metadata: {
+        toolCallId: params.toolCall.toolCallId,
+        rawRequest: params,
+        options: params.options,
+      },
+    };
+  }
   const kind: AgentPermissionRequestKind = snapshot.kind === "switch_mode" ? "mode" : "tool";
   return {
     id: requestId,
@@ -3321,6 +3402,19 @@ function mapPermissionRequest(
       options: params.options,
     },
   };
+}
+
+/**
+ * Auto-approval prefers `allow_once` over `allow_always` so opting in never
+ * writes a durable "don't ask again" rule into the CLI's own state, which
+ * would also silence prompts for providers that did not opt in.
+ */
+function selectAutoApproveOption(options: PermissionOption[]): PermissionOption | null {
+  return (
+    options.find((option) => option.kind === "allow_once") ??
+    options.find((option) => option.kind === "allow_always") ??
+    null
+  );
 }
 
 function selectPermissionOption(
